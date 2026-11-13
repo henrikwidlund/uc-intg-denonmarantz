@@ -312,7 +312,13 @@ async fn the_start_asks_for_each_toggle_once() {
     // A long retry delay: only the queries of the start are counted.
     let rig = rig(answers_all, Duration::from_secs(60)).await;
     let count = toggle_queries_after_the_start(&rig).await;
-    assert_eq!(1, count);
+    assert_eq!(
+        1,
+        count,
+        "connections: {}, lines: {:?}",
+        rig.telnet.connections(),
+        rig.telnet.received()
+    );
     assert_eq!(1, rig.telnet.count("PSTONE CTRL ?"));
 }
 
