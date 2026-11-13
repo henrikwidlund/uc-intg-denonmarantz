@@ -57,7 +57,7 @@ const TABLES: [Table; 4] = [
     group_d::TABLE,
 ];
 
-static REGISTRY: LazyLock<HashMap<&'static str, Run>> = LazyLock::new(|| {
+static REGISTRY: LazyLock<HashMap<&str, Run>> = LazyLock::new(|| {
     TABLES
         .iter()
         .flat_map(|table| table.iter().copied())

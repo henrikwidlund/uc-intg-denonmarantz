@@ -135,29 +135,29 @@ impl Fake {
 
     async fn start_with(power_on: bool, description: Vec<u8>) -> Self {
         let description: Arc<[u8]> = description.into();
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind the fake receiver");
-        let port = listener.local_addr().expect("address").port();
+        let (port, listeners) = bind_loopback("bind the fake receiver").await;
         let commands = Arc::new(Mutex::new(Vec::new()));
         let app_commands = Arc::new(AtomicUsize::new(0));
         let gone = Arc::new(AtomicBool::new(false));
-        let (seen, asked, closed) = (commands.clone(), app_commands.clone(), gone.clone());
-        tokio::spawn(async move {
-            while let Ok((socket, _)) = listener.accept().await {
-                if closed.load(Ordering::SeqCst) {
-                    continue;
+        for listener in listeners {
+            let (seen, asked, closed) = (commands.clone(), app_commands.clone(), gone.clone());
+            let description = description.clone();
+            tokio::spawn(async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    if closed.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    tokio::spawn(serve(
+                        socket,
+                        power_on,
+                        seen.clone(),
+                        description.clone(),
+                        asked.clone(),
+                        closed.clone(),
+                    ));
                 }
-                tokio::spawn(serve(
-                    socket,
-                    power_on,
-                    seen.clone(),
-                    description.clone(),
-                    asked.clone(),
-                    closed.clone(),
-                ));
-            }
-        });
+            });
+        }
         Self {
             port,
             commands,
@@ -200,6 +200,19 @@ impl Fake {
         avr.update().await.expect("read the fake receiver");
         avr
     }
+}
+
+/// Listeners on the IPv4 loopback address and, if the system has it, on the IPv6 one, with the same
+/// port. A connect to `localhost` then works at once on every system: Windows tries `::1` first and
+/// waits about 2 seconds when nothing listens there.
+async fn bind_loopback(what: &str) -> (u16, Vec<TcpListener>) {
+    let v4 = TcpListener::bind("127.0.0.1:0").await.expect(what);
+    let port = v4.local_addr().expect("address").port();
+    let mut listeners = vec![v4];
+    if let Ok(v6) = TcpListener::bind(("::1", port)).await {
+        listeners.push(v6);
+    }
+    (port, listeners)
 }
 
 async fn serve(
@@ -390,28 +403,27 @@ pub struct FakeTelnet {
 impl FakeTelnet {
     /// Start the port. `answers` gives the lines for a line of the client.
     pub async fn start(answers: impl Fn(&str) -> Vec<String> + Send + Sync + 'static) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind the fake telnet port");
-        let port = listener.local_addr().expect("address").port();
+        let (port, listeners) = bind_loopback("bind the fake telnet port").await;
         let received = Arc::new(Mutex::new(Vec::new()));
         let control = Arc::new(Mutex::new(None));
         let connections = Arc::new(AtomicUsize::new(0));
         let gone = Arc::new(AtomicBool::new(false));
-        let answers = Arc::new(answers);
-        let (seen, slot, count) = (received.clone(), control.clone(), connections.clone());
-        let closed = gone.clone();
-        tokio::spawn(async move {
-            while let Ok((socket, _)) = listener.accept().await {
-                if closed.load(Ordering::SeqCst) {
-                    continue;
+        let answers: Answers = Arc::new(answers);
+        for listener in listeners {
+            let (seen, slot, count) = (received.clone(), control.clone(), connections.clone());
+            let (closed, answers) = (gone.clone(), answers.clone());
+            tokio::spawn(async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    if closed.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let (tx, rx) = mpsc::unbounded_channel();
+                    *slot.lock().expect("lock") = Some(tx);
+                    tokio::spawn(serve_telnet(socket, answers.clone(), seen.clone(), rx));
                 }
-                count.fetch_add(1, Ordering::SeqCst);
-                let (tx, rx) = mpsc::unbounded_channel();
-                *slot.lock().expect("lock") = Some(tx);
-                tokio::spawn(serve_telnet(socket, answers.clone(), seen.clone(), rx));
-            }
-        });
+            });
+        }
         Self {
             port,
             received,

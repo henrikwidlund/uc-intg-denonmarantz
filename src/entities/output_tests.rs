@@ -4,9 +4,14 @@
 //! Tests of the attributes that the entities show. The expected values are the ones of the Python
 //! integration.
 
-use super::*;
+use super::{
+    EntityKind, NumberKind, SelectKind, SensorKind, SwitchKind, View, attributes, definition,
+};
+use crate::config_store::DeviceConfig;
+use denon_marantz::State;
 use denon_marantz::proto::telnet::Message;
 use serde_json::json;
+use serde_json::{Map, Value};
 
 fn cfg() -> DeviceConfig {
     DeviceConfig {

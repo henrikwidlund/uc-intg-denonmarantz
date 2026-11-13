@@ -1367,6 +1367,79 @@ fn receiver_has(ctx: &Ctx, kind: &str) -> bool {
     })
 }
 
+/// Select every option of one select, then the first one again. Adds what went wrong to
+/// `problems`. `None` if the select has no options.
+async fn sweep_select(
+    ctx: &mut Ctx,
+    kind: &str,
+    problems: &mut Vec<String>,
+) -> Result<Option<Tally>, Fail> {
+    let select = ctx.select(kind);
+    let Some(options) = ctx
+        .client
+        .attr(&select, "options")
+        .and_then(Value::as_array)
+        .cloned()
+    else {
+        problems.push(format!("{kind}: no options"));
+        return Ok(None);
+    };
+    let original = ctx
+        .client
+        .attr(&select, "current_option")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let mut tally = Tally::default();
+    // The library says before sending if it will refuse: the driver must agree.
+    let feature = match kind {
+        "reference_level_offset" => Some(denon_marantz::Feature::ReferenceLevelOffset),
+        "dynamic_volume" => Some(denon_marantz::Feature::Audyssey),
+        _ => None,
+    };
+    let status = match (&ctx.oracle, feature) {
+        (Some(oracle), Some(feature)) => {
+            oracle.refresh().await?;
+            Some(oracle.status(feature))
+        }
+        _ => None,
+    };
+    for option in options
+        .iter()
+        .filter(|o| **o != json!("--") && **o != original)
+    {
+        match sweep_one(ctx, kind, option).await {
+            Ok(outcome) => {
+                if matches!(outcome, Outcome::Ignored) {
+                    tally.detail.push(format!(
+                        "{option} (from {})",
+                        ctx.client.text(&select, "current_option")
+                    ));
+                }
+                tally.add(outcome);
+            }
+            Err(e) => problems.push(format!("{kind} -> {option}: {e}")),
+        }
+    }
+    if original != Value::Null
+        && original != json!("--")
+        && let Err(e) = sweep_one(ctx, kind, &original).await
+    {
+        problems.push(format!("{kind} back to {original}: {e}"));
+    }
+    if let Some(status) = status {
+        let refused = !tally.refused.is_empty();
+        if refused == status.can_send()
+            && tally.verified + tally.ignored + tally.unverifiable + tally.refused.len() > 0
+        {
+            problems.push(format!(
+                "{kind}: the library says {status:?}, the driver {}",
+                if refused { "refused" } else { "did not refuse" }
+            ));
+        }
+    }
+    Ok(Some(tally))
+}
+
 /// Select every option of the selects and check the entities after each change.
 pub async fn select_sweep(ctx: &mut Ctx) -> Check {
     ensure_on(ctx).await?;
@@ -1408,71 +1481,10 @@ pub async fn select_sweep(ctx: &mut Ctx) -> Check {
         if !ctx.opt.kinds.is_empty() && !ctx.opt.kinds.iter().any(|k| k == kind) {
             continue;
         }
-        let select = ctx.select(kind);
-        let Some(options) = ctx
-            .client
-            .attr(&select, "options")
-            .and_then(Value::as_array)
-            .cloned()
-        else {
-            problems.push(format!("{kind}: no options"));
-            continue;
-        };
-        let original = ctx
-            .client
-            .attr(&select, "current_option")
-            .cloned()
-            .unwrap_or(Value::Null);
-        let mut tally = Tally::default();
-        // The library says before sending if it will refuse: the driver must agree.
-        let feature = match kind {
-            "reference_level_offset" => Some(denon_marantz::Feature::ReferenceLevelOffset),
-            "dynamic_volume" => Some(denon_marantz::Feature::Audyssey),
-            _ => None,
-        };
-        let status = match (&ctx.oracle, feature) {
-            (Some(oracle), Some(feature)) => {
-                oracle.refresh().await?;
-                Some(oracle.status(feature))
-            }
-            _ => None,
-        };
-        for option in options
-            .iter()
-            .filter(|o| **o != json!("--") && **o != original)
-        {
-            match sweep_one(ctx, kind, option).await {
-                Ok(outcome) => {
-                    if matches!(outcome, Outcome::Ignored) {
-                        tally.detail.push(format!(
-                            "{option} (from {})",
-                            ctx.client.text(&select, "current_option")
-                        ));
-                    }
-                    tally.add(outcome);
-                }
-                Err(e) => problems.push(format!("{kind} -> {option}: {e}")),
-            }
+        if let Some(tally) = sweep_select(ctx, kind, &mut problems).await? {
+            verified += tally.verified;
+            summary.push(format!("{kind}: {}", tally.describe()));
         }
-        if original != Value::Null
-            && original != json!("--")
-            && let Err(e) = sweep_one(ctx, kind, &original).await
-        {
-            problems.push(format!("{kind} back to {original}: {e}"));
-        }
-        if let Some(status) = status {
-            let refused = !tally.refused.is_empty();
-            if refused == status.can_send()
-                && tally.verified + tally.ignored + tally.unverifiable + tally.refused.len() > 0
-            {
-                problems.push(format!(
-                    "{kind}: the library says {status:?}, the driver {}",
-                    if refused { "refused" } else { "did not refuse" }
-                ));
-            }
-        }
-        verified += tally.verified;
-        summary.push(format!("{kind}: {}", tally.describe()));
     }
     if dirac_original != Value::Null
         && dirac_original != json!("--")

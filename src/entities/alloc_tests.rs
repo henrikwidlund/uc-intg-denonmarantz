@@ -5,8 +5,11 @@
 //! attributes of all entities. Run it alone, because the counter is global:
 //! `cargo test --locked alloc_tests -- --ignored --nocapture`.
 
-use super::*;
+use super::{EntityKind, SensorKind, View, attributes};
+use crate::config_store::DeviceConfig;
+use denon_marantz::State;
 use denon_marantz::proto::telnet::Message;
+use serde_json::Map;
 
 fn cfg() -> DeviceConfig {
     DeviceConfig {

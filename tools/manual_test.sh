@@ -35,6 +35,9 @@ SELECTION="$*"
 STEP=0
 # Debug lines of the driver and the library.
 DRIVER_LOG_LEVEL="info,uc_intg_denonmarantz=debug,denon_marantz=debug"
+# Texts that many steps use.
+RECEIVER_ON="The receiver is on."
+LOG_PROBLEMS="recent_log 'WARN|ERROR'"
 
 echo "Where does the driver run?"
 echo "  1 + Enter = this script builds and starts it"
@@ -326,12 +329,12 @@ step "Take over a configuration of the Python integration" \
 # ---------------------------------------------------------------- control
 
 step "Power off and on" \
-"The receiver is on." \
+"$RECEIVER_ON" \
 "Media player: press Off. Wait 5 s. Press On." \
 "Off: the receiver goes to standby, the state is Off, the media info and the source are empty.
 Sensors show '--', the mute sensor shows 'off'. Selects show '--'.
 On: the receiver wakes, the state is On, values come back." \
-"recent_log 'WARN|ERROR'"
+"$LOG_PROBLEMS"
 
 step "Input source and sound mode" \
 "ASK FIRST: this can start sound. The receiver is on." \
@@ -339,24 +342,24 @@ step "Input source and sound mode" \
 Select a sound mode, for example Stereo and Dolby Surround." \
 "The receiver switches. The media player, the select and the sensor show the new value.
 The sound mode shows the name that the receiver reports for the mode." \
-"recent_log 'WARN|ERROR'"
+"$LOG_PROBLEMS"
 
 step "Selects and sensors" \
-"The receiver is on." \
+"$RECEIVER_ON" \
 "Change dimmer and eco mode with the select entities. Change the HDMI monitor output only if
 you have two TVs." \
 "The receiver changes. The sensor of the same value follows within a second." \
-"recent_log 'WARN|ERROR'"
+"$LOG_PROBLEMS"
 
 step "Remote entity commands" \
-"The receiver is on." \
+"$RECEIVER_ON" \
 "Send these with the remote entity: DIMMER_TOGGLE, OUTPUT_AUTO, INFO_MENU, and one UI page button
 (for example Sound Modes)." \
 "Each command changes the receiver, and the UI pages of the remote entity have 15 pages." \
-"recent_log 'WARN|ERROR'"
+"$LOG_PROBLEMS"
 
 step "Manual address" \
-"The receiver is on." \
+"$RECEIVER_ON" \
 "Start the setup again and type the IP address of the receiver on the page 'Setup mode'. Then type a
 text with a space. Then an address with no receiver." \
 "The right address finds the receiver. The text with a space shows the page again with an error. The
@@ -372,14 +375,14 @@ the sensor Active Dirac Filter." \
 Audyssey settings are refused with a message that says why. The Dirac select has the slots that have a
 filter, and the saved filter names. A receiver without Audyssey or Dirac shows '--' or has no Dirac
 entities." \
-"recent_log 'WARN|ERROR'"
+"$LOG_PROBLEMS"
 
 step "Quick select, triggers, tuner and Bluetooth" \
 "ASK FIRST: a quick select can change the volume and the source. The triggers can switch other equipment." \
 "Select a quick select. Switch a trigger on and off. Select the tuner band. Switch the Bluetooth
 transmitter and select the Bluetooth output." \
 "Each change shows on the receiver and in the entity. The tuner sensor shows the frequency with its unit." \
-"recent_log 'WARN|ERROR'"
+"$LOG_PROBLEMS"
 
 step "Media info and navigation" \
 "Play something from a network source, for example HEOS or internet radio." \
@@ -388,7 +391,7 @@ the cursor keys, menu, back, info, channel up and down. Then select a source tha
 tuner." \
 "Title, artist, album and cover show for network audio. A source without media shows its name as the title.
 The tuner shows the frequency as the title and the band as the artist. The keys work on the receiver." \
-"recent_log 'WARN|ERROR'"
+"$LOG_PROBLEMS"
 
 step "Signal sensors and the signal read option" \
 "A source with a video and audio signal is playing." \
@@ -399,12 +402,12 @@ follow also when the receiver does not report a change." \
 "recent_log 'signal|WARN|ERROR'"
 
 step "Simple commands and pages" \
-"The receiver is on." \
+"$RECEIVER_ON" \
 "Open the pages of the remote entity (15 pages). Press a few buttons on each page, also a repeated
 command and a sequence of two commands with a pause." \
 "The buttons work. A held button sends one command, not four. A long sequence is answered at once and
 the volume buttons still work while it runs." \
-"recent_log 'WARN|ERROR'"
+"$LOG_PROBLEMS"
 
 step "Configure, remove and options" \
 "At least one receiver is configured." \
@@ -412,32 +415,32 @@ step "Configure, remove and options" \
 Then add and remove a receiver if you have a second one." \
 "The changes work without a restart. A new volume step is used at once. With 'Show all sources' the
 input source select has more sources. The debug log option writes more lines and stays on after a restart." \
-"recent_log 'WARN|ERROR'"
+"$LOG_PROBLEMS"
 
 step "Settings that the receiver does not accept" \
 "The receiver is in standby, or a Dirac filter is selected." \
 "Switch the tone control on. In standby, change a switch, a number and a select." \
 "With a Dirac filter the tone control is refused with a clear message. In standby the commands are
 accepted and do nothing. The log shows no WARN line for the refused command." \
-"recent_log 'WARN|ERROR'"
+"$LOG_PROBLEMS"
 
 step "Volume (ask first)" \
 "ASK FIRST: this changes the main volume. Set the volume low." \
 "Press volume up and down on the Remote. Change the volume step in the setup and try again." \
 "One press changes the volume by the step. The volume sensors follow." \
-"recent_log 'WARN|ERROR'"
+"$LOG_PROBLEMS"
 
 # ---------------------------------------------------------------- wake and loss
 
 step "Sleep and wake of the Remote" \
-"The receiver is on." \
+"$RECEIVER_ON" \
 "Let the Remote go to sleep for a minute. Wake it and press a button at once." \
 "The command works at once, or in less than 3 seconds.
 The log shows 'connected in' and the time." \
 "recent_log 'connected in|network not ready|WARN|ERROR'"
 
 step "Receiver not reachable" \
-"The receiver is on." \
+"$RECEIVER_ON" \
 "Unplug the network cable or the power of the receiver. Press volume up on the Remote at once, and
 again after 30 seconds." \
 "The entities become unavailable. A command fails at once (not after many seconds).
@@ -451,13 +454,13 @@ another input source. Select a sound mode group (for example STEREO). Switch bac
 "With HTTP there are 7 sensors and 6 selects, and no switches or numbers. Commands work. The new value shows within about 3 seconds
 (source and sound mode can take 2 s). The sound mode select lists groups such as MOVIE and STEREO.
 Other changes show within 10 seconds." \
-"recent_log 'WARN|ERROR'"
+"$LOG_PROBLEMS"
 
 step "Backup and restore" \
 "At least one receiver is configured." \
 "Setup > Backup configuration: copy the text. Then Setup > Reset. Then Restore from backup with the text." \
 "The receiver is back with the same entity ids." \
-"recent_log 'WARN|ERROR'"
+"$LOG_PROBLEMS"
 
 step "Broken configuration file" \
 "The driver runs." \

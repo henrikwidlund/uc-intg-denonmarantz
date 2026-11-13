@@ -58,7 +58,7 @@ static ENTRIES: LazyLock<Vec<Entry>> = LazyLock::new(|| {
         .collect()
 });
 
-static INDEX: LazyLock<HashMap<&'static str, &'static Entry>> =
+static INDEX: LazyLock<HashMap<&str, &Entry>> =
     LazyLock::new(|| ENTRIES.iter().map(|e| (e.name, e)).collect());
 
 impl Entry {
