@@ -1,0 +1,38 @@
+{
+  "driver_id": "denonavr_rs",
+  "version": "",
+  "min_core_api": "0.20.0",
+  "name": {
+    "en": "Denon and Marantz AVR Network Receivers (Rust)"
+  },
+  "icon": "uc:tv-music",
+  "description": {
+    "en": "Control your Denon and Marantz network receivers with Remote Two/3."
+  },
+  "developer": {
+    "name": "Henrik Widlund",
+    "url": "https://github.com/henrikwidlund/uc-intg-denonmarantz"
+  },
+  "home_page": "https://github.com/henrikwidlund/uc-intg-denonmarantz",
+  "setup_data_schema": {
+    "title": {
+      "en": "Integration setup"
+    },
+    "settings": [
+      {
+        "id": "info",
+        "label": {
+          "en": "Setup process"
+        },
+        "field": {
+          "label": {
+            "value": {
+              "en": "The integration discovers Denon and Marantz Receivers on the network.\n\nPlease note that the integration needs a moment to connect after the remote starts or wakes up.\n\nSee the [project page](https://github.com/henrikwidlund/uc-intg-denonmarantz) for requirements, features and restrictions."
+            }
+          }
+        }
+      }
+    ]
+  },
+  "release_date": "2026-10-31"
+}

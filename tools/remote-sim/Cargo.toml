@@ -1,0 +1,17 @@
+[package]
+name = "remote-sim"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+description = "Test program that acts as the Remote and tests the driver with a real receiver"
+publish = false
+
+# Not part of the driver build.
+[workspace]
+
+[dependencies]
+denon-marantz = { git = "https://github.com/henrikwidlund/rusty-denon-marantz", rev = "35e5f6b", default-features = false, features = ["telnet", "http"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+serde_json = "1"
+tokio = { version = "1", features = ["fs", "macros", "net", "process", "rt", "time"] }
+tokio-tungstenite = "0.26"
