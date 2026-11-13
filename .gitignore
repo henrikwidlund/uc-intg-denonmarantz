@@ -9,3 +9,4 @@
 /driver.log
 remote-sim-results-*.md
 /tools/remote-sim/target
+/settings.json
