@@ -401,14 +401,36 @@ async fn a_receiver_with_a_new_address_is_found_by_its_serial_number() {
     old_http.leave();
     old_telnet.leave();
     // Three failed reads over HTTP, the old address again, then the search.
-    until("the new address", 15, || {
+    let start = Instant::now();
+    let found = || {
         events
             .lock()
             .expect("lock")
             .iter()
             .any(|event| matches!(event, DeviceEvent::Config { cfg, .. } if cfg.address == NEW))
-    })
-    .await;
+    };
+    while !found() {
+        if start.elapsed() > Duration::from_secs(15) {
+            let statuses: Vec<_> = events
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter_map(|event| match event {
+                    DeviceEvent::Status { status, .. } => Some(*status),
+                    _ => None,
+                })
+                .collect();
+            panic!(
+                "no new address after 15 s. Statuses: {statuses:?}. Reads over HTTP: old {}, \
+                new {}. Telnet connections: old {}, new {}",
+                old_http.app_commands(),
+                new_http.app_commands(),
+                old_telnet.connections(),
+                new_telnet.connections()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     until("the new connection", 5, || new_telnet.connections() >= 1).await;
 }
 
