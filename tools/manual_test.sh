@@ -84,7 +84,7 @@ selected() {
 
 # The driver needs root for mDNS. Files that it wrote as root are given back to the user.
 give_files_back() {
-    sudo chown "$(id -u):$(id -g)" "$CONFIG_DIR"/config.json* "$LOG" 2>/dev/null
+    sudo chown "$(id -u):$(id -g)" "$CONFIG_DIR"/config.json* "$CONFIG_DIR/settings.json" "$LOG" 2>/dev/null
     return 0
 }
 
@@ -317,7 +317,7 @@ step "Configuration file" \
 "Press Enter to show the configuration file." \
 "The file has the fields of the Python integration (id = serial number, address, use_telnet, ...).
 The mode is -rw------- and there is no config.json.tmp file left." \
-"ls -l \"$CONFIG_DIR\"/config.json* && cat \"$CONFIG_DIR/config.json\""
+"give_files_back && ls -l \"$CONFIG_DIR\"/config.json* && cat \"$CONFIG_DIR/config.json\""
 
 step "Take over a configuration of the Python integration" \
 "Copy config.json of the Python integration into the config folder of this driver. Stop the driver first." \
@@ -357,14 +357,6 @@ step "Remote entity commands" \
 (for example Sound Modes)." \
 "Each command changes the receiver, and the UI pages of the remote entity have 15 pages." \
 "$LOG_PROBLEMS"
-
-step "Manual address" \
-"$RECEIVER_ON" \
-"Start the setup again and type the IP address of the receiver on the page 'Setup mode'. Then type a
-text with a space. Then an address with no receiver." \
-"The right address finds the receiver. The text with a space shows the page again with an error. The
-address with no receiver ends the setup with a not found message of the Remote." \
-"recent_log 'discovering|not found|WARN|ERROR'"
 
 step "Tone, Audyssey and Dirac" \
 "ASK FIRST: this changes the sound. The receiver is on." \

@@ -116,6 +116,8 @@ pub async fn run(
                 connected: true,
                 artwork_url: None,
                 paused: false,
+                // Commands do not read the active sound mode.
+                sound_mode: None,
             };
             // The receiver ignores most settings while it is off.
             if is_off(&view) && select_kind != SelectKind::InputSource {
@@ -312,6 +314,8 @@ async fn action_run(
                 connected: true,
                 artwork_url: None,
                 paused: false,
+                // Commands do not read the active sound mode.
+                sound_mode: None,
             };
             select::select_option(avr, &view, SelectKind::InputSource, &name).await?;
         }
@@ -337,6 +341,8 @@ async fn action_run(
                 connected: true,
                 artwork_url: None,
                 paused: false,
+                // Commands do not read the active sound mode.
+                sound_mode: None,
             };
             select::select_option(avr, &view, SelectKind::SoundMode, &name).await?;
         }

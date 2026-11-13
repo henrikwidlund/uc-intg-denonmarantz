@@ -39,6 +39,8 @@ pub struct View<'a> {
     /// Network audio was paused with the pause command. The receiver does not tell a pause from a
     /// stop: the Python integration shows `PAUSED` in the same way.
     pub paused: bool,
+    /// The option of the active sound mode. See `select::active_sound_mode`.
+    pub sound_mode: Option<&'a str>,
 }
 
 /// Select entities of a receiver. The names are the ones of the Python integration.

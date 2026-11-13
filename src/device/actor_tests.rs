@@ -8,7 +8,8 @@
 use super::discovery::{TEST_BUILDER, TEST_DISCOVERY, TestBuilder};
 use super::{Command, Connect, DenonActor, DeviceEvent, DeviceStatus, Disconnect};
 use crate::config_store::DeviceConfig;
-use crate::entities::{EntityKind, SwitchKind};
+use crate::entities::sensor::EMPTY;
+use crate::entities::{EntityKind, SelectKind, SensorKind, SwitchKind};
 use crate::test_support::{Fake, FakeTelnet, test_builder};
 use actix::{Actor, Addr, Context, Handler};
 use denon_marantz::{Brand, DiscoveredReceiver, ReceiverType};
@@ -441,6 +442,87 @@ async fn a_receiver_with_a_new_address_is_found_by_its_serial_number() {
 }
 
 /// The last state of an entity that the actor sent.
+/// A receiver that answers every query with a line that does not change the sound mode.
+fn keeps_the_sound_mode(line: &str) -> Vec<String> {
+    let mut answer = answers_all(line);
+    for text in &mut answer {
+        if text == "MSSTEREO" {
+            "MVMAX 98".clone_into(text);
+        }
+    }
+    answer
+}
+
+// After a change, the receiver reports a mode that is not in its list for about 1 s.
+#[actix::test]
+async fn the_sound_mode_select_keeps_the_last_mode_that_is_in_the_list() {
+    let rig = rig(keeps_the_sound_mode, QUICK).await;
+    until("the first read", 5, || rig.telnet.count("SLP?") >= 1).await;
+    for line in [
+        "PWON",
+        "OPSMLALL MOV001Multi Ch In",
+        "OPSMLALL MOV002Direct",
+        "OPSMLALL END",
+        "MSMULTI CH IN",
+    ] {
+        rig.telnet.send(line);
+    }
+    let select = EntityKind::Select(SelectKind::SoundMode);
+    until("multi ch in", 5, || {
+        entity_state(&rig.events, select, "current_option") == Some("Multi Ch In".into())
+    })
+    .await;
+    let before = rig.events.lock().expect("lock").len();
+    rig.telnet.send("MSDOLBY ATMOS");
+    // The first send after this one that shows the new mode in the sensor.
+    let sensor = EntityKind::Sensor(SensorKind::SoundMode);
+    let shown = || {
+        let events = rig.events.lock().expect("lock");
+        events[before..].iter().find_map(|event| match event {
+            DeviceEvent::Changes { changes, .. } => {
+                let attr = |kind, name| {
+                    changes
+                        .iter()
+                        .find(|(k, _)| *k == kind)
+                        .and_then(|(_, attrs)| attrs.get(name).cloned())
+                };
+                (attr(sensor, "value") == Some("DOLBY ATMOS".into()))
+                    .then(|| attr(select, "current_option"))
+            }
+            _ => None,
+        })
+    };
+    until("the new mode", 5, || shown().is_some()).await;
+    assert_eq!(Some(Some("Multi Ch In".into())), shown());
+}
+
+#[actix::test]
+async fn a_new_sound_mode_list_drops_a_kept_mode_that_is_not_in_it() {
+    let rig = rig(keeps_the_sound_mode, QUICK).await;
+    until("the first read", 5, || rig.telnet.count("SLP?") >= 1).await;
+    for line in [
+        "PWON",
+        "OPSMLALL MOV001Multi Ch In",
+        "OPSMLALL MOV002Direct",
+        "OPSMLALL END",
+        "MSMULTI CH IN",
+    ] {
+        rig.telnet.send(line);
+    }
+    let select = EntityKind::Select(SelectKind::SoundMode);
+    let mode = || entity_state(&rig.events, select, "current_option");
+    until("multi ch in", 5, || mode() == Some("Multi Ch In".into())).await;
+    // A list without Multi Ch In: no option fits the reported mode.
+    for line in [
+        "OPSMLALL MOV001Stereo",
+        "OPSMLALL MOV002Direct",
+        "OPSMLALL END",
+    ] {
+        rig.telnet.send(line);
+    }
+    until("no option", 5, || mode() == Some(EMPTY.into())).await;
+}
+
 fn entity_state(events: &Mutex<Vec<DeviceEvent>>, kind: EntityKind, attr: &str) -> Option<Value> {
     let events = events.lock().expect("lock");
     events.iter().rev().find_map(|event| match event {

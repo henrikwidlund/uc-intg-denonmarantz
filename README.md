@@ -16,6 +16,7 @@ work without a new setup.
   repeat and button sequences. Text of up to 28 characters is sent to the receiver as it is.
 - **Selects**: sound mode, input source, reference level, dynamic volume, dimmer, eco mode. With telnet also
   monitor output, speaker preset, picture mode, digital codec and, if the receiver has Dirac, the Dirac filter (only the slots that have a filter).
+  With telnet, the sound mode select offers the modes that the receiver lists for the current input.
 - **More entities** (with telnet): switches for tone control, Dynamic EQ, the three trigger outputs and the
   Bluetooth transmitter; numbers for bass and treble; selects for the Audyssey MultEQ mode, the quick select
   (smart select on Marantz), the tuner band and the Bluetooth output; a sensor for the active Dirac filter.

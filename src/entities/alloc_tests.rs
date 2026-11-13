@@ -66,6 +66,7 @@ fn build_some(state: &State, cfg: &DeviceConfig, keep: impl Fn(EntityKind) -> bo
         connected: true,
         artwork_url: None,
         paused: false,
+        sound_mode: super::select::active_sound_mode(state),
     };
     let mut keys = 0;
     for kind in EntityKind::all(cfg).filter(|k| keep(*k)) {

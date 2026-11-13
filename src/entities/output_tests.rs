@@ -54,6 +54,7 @@ fn view<'a>(state: &'a State, cfg: &'a DeviceConfig) -> View<'a> {
         connected: true,
         artwork_url: None,
         paused: false,
+        sound_mode: super::select::active_sound_mode(state),
     }
 }
 
@@ -376,6 +377,67 @@ fn the_sound_mode_list_has_the_groups_without_a_receiver_list() {
     let options = options.as_array().expect("options");
     assert!(options.contains(&json!("MOVIE")), "{options:?}");
     assert!(options.contains(&json!("STEREO")), "{options:?}");
+    assert!(!options.contains(&json!("MULTI CH IN")), "{options:?}");
+}
+
+/// The sound mode list of a receiver with a multichannel input.
+const SOUND_MODE_LIST: [&str; 6] = [
+    "OPSMLALL MOV001Stereo",
+    "OPSMLALL MOV002Multi Ch In",
+    "OPSMLALL MOV003Multi Ch Stereo",
+    "OPSMLALL MOV004Direct",
+    "OPSMLALL MOV005Pure Direct",
+    "OPSMLALL END",
+];
+
+#[test]
+fn the_sound_mode_select_marks_the_list_entry_of_the_reported_mode() {
+    let cfg = cfg();
+    for (reported, shown) in [
+        ("MSSTEREO", "Stereo"),
+        ("MSMULTI CH IN", "Multi Ch In"),
+        ("MSMCH STEREO", "Multi Ch Stereo"),
+        ("MSDIRECT", "Direct"),
+        ("MSPURE DIRECT", "Pure Direct"),
+    ] {
+        let mut lines = vec!["PWON"];
+        lines.extend(SOUND_MODE_LIST);
+        lines.push(reported);
+        let state = state(&lines);
+        let v = view(&state, &cfg);
+        assert_eq!(
+            json!(shown),
+            select(&v, SelectKind::SoundMode)["current_option"],
+            "{reported}"
+        );
+        assert_eq!(
+            json!(shown),
+            attrs(&v, EntityKind::MediaPlayer)["sound_mode"]
+        );
+    }
+    // A mode that is not in the list has no option.
+    let mut lines = vec!["PWON"];
+    lines.extend(SOUND_MODE_LIST);
+    lines.push("MSDOLBY ATMOS");
+    assert_eq!(None, super::select::active_sound_mode(&state(&lines)));
+}
+
+#[test]
+fn without_a_receiver_list_the_sound_mode_select_marks_the_group() {
+    let cfg = cfg();
+    for (reported, shown) in [
+        ("MSSTEREO", "STEREO"),
+        ("MSDOLBY ATMOS", "DOLBY DIGITAL"),
+        // As in the Python integration: Multi Ch In is part of the movie group.
+        ("MSMULTI CH IN", "MOVIE"),
+    ] {
+        let state = state(&["PWON", reported]);
+        assert_eq!(
+            json!(shown),
+            select(&view(&state, &cfg), SelectKind::SoundMode)["current_option"],
+            "{reported}"
+        );
+    }
 }
 
 #[test]

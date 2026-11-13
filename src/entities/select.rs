@@ -13,7 +13,7 @@ use denon_marantz::proto::{
     HdmiOutput, MultiEq, PictureMode, ReferenceLevelOffset, SoundModeGroup, SpeakerPreset,
     TunerBand,
 };
-use denon_marantz::{Avr, SoundModeEntry, Zone};
+use denon_marantz::{Avr, SoundModeEntry, State, Zone};
 use serde_json::{Map, Value};
 
 /// Options of a select: the shown text, and the current one.
@@ -22,6 +22,30 @@ pub struct Choices {
     pub current: Option<String>,
     /// The options are numbers, as the Python integration sends them.
     pub numeric: bool,
+}
+
+/// The option of the active sound mode. The receiver reports its own text for it, for example
+/// `MULTI CH IN` for the list entry `Multi Ch In`. `None` if no option fits.
+pub fn active_sound_mode(state: &State) -> Option<&str> {
+    let raw = state.zone(Zone::Main).sound_mode.as_deref()?;
+    let modes = &state.device().sound_modes;
+    if modes.as_slice().is_empty() {
+        // Without the list, the options are the groups.
+        return SoundModeGroup::from_raw(raw)
+            .or_else(|| SoundModeGroup::guess_from_raw(raw))
+            .map(|group| group_option(group).code());
+    }
+    modes.entry_for(raw).map(|entry| entry.name.as_str())
+}
+
+/// The group option that shows a group. As in the Python integration, Multi Ch In is part of the
+/// movie group: it has no option of its own.
+fn group_option(group: SoundModeGroup) -> SoundModeGroup {
+    if group == SoundModeGroup::MultiChIn {
+        SoundModeGroup::Movie
+    } else {
+        group
+    }
 }
 
 /// Option order of the Python integration.
@@ -135,12 +159,18 @@ pub fn choices(v: &View<'_>, kind: SelectKind) -> Choices {
             }
             // Without telnet the receiver gives no list: the groups are the choices.
             if options.is_empty() {
-                options.extend(SoundModeGroup::ALL.iter().map(|g| g.code().to_owned()));
+                options.extend(
+                    SoundModeGroup::ALL
+                        .iter()
+                        .filter(|g| **g == group_option(**g))
+                        .map(|g| g.code().to_owned()),
+                );
             }
-            // The receiver reports its own name for the active mode.
+            // The receiver reports its own text for the active mode: `active_sound_mode` maps it to an
+            // option.
             Choices {
                 options,
-                current: zone.sound_mode.clone(),
+                current: v.sound_mode.map(str::to_owned),
                 numeric: false,
             }
         }

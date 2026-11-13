@@ -8,7 +8,7 @@ use crate::device::commands::{self, Expected};
 use crate::device::{
     Command, Connect, DeviceEvent, DeviceStatus, Disconnect, Stop, UpdateConfig, discovery,
 };
-use crate::entities::{self, EntityKind, SensorKind, View, remote};
+use crate::entities::{self, EntityKind, SensorKind, View, remote, select};
 use crate::errors::ServiceError;
 use actix::prelude::*;
 use denon_marantz::{
@@ -86,6 +86,9 @@ pub struct DenonActor {
     last: State,
     /// Last address of the picture of what plays.
     last_artwork: Option<String>,
+    /// The option of the active sound mode. The last one is kept while the receiver reports a
+    /// mode that is not in its list: after a change, it reports another mode for about 1 s.
+    sound_mode: Option<String>,
     /// What plays was reported after the last source change. The receiver keeps the values of the
     /// old source, so they are not shown before.
     status: DeviceStatus,
@@ -160,6 +163,7 @@ impl DenonActor {
             avr: None,
             last: State::new(true),
             last_artwork: None,
+            sound_mode: None,
             status: DeviceStatus::Disconnected,
             status_tx: watch::Sender::new(DeviceStatus::Disconnected),
             want: false,
@@ -203,12 +207,18 @@ impl DenonActor {
             let state = avr.state();
             let state = state.borrow();
             self.last_artwork = avr.artwork_url();
+            if let Some(mode) = select::active_sound_mode(&state)
+                && self.sound_mode.as_deref() != Some(mode)
+            {
+                self.sound_mode = Some(mode.to_owned());
+            }
             build_changes(
                 &state,
                 &self.cfg,
                 connected,
                 self.last_artwork.as_deref(),
                 self.paused,
+                self.sound_mode.as_deref(),
                 keep,
             )
         } else {
@@ -218,6 +228,7 @@ impl DenonActor {
                 connected,
                 self.last_artwork.as_deref(),
                 self.paused,
+                self.sound_mode.as_deref(),
                 keep,
             )
         };
@@ -401,6 +412,8 @@ impl DenonActor {
         // Values from before the connect are not valid anymore.
         self.expected.clear();
         self.paused = false;
+        // The list of the receiver can be another one now.
+        self.sound_mode = None;
         self.update_address(address, version);
 
         ctx.add_message_stream(
@@ -750,6 +763,7 @@ fn build_changes(
     connected: bool,
     artwork_url: Option<&str>,
     paused: bool,
+    sound_mode: Option<&str>,
     keep: impl Fn(EntityKind) -> bool,
 ) -> Vec<(EntityKind, Map<String, serde_json::Value>)> {
     let view = View {
@@ -758,6 +772,7 @@ fn build_changes(
         connected,
         artwork_url,
         paused,
+        sound_mode,
     };
     EntityKind::all(cfg)
         .filter(|kind| keep(*kind))
@@ -849,6 +864,10 @@ impl Handler<Changed> for DenonActor {
                 self.schedule_reload(ctx, parts);
             }
             self.clear_pause(change.setting);
+            // The kept sound mode can be missing from a new list.
+            if change.setting == Setting::SoundModes {
+                self.sound_mode = None;
+            }
             self.schedule_emit_for(change.setting, ctx);
         } else {
             // Changes were lost.
@@ -1115,7 +1134,10 @@ mod tests {
     /// The entities whose attributes differ between two states.
     fn changed_kinds(before: &State, after: &State) -> Vec<EntityKind> {
         let cfg = test_cfg();
-        let all = |state: &State| build_changes(state, &cfg, true, None, false, |_| true);
+        let all = |state: &State| {
+            let mode = select::active_sound_mode(state);
+            build_changes(state, &cfg, true, None, false, mode, |_| true)
+        };
         all(before)
             .into_iter()
             .zip(all(after))
