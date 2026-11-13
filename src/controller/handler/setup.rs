@@ -1406,6 +1406,20 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
 
+        /// Wait until the last event has this setup state. The configuration is saved off the
+        /// actix thread, so the end of a setup can take longer than [`settle`] on a slow machine.
+        async fn wait_state(events: &Mutex<Vec<Value>>, state: &str) {
+            let end = std::time::Instant::now() + Duration::from_secs(5);
+            while last(events)["state"] != state {
+                assert!(
+                    std::time::Instant::now() < end,
+                    "state {} instead of {state}",
+                    last(events)["state"]
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
         const PYTHON_CONFIG: &str = r#"[{"id": "SERIAL0000001", "name": "AVR", "address": "192.0.2.6", "support_sound_mode": true, "show_all_inputs": false, "use_telnet": true, "update_audyssey": false, "zone2": false, "zone3": false, "volume_step": 1.0, "timeout": 2000, "is_denon": true, "is_dirac_supported": true}]"#;
 
         /// The ids of the available entities.
@@ -1578,8 +1592,7 @@ mod tests {
                 .await
                 .expect("send")
                 .expect("ok");
-            settle().await;
-            assert_eq!(json!("OK"), last(&events)["state"]);
+            wait_state(&events, "OK").await;
             assert_eq!(55, entity_ids(&controller).await.len());
         }
 
@@ -1639,8 +1652,7 @@ mod tests {
                 .await
                 .expect("send")
                 .expect("ok");
-            settle().await;
-            assert_eq!(json!("OK"), last(&events)["state"]);
+            wait_state(&events, "OK").await;
             assert_eq!(15, entity_states(&controller).await.len());
         }
 
@@ -1667,8 +1679,7 @@ mod tests {
                 .await
                 .expect("send")
                 .expect("ok");
-            settle().await;
-            assert_eq!(json!("OK"), last(&events)["state"]);
+            wait_state(&events, "OK").await;
             assert_eq!(0, entity_ids(&controller).await.len());
         }
     }

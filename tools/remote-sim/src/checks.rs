@@ -474,21 +474,21 @@ pub async fn remote_ui(ctx: &mut Ctx) -> Check {
 
 // ---------------------------------------------------------------- wake and sleep
 
-fn connects(ctx: &Ctx) -> usize {
-    ctx.driver.log_text().matches("connected in").count()
+async fn connects(ctx: &Ctx) -> usize {
+    ctx.driver.log_text().await.matches("connected in").count()
 }
 
 pub async fn standby(ctx: &mut Ctx) -> Check {
     ensure_on(ctx).await?;
     let mp = ctx.mp();
-    let before = connects(ctx);
+    let before = connects(ctx).await;
     ctx.client.send_event("enter_standby").await?;
     ctx.client.listen(3).await?;
     let state = ctx.client.text(&mp, "state");
     ensure!(state != "UNAVAILABLE", "state in standby: {state}");
     ctx.client.send_event("exit_standby").await?;
     let start = Instant::now();
-    while connects(ctx) == before {
+    while connects(ctx).await == before {
         ensure!(
             start.elapsed() < Duration::from_secs(8),
             "no new connection after exit_standby"
@@ -1086,8 +1086,8 @@ pub async fn unreachable(ctx: &mut Ctx) -> Check {
 
 // ---------------------------------------------------------------- configuration file
 
-fn read_config(ctx: &Ctx) -> Result<Value, Fail> {
-    let text = std::fs::read_to_string(ctx.driver.config_file())?;
+async fn read_config(ctx: &Ctx) -> Result<Value, Fail> {
+    let text = tokio::fs::read_to_string(ctx.driver.config_file()).await?;
     serde_json::from_str(&text).map_err(|e| Fail::new(format!("config.json: {e}")))
 }
 
@@ -1110,7 +1110,7 @@ const PYTHON_FIELDS: [&str; 13] = [
 ];
 
 pub async fn config_file(ctx: &mut Ctx) -> Check {
-    let config = read_config(ctx)?;
+    let config = read_config(ctx).await?;
     let device = config
         .as_array()
         .and_then(|a| a.iter().find(|d| d["id"] == ctx.key.as_str()))
@@ -1138,6 +1138,22 @@ async fn settle(ctx: &mut Ctx) -> Result<(), Fail> {
         .map_err(|e| Fail::new(format!("30 s after the start: {e}")))
 }
 
+/// The configuration files that the driver moved away because it could not read them.
+async fn bad_configs(ctx: &Ctx) -> Result<Vec<std::path::PathBuf>, Fail> {
+    let mut entries = tokio::fs::read_dir(&ctx.driver.dir).await?;
+    let mut found = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("config.json.bad-")
+        {
+            found.push(entry.path());
+        }
+    }
+    Ok(found)
+}
+
 /// Start the driver again with a changed configuration file.
 async fn restart(ctx: &mut Ctx) -> Result<(), Fail> {
     ctx.driver.start().await?;
@@ -1146,8 +1162,8 @@ async fn restart(ctx: &mut Ctx) -> Result<(), Fail> {
 
 pub async fn python_config(ctx: &mut Ctx) -> Check {
     let ids = entity_ids(ctx).await?;
-    let good = std::fs::read_to_string(ctx.driver.config_file())?;
-    let mut config = read_config(ctx)?;
+    let good = tokio::fs::read_to_string(ctx.driver.config_file()).await?;
+    let mut config = read_config(ctx).await?;
     // The file of the Python integration has no field for the signal read.
     for device in config.as_array_mut().into_iter().flatten() {
         if let Some(device) = device.as_object_mut() {
@@ -1155,7 +1171,7 @@ pub async fn python_config(ctx: &mut Ctx) -> Check {
         }
     }
     ctx.driver.stop().await;
-    std::fs::write(ctx.driver.config_file(), config.to_string())?;
+    tokio::fs::write(ctx.driver.config_file(), config.to_string()).await?;
     let result = async {
         restart(ctx).await?;
         let after = entity_ids(ctx).await?;
@@ -1171,7 +1187,7 @@ pub async fn python_config(ctx: &mut Ctx) -> Check {
     }
     .await;
     ctx.driver.stop().await;
-    std::fs::write(ctx.driver.config_file(), good)?;
+    tokio::fs::write(ctx.driver.config_file(), good).await?;
     restart(ctx).await?;
     subscribe_all(ctx).await?;
     settle(ctx).await?;
@@ -1179,40 +1195,25 @@ pub async fn python_config(ctx: &mut Ctx) -> Check {
 }
 
 pub async fn broken_config(ctx: &mut Ctx) -> Check {
-    let good = std::fs::read_to_string(ctx.driver.config_file())?;
+    let good = tokio::fs::read_to_string(ctx.driver.config_file()).await?;
     ctx.driver.stop().await;
-    std::fs::write(ctx.driver.config_file(), "[{\"broken\": ")?;
+    tokio::fs::write(ctx.driver.config_file(), "[{\"broken\": ").await?;
     let result = async {
         restart(ctx).await?;
         ctx.client
             .request_ok("get_driver_version", Value::Null)
             .await?;
         ensure!(ctx.driver.alive(), "the driver ended");
-        let moved = std::fs::read_dir(&ctx.driver.dir)?
-            .filter_map(Result::ok)
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("config.json.bad-")
-            })
-            .count();
+        let moved = bad_configs(ctx).await?.len();
         ensure!(moved == 1, "{moved} moved files");
         Ok("the driver runs, the file was moved".to_owned())
     }
     .await;
     ctx.driver.stop().await;
-    if let Ok(entries) = std::fs::read_dir(&ctx.driver.dir) {
-        for entry in entries.filter_map(Result::ok) {
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("config.json.bad-")
-            {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
+    for path in bad_configs(ctx).await.unwrap_or_default() {
+        let _ = tokio::fs::remove_file(path).await;
     }
-    std::fs::write(ctx.driver.config_file(), good)?;
+    tokio::fs::write(ctx.driver.config_file(), good).await?;
     restart(ctx).await?;
     subscribe_all(ctx).await?;
     wait_available(ctx, 20).await?;
@@ -1236,7 +1237,7 @@ pub async fn restore_power(ctx: &mut Ctx) -> Check {
 }
 
 pub async fn log(ctx: &mut Ctx) -> Check {
-    let text = ctx.driver.log_text();
+    let text = ctx.driver.log_text().await;
     let lines = |tag: &str| -> Vec<&str> { text.lines().filter(|l| l.contains(tag)).collect() };
     // The broken file check causes one ERROR line.
     let errors: Vec<&str> = lines(" ERROR ")
@@ -1500,7 +1501,7 @@ pub async fn select_sweep(ctx: &mut Ctx) -> Check {
 /// Set one option, wait for the select and its sensor, then compare with the receiver.
 async fn sweep_one(ctx: &mut Ctx, kind: &str, option: &Value) -> Result<Outcome, Fail> {
     let select = ctx.select(kind);
-    let log_start = ctx.driver.log_text().len();
+    let log_start = ctx.driver.log_text().await.len();
     let (response, _) = ctx
         .client
         .command(
@@ -1523,6 +1524,7 @@ async fn sweep_one(ctx: &mut Ctx, kind: &str, option: &Value) -> Result<Outcome,
         && let Some(reason) = ctx
             .driver
             .log_text()
+            .await
             .get(log_start..)
             .and_then(|new| new.split_once(IGNORED))
             .and_then(|(_, rest)| rest.lines().next())
@@ -1597,7 +1599,8 @@ pub async fn simple_commands(ctx: &mut Ctx) -> Check {
             .find(|e| e["entity_id"] == remote.as_str())
             .map_or(Value::Null, |e| e["options"]["simple_commands"].clone()),
     );
-    let table = std::fs::read_to_string(&ctx.opt.commands)
+    let table = tokio::fs::read_to_string(&ctx.opt.commands)
+        .await
         .map_err(|e| Fail::new(format!("{}: {e}", ctx.opt.commands.display())))?;
     let names: Vec<&str> = table
         .lines()

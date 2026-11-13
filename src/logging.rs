@@ -114,9 +114,18 @@ mod tests {
     async fn library_log_lines_reach_the_log() {
         log::set_logger(&CAPTURE).expect("logger");
         log::set_max_level(Level::Debug.to_level_filter());
-        // Nothing listens on this address, so the library logs that it got no answer.
-        let result =
-            denon_marantz::identify("127.0.0.1", denon_marantz::HttpConfig::default()).await;
+        // Nothing listens on this port, so the library logs that it got no answer. A fixed port
+        // can be in use on a test machine.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("free port")
+            .port();
+        let result = denon_marantz::identify_on(
+            "127.0.0.1",
+            &[(denon_marantz::ReceiverType::AvrX, port)],
+            denon_marantz::HttpConfig::default(),
+        )
+        .await;
         assert!(result.is_err());
         let lines = CAPTURE.0.lock().expect("lock").clone();
         assert!(
