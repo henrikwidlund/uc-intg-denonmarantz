@@ -11,6 +11,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
 
 const DESCRIPTION: &[u8] = include_bytes!("test_data/description.xml");
 const INFO: &[u8] =
@@ -110,6 +111,8 @@ pub struct Fake {
     app_commands: Arc<AtomicUsize>,
     /// The receiver is gone from its address: it closes every connection.
     gone: Arc<AtomicBool>,
+    /// The tasks that accept connections. They end when the receiver leaves.
+    accepts: Vec<AbortHandle>,
 }
 
 /// The description of a Marantz receiver: the manufacturer is the only difference.
@@ -139,10 +142,11 @@ impl Fake {
         let commands = Arc::new(Mutex::new(Vec::new()));
         let app_commands = Arc::new(AtomicUsize::new(0));
         let gone = Arc::new(AtomicBool::new(false));
+        let mut accepts = Vec::with_capacity(listeners.len());
         for listener in listeners {
             let (seen, asked, closed) = (commands.clone(), app_commands.clone(), gone.clone());
             let description = description.clone();
-            tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 while let Ok((socket, _)) = listener.accept().await {
                     if closed.load(Ordering::SeqCst) {
                         continue;
@@ -157,18 +161,23 @@ impl Fake {
                     ));
                 }
             });
+            accepts.push(task.abort_handle());
         }
         Self {
             port,
             commands,
             app_commands,
             gone,
+            accepts,
         }
     }
 
-    /// The receiver leaves its address: it answers no request from now on.
+    /// The receiver leaves its address: the port is closed and open connections get no answer.
     pub fn leave(&self) {
         self.gone.store(true, Ordering::SeqCst);
+        for task in &self.accepts {
+            task.abort();
+        }
     }
 
     /// The port of the receiver.
@@ -398,6 +407,8 @@ pub struct FakeTelnet {
     connections: Arc<AtomicUsize>,
     /// New connections are closed at once.
     gone: Arc<AtomicBool>,
+    /// The tasks that accept connections. They end when the receiver leaves.
+    accepts: Vec<AbortHandle>,
 }
 
 impl FakeTelnet {
@@ -409,10 +420,11 @@ impl FakeTelnet {
         let connections = Arc::new(AtomicUsize::new(0));
         let gone = Arc::new(AtomicBool::new(false));
         let answers: Answers = Arc::new(answers);
+        let mut accepts = Vec::with_capacity(listeners.len());
         for listener in listeners {
             let (seen, slot, count) = (received.clone(), control.clone(), connections.clone());
             let (closed, answers) = (gone.clone(), answers.clone());
-            tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 while let Ok((socket, _)) = listener.accept().await {
                     if closed.load(Ordering::SeqCst) {
                         continue;
@@ -423,6 +435,7 @@ impl FakeTelnet {
                     tokio::spawn(serve_telnet(socket, answers.clone(), seen.clone(), rx));
                 }
             });
+            accepts.push(task.abort_handle());
         }
         Self {
             port,
@@ -430,12 +443,16 @@ impl FakeTelnet {
             control,
             connections,
             gone,
+            accepts,
         }
     }
 
-    /// Close the connection and refuse new ones.
+    /// Close the connection and the port.
     pub fn leave(&self) {
         self.gone.store(true, Ordering::SeqCst);
+        for task in &self.accepts {
+            task.abort();
+        }
         self.close();
     }
 
