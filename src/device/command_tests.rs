@@ -26,6 +26,8 @@ fn cfg() -> DeviceConfig {
         is_denon: true,
         is_dirac_supported: Some(true),
         signal_poll_secs: 0,
+        receiver_type: None,
+        update_method: None,
     }
 }
 
@@ -93,7 +95,7 @@ async fn the_bass_and_treble_numbers_send_levels() {
     .await;
     // The library turns the tone control on first.
     assert_eq!(vec!["PSTONE%20CTRL%20ON", "PSBAS%2052"], commands);
-    // The level is not known: it counts as 0 dB.
+    // The level is 0 dB.
     let commands = sent(EntityKind::Number(NumberKind::Treble), "increment", None).await;
     assert_eq!(vec!["PSTONE%20CTRL%20ON", "PSTRE%2051"], commands);
     let high = params(&json!({ "value": 20 }));

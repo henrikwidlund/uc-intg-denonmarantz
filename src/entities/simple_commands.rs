@@ -201,6 +201,8 @@ mod tests {
             is_denon,
             is_dirac_supported: None,
             signal_poll_secs: 0,
+            receiver_type: None,
+            update_method: None,
         }
     }
 

@@ -88,8 +88,8 @@ const TUNER_BANDS: &[TunerBand] = &[TunerBand::Am, TunerBand::Fm];
 /// Quick selects of a receiver: the first five exist on all models.
 const QUICK_SELECTS: usize = 5;
 
-/// Six selects always exist. With a telnet connection there are four more, and the Dirac filter
-/// if the receiver supports it.
+/// Six selects always exist. With a telnet connection there are more, and the Dirac filter if the
+/// receiver supports it. The `MultEq` select also comes with `AppCommand` over HTTP.
 pub const fn available(cfg: &DeviceConfig, kind: SelectKind) -> bool {
     match kind {
         SelectKind::SoundMode
@@ -102,10 +102,10 @@ pub const fn available(cfg: &DeviceConfig, kind: SelectKind) -> bool {
         | SelectKind::SpeakerPreset
         | SelectKind::PictureMode
         | SelectKind::DigitalCodec
-        | SelectKind::MultiEq
         | SelectKind::QuickSelect
         | SelectKind::TunerBand
         | SelectKind::BluetoothOutput => cfg.use_telnet,
+        SelectKind::MultiEq => cfg.use_telnet || cfg.reads_app_command(),
         SelectKind::DiracFilter => cfg.use_telnet && cfg.has_dirac(),
     }
 }

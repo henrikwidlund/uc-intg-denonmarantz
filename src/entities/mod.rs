@@ -356,6 +356,8 @@ mod tests {
             is_denon: true,
             is_dirac_supported: Some(dirac),
             signal_poll_secs: 0,
+            receiver_type: None,
+            update_method: None,
         }
     }
 
@@ -378,6 +380,65 @@ mod tests {
         assert_eq!((11, 29), count(&cfg(true, true)));
         assert_eq!((10, 29), count(&cfg(true, false)));
         assert_eq!((6, 7), count(&cfg(false, true)));
+    }
+
+    #[test]
+    fn http_mode_offers_what_the_receiver_reads_over_http() {
+        use crate::config_store::{HttpReadMethod, ReceiverGeneration};
+        let http = |receiver_type, update_method| DeviceConfig {
+            receiver_type,
+            update_method,
+            ..cfg(false, true)
+        };
+        let extra = |c: &DeviceConfig| {
+            EntityKind::all(c)
+                .filter(|k| !EntityKind::all(&cfg(false, true)).any(|base| base == *k))
+                .collect::<Vec<_>>()
+        };
+        let app_command = [
+            EntityKind::Select(SelectKind::MultiEq),
+            EntityKind::Switch(SwitchKind::ToneControl),
+            EntityKind::Switch(SwitchKind::DynamicEq),
+            EntityKind::Number(NumberKind::Bass),
+            EntityKind::Number(NumberKind::Treble),
+        ];
+        let signal = [
+            SensorKind::AudioSignal,
+            SensorKind::AudioSamplingRate,
+            SensorKind::VideoHdmiSignalIn,
+            SensorKind::VideoHdmiSignalOut,
+            SensorKind::InputChannels,
+            SensorKind::OutputChannels,
+        ]
+        .map(EntityKind::Sensor);
+
+        let x2016 = extra(&http(
+            Some(ReceiverGeneration::AvrX2016),
+            Some(HttpReadMethod::AppCommand),
+        ));
+        assert_eq!(app_command.len() + signal.len(), x2016.len(), "{x2016:?}");
+        assert!(app_command.iter().chain(&signal).all(|k| x2016.contains(k)));
+
+        let avr_x = extra(&http(
+            Some(ReceiverGeneration::AvrX),
+            Some(HttpReadMethod::AppCommand),
+        ));
+        assert_eq!(app_command.as_slice(), avr_x.as_slice());
+
+        for (receiver_type, update_method) in [
+            (
+                Some(ReceiverGeneration::AvrX),
+                Some(HttpReadMethod::StatusPages),
+            ),
+            (
+                Some(ReceiverGeneration::Avr),
+                Some(HttpReadMethod::StatusPages),
+            ),
+            (None, None),
+        ] {
+            let c = http(receiver_type, update_method);
+            assert!(extra(&c).is_empty(), "{receiver_type:?} {update_method:?}");
+        }
     }
 
     #[test]

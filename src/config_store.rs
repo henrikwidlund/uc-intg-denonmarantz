@@ -68,6 +68,37 @@ pub struct DeviceConfig {
         deserialize_with = "zero_if_null"
     )]
     pub signal_poll_secs: u16,
+    /// The receiver generation. It is found at the setup and checked at each connect.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "none_if_unknown"
+    )]
+    pub receiver_type: Option<ReceiverGeneration>,
+    /// How the receiver is read over HTTP. It is found at the setup and checked at each connect.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "none_if_unknown"
+    )]
+    pub update_method: Option<HttpReadMethod>,
+}
+
+/// The receiver generation, as the library reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiverGeneration {
+    Avr,
+    AvrX,
+    AvrX2016,
+}
+
+/// How the receiver is read over HTTP, as the library reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpReadMethod {
+    AppCommand,
+    StatusPages,
 }
 
 impl DeviceConfig {
@@ -78,6 +109,16 @@ impl DeviceConfig {
 
     pub const fn has_dirac(&self) -> bool {
         matches!(self.is_dirac_supported, Some(true))
+    }
+
+    /// The receiver is read with `AppCommand`: tone control and Audyssey come over HTTP too.
+    pub const fn reads_app_command(&self) -> bool {
+        matches!(self.update_method, Some(HttpReadMethod::AppCommand))
+    }
+
+    /// The signal comes over HTTP. This is tested only on the 2016 generation.
+    pub const fn reads_signal(&self) -> bool {
+        self.reads_app_command() && matches!(self.receiver_type, Some(ReceiverGeneration::AvrX2016))
     }
 }
 
@@ -92,6 +133,14 @@ fn false_if_null<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
 
 fn step_if_null<'de, D: Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
     Ok(Option::<f32>::deserialize(d)?.unwrap_or_else(default_volume_step))
+}
+
+/// A value that this version does not know reads as `None`, so the file still loads.
+fn none_if_unknown<'de, D: Deserializer<'de>, T: DeserializeOwned>(
+    d: D,
+) -> Result<Option<T>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(value.and_then(|v| T::deserialize(v).ok()))
 }
 
 fn timeout_if_null<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
@@ -456,6 +505,8 @@ mod tests {
             is_denon: false,
             is_dirac_supported: Some(true),
             signal_poll_secs: 10,
+            receiver_type: None,
+            update_method: None,
         }
     }
 
@@ -476,6 +527,43 @@ mod tests {
         let python: serde_json::Value = serde_json::from_str(PYTHON_CONFIG).expect("json");
         let ours: serde_json::Value = serde_json::from_str(&text).expect("json");
         assert_eq!(python, ours);
+    }
+
+    #[test]
+    fn the_receiver_kind_is_kept_and_a_python_config_has_none() {
+        let python: Vec<DeviceConfig> = serde_json::from_str(PYTHON_CONFIG).expect("json");
+        assert_eq!(
+            (None, None),
+            (python[0].receiver_type, python[0].update_method)
+        );
+        // A file without the values stays without them.
+        let text = serde_json::to_string(&python[0]).expect("json");
+        assert!(
+            !text.contains("receiver_type") && !text.contains("update_method"),
+            "{text}"
+        );
+
+        let d = DeviceConfig {
+            receiver_type: Some(ReceiverGeneration::AvrX2016),
+            update_method: Some(HttpReadMethod::AppCommand),
+            ..device()
+        };
+        let text = serde_json::to_string(&d).expect("json");
+        assert!(
+            text.contains(r#""receiver_type":"avr_x2016""#)
+                && text.contains(r#""update_method":"app_command""#),
+            "{text}"
+        );
+        assert_eq!(d, serde_json::from_str(&text).expect("json"));
+    }
+
+    #[test]
+    fn an_unknown_receiver_kind_reads_as_none() {
+        let d: DeviceConfig = serde_json::from_str(
+            r#"{"id":"A","name":"C","address":"h","receiver_type":"avr_z","update_method":7}"#,
+        )
+        .expect("json");
+        assert_eq!((None, None), (d.receiver_type, d.update_method));
     }
 
     #[test]

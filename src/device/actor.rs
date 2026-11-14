@@ -415,6 +415,7 @@ impl DenonActor {
         // The list of the receiver can be another one now.
         self.sound_mode = None;
         self.update_address(address, version);
+        self.update_receiver_kind(&avr, version);
 
         ctx.add_message_stream(
             BroadcastStream::new(changes).map(move |change| Changed(generation, change.ok())),
@@ -444,6 +445,28 @@ impl DenonActor {
         self.emit();
     }
 
+    /// Take the generation and the HTTP read method of the receiver. A configuration of the Python
+    /// integration does not have them. The controller saves them.
+    fn update_receiver_kind(&mut self, avr: &Avr, version: u64) {
+        let info = avr.info();
+        let kind = (
+            discovery::receiver_type(info),
+            discovery::update_method(info),
+        );
+        if self.cfg_version != version || kind == (self.cfg.receiver_type, self.cfg.update_method) {
+            return;
+        }
+        info!(
+            "[{}] receiver type {:?}, read with {:?}",
+            self.cfg.name, kind.0, kind.1
+        );
+        (self.cfg.receiver_type, self.cfg.update_method) = kind;
+        self.controller.do_send(DeviceEvent::Config {
+            key: self.key.clone(),
+            cfg: self.cfg.clone(),
+        });
+    }
+
     /// Take the address that was found by the search. The controller saves it.
     fn update_address(&mut self, address: Option<String>, version: u64) {
         let Some(address) = address else { return };
@@ -462,7 +485,9 @@ impl DenonActor {
     }
 
     /// Read the state over HTTP and show if the receiver answers. It does nothing while telnet
-    /// reports the changes, or while an earlier read runs.
+    /// reports the changes, or while an earlier read runs. In HTTP mode Audyssey and the signal are
+    /// read after the state: the library asks only receivers that use `AppCommand`. In telnet mode
+    /// they are not: while telnet is down, a blank answer would clear the values of telnet.
     fn poll_http(&mut self, ctx: &mut Context<Self>) {
         if !self.needs_poll() || self.polling {
             return;
@@ -470,13 +495,26 @@ impl DenonActor {
         let Some(avr) = self.avr.clone() else { return };
         self.polling = true;
         let generation = self.generation;
-        ctx.spawn(async move { avr.update().await }.into_actor(self).map(
-            move |result, act, ctx| {
+        let audyssey = !self.cfg.use_telnet;
+        ctx.spawn(
+            async move {
+                let result = avr.update().await;
+                let extra = match &result {
+                    Ok(()) if audyssey => Some(avr.update_signal_and_audyssey().await),
+                    _ => None,
+                };
+                (result, extra)
+            }
+            .into_actor(self)
+            .map(move |(result, extra), act, ctx| {
                 // A result of an older connection must not clear the flag of the new one.
                 if act.generation != generation {
                     return;
                 }
                 act.polling = false;
+                if let Some(Err(e)) = &extra {
+                    debug!("[{}] Audyssey and signal not read: {e}", act.cfg.name);
+                }
                 let ok = result.is_ok();
                 if let Err(e) = &result {
                     debug!("[{}] read over HTTP failed: {e}", act.cfg.name);
@@ -505,8 +543,8 @@ impl DenonActor {
                 if flipped {
                     act.schedule_emit(ctx);
                 }
-            },
-        ));
+            }),
+        );
     }
 
     fn poll_signal(&mut self, ctx: &mut Context<Self>) {
@@ -1118,6 +1156,8 @@ mod tests {
             is_denon: true,
             is_dirac_supported: Some(true),
             signal_poll_secs: 0,
+            receiver_type: None,
+            update_method: None,
         }
     }
 

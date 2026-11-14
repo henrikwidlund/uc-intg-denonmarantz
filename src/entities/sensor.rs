@@ -78,12 +78,23 @@ pub const fn name(kind: SensorKind) -> &'static str {
     }
 }
 
-/// The first seven sensors always exist, the others only with a telnet connection.
+/// The first seven sensors always exist, the others only with a telnet connection. The signal
+/// sensors that `Avr::update_signal_and_audyssey` reads also come over HTTP.
 pub const fn available(cfg: &DeviceConfig, kind: SensorKind) -> bool {
     if matches!(kind, SensorKind::DiracFilter) {
         return cfg.use_telnet && cfg.has_dirac();
     }
     cfg.use_telnet
+        || (cfg.reads_signal()
+            && matches!(
+                kind,
+                SensorKind::AudioSignal
+                    | SensorKind::AudioSamplingRate
+                    | SensorKind::VideoHdmiSignalIn
+                    | SensorKind::VideoHdmiSignalOut
+                    | SensorKind::InputChannels
+                    | SensorKind::OutputChannels
+            ))
         || matches!(
             kind,
             SensorKind::VolumeDb

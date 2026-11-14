@@ -29,6 +29,8 @@ fn cfg() -> DeviceConfig {
         is_denon: true,
         is_dirac_supported: Some(true),
         signal_poll_secs: 0,
+        receiver_type: None,
+        update_method: None,
     }
 }
 

@@ -6,7 +6,7 @@
 //! above the limit in `checks::MAX_VOLUME`.
 //!
 //! Usage: `remote-sim <receiver address> [--driver <path>] [--only a,b] [--skip a,b]
-//! [--kinds a,b] [--no-power] [--no-oracle] [--port <port>] [--commands <path>]`
+//! [--kinds a,b] [--avoid-sources a,b] [--no-power] [--no-oracle] [--port <port>] [--commands <path>]`
 
 mod checks;
 mod driver;
@@ -68,6 +68,18 @@ pub struct Options {
     pub commands: PathBuf,
     /// Selects for the sweep. Empty: all.
     pub kinds: Vec<String>,
+    /// Sources that the checks never select. The names are compared without case.
+    pub avoid_sources: Vec<String>,
+}
+
+impl Options {
+    /// A source that the checks may select.
+    pub fn may_select(&self, source: &str) -> bool {
+        !self
+            .avoid_sources
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(source))
+    }
 }
 
 pub struct Ctx {
@@ -155,6 +167,7 @@ fn parse() -> Result<Options, String> {
         port: 19090,
         commands: PathBuf::from("resources/commands.tsv"),
         kinds: Vec::new(),
+        avoid_sources: Vec::new(),
     };
     let list = |v: Option<String>| -> Vec<String> {
         v.unwrap_or_default()
@@ -169,6 +182,7 @@ fn parse() -> Result<Options, String> {
             "--skip" => opt.skip = list(args.next()),
             "--commands" => opt.commands = args.next().ok_or("--commands needs a path")?.into(),
             "--kinds" => opt.kinds = list(args.next()),
+            "--avoid-sources" => opt.avoid_sources = list(args.next()),
             "--no-oracle" => opt.no_oracle = true,
             "--no-power" => opt.no_power = true,
             "--port" => {
@@ -193,7 +207,7 @@ async fn main() {
         Ok(o) => o,
         Err(e) => {
             eprintln!(
-                "{e}\nUsage: remote-sim <receiver address> [--driver <path>] [--only a,b] [--skip a,b] [--kinds a,b] [--no-power] [--no-oracle] [--port <port>] [--commands <path>]"
+                "{e}\nUsage: remote-sim <receiver address> [--driver <path>] [--only a,b] [--skip a,b] [--kinds a,b] [--avoid-sources a,b] [--no-power] [--no-oracle] [--port <port>] [--commands <path>]"
             );
             std::process::exit(2);
         }

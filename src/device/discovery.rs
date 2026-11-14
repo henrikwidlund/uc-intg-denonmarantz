@@ -3,10 +3,10 @@
 
 //! Find receivers on the network and connect to them.
 
-use crate::config_store::DeviceConfig;
+use crate::config_store::{self, DeviceConfig};
 use denon_marantz::{
     Ask, Avr, AvrBuilder, DiscoveredReceiver, DiscoveryConfig, Error, PageStatus, Query,
-    QueryGroup, ReceiverType, StartOptions, StartReport, Started, discover_all,
+    QueryGroup, ReceiverType, StartOptions, StartReport, Started, UpdateMethod, discover_all,
 };
 use log::debug;
 use std::sync::Arc;
@@ -245,6 +245,8 @@ pub struct Identified {
     pub is_denon: bool,
     pub is_dirac_supported: bool,
     pub support_sound_mode: bool,
+    pub receiver_type: Option<config_store::ReceiverGeneration>,
+    pub update_method: Option<config_store::HttpReadMethod>,
 }
 
 impl Identified {
@@ -262,7 +264,30 @@ impl Identified {
             is_dirac_supported: info.dirac_live,
             // Receivers that are not AVR-X have no sound mode list.
             support_sound_mode: info.receiver_type != ReceiverType::Avr,
+            receiver_type: receiver_type(info),
+            update_method: update_method(info),
         })
+    }
+}
+
+/// The receiver generation for the configuration. `None` for a generation that this version does
+/// not know.
+pub const fn receiver_type(info: &denon_marantz::Info) -> Option<config_store::ReceiverGeneration> {
+    match info.receiver_type {
+        ReceiverType::Avr => Some(config_store::ReceiverGeneration::Avr),
+        ReceiverType::AvrX => Some(config_store::ReceiverGeneration::AvrX),
+        ReceiverType::AvrX2016 => Some(config_store::ReceiverGeneration::AvrX2016),
+        _ => None,
+    }
+}
+
+/// How the receiver is read over HTTP, for the configuration. `None` for a method that this
+/// version does not know.
+pub const fn update_method(info: &denon_marantz::Info) -> Option<config_store::HttpReadMethod> {
+    match info.update_method {
+        UpdateMethod::AppCommand => Some(config_store::HttpReadMethod::AppCommand),
+        UpdateMethod::StatusPages => Some(config_store::HttpReadMethod::StatusPages),
+        _ => None,
     }
 }
 

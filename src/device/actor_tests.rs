@@ -7,7 +7,7 @@
 
 use super::discovery::{TEST_BUILDER, TEST_DISCOVERY, TestBuilder};
 use super::{Command, Connect, DenonActor, DeviceEvent, DeviceStatus, Disconnect};
-use crate::config_store::DeviceConfig;
+use crate::config_store::{self, DeviceConfig};
 use crate::entities::sensor::EMPTY;
 use crate::entities::{EntityKind, SelectKind, SensorKind, SwitchKind};
 use crate::test_support::{Fake, FakeTelnet, test_builder};
@@ -56,6 +56,8 @@ fn cfg() -> DeviceConfig {
         is_denon: true,
         is_dirac_supported: Some(true),
         signal_poll_secs: 0,
+        receiver_type: None,
+        update_method: None,
     }
 }
 
@@ -560,4 +562,41 @@ async fn audyssey_values_stay_known_after_a_blank_http_answer() {
         Some(Value::from("OFF")),
         entity_state(&events, kind, "state")
     );
+}
+
+#[actix::test]
+async fn the_connect_adds_the_receiver_kind_to_the_configuration() {
+    let rig = rig(answers_all, QUICK).await;
+    let reported = || {
+        rig.events.lock().expect("lock").iter().any(|event| {
+            matches!(event, DeviceEvent::Config { cfg, .. }
+                if cfg.receiver_type == Some(config_store::ReceiverGeneration::AvrX)
+                    && cfg.update_method == Some(config_store::HttpReadMethod::AppCommand))
+        })
+    };
+    until("the receiver kind", 5, reported).await;
+}
+
+#[actix::test]
+async fn the_http_poll_reads_audyssey_and_the_signal() {
+    let http = Fake::start(true).await;
+    let http_port = http.port();
+    let setup: TestBuilder = Rc::new(move |_, builder| test_builder(http_port, 1, builder));
+    TEST_BUILDER.with(|slot| *slot.borrow_mut() = Some(setup));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let collector = Collector(events.clone()).start();
+    let cfg = DeviceConfig {
+        use_telnet: false,
+        ..cfg()
+    };
+    let actor = DenonActor::new("SERIAL0000001".into(), cfg, collector.recipient())
+        .with_poll_interval(QUICK)
+        .start();
+    actor.send(Connect).await.expect("connect");
+    until("the first poll", 5, || http.app_commands() >= 2).await;
+    let before = http.audyssey_reads();
+    until("two more reads of Audyssey", 5, || {
+        http.audyssey_reads() >= before + 2
+    })
+    .await;
 }

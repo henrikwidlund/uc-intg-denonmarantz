@@ -648,7 +648,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=c16cc2a#c16cc2a5d4e1a791ba86e7bbe905378956f7d5be"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=dcc53d7#dcc53d7695a3d9a02516af40b8648c6aef7164a9"
 dependencies = [
  "bytes",
  "denon-marantz-discovery",
@@ -667,7 +667,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz-discovery"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=c16cc2a#c16cc2a5d4e1a791ba86e7bbe905378956f7d5be"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=dcc53d7#dcc53d7695a3d9a02516af40b8648c6aef7164a9"
 dependencies = [
  "http 1.5.0",
 ]
@@ -675,7 +675,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz-proto"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=c16cc2a#c16cc2a5d4e1a791ba86e7bbe905378956f7d5be"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=dcc53d7#dcc53d7695a3d9a02516af40b8648c6aef7164a9"
 dependencies = [
  "quick-xml",
  "thiserror",

@@ -57,12 +57,16 @@ to the log that says why.
   is recommended.
 - Some receivers allow only one telnet connection. If telnet does not work for you, use the connection mode
   _Use HTTP connection_. In this mode the driver reads the receiver every 10 seconds and after each
-  command. Only the media player, the remote, 6 selects (sound mode, input source, reference level, dynamic volume, dimmer, eco mode) and 7 sensors
-  (volume in dB, absolute volume, sound mode, input source, mute, dimmer, eco mode) exist: no switches and
-  no numbers. The sound mode select offers the sound mode groups, for example `MOVIE`.
+  command. All receivers have the media player, the remote, 6 selects (sound mode, input source, reference
+  level, dynamic volume, dimmer, eco mode) and 7 sensors (volume in dB, absolute volume, sound mode, input
+  source, mute, dimmer, eco mode). Receivers that the driver reads with the newer HTTP interface also have
+  the MultEQ select, the tone control and Dynamic EQ switches, and the bass and treble numbers. Models from
+  2016 and later also have the sensors for the audio signal, sampling rate, HDMI video in and out, and the
+  input and output channels. The sound mode select offers the sound mode groups, for example `MOVIE`.
 
-Changing the connection mode changes the number of entities. Entities that no longer exist are removed in the
-Remote. Pages and activities that used them show them as orphaned.
+Changing the connection mode does not remove entities. If you add entities while using telnet and then change to
+HTTP only, the entities that need telnet stay in the integration as unavailable. Remove them in the web
+configurator of the Remote.
 
 ## Install on the Remote
 
@@ -157,6 +161,7 @@ Options:
 - `--only a,b` and `--skip a,b` select checks by name. `--only` must also name the first checks
   `metadata,setup,entities,states`: the other checks need them.
 - `--kinds a,b` limits the select sweep to these selects, for example `dirac_filter`.
+- `--avoid-sources a,b`: the checks never select these sources. Names are compared without case.
 - `--no-power` skips the power check. The other checks still switch the receiver on if it is off.
 - `--no-oracle` does not open the second connection. The values are then not compared with the receiver.
 - `--driver <path>`, `--port <port>` and `--commands <path>` change the driver binary, the port and the

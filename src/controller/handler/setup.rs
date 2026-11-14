@@ -637,6 +637,8 @@ impl Controller {
                         is_denon: options.is_denon,
                         is_dirac_supported: Some(identified.is_dirac_supported),
                         signal_poll_secs: options.signal_poll_secs,
+                        receiver_type: identified.receiver_type,
+                        update_method: identified.update_method,
                     };
                     if let Some(device) = act.devices.get_mut(cfg.key()) {
                         device.cfg = cfg.clone();
@@ -1643,7 +1645,8 @@ mod tests {
             // The page comes after the check for Dirac, which waits for an address that does not
             // answer.
             tokio::time::sleep(Duration::from_millis(2500)).await;
-            // HTTP only: the media player, the remote, 6 selects and 7 sensors.
+            // A configuration without the receiver type, HTTP only: the media player, the remote,
+            // 6 selects and 7 sensors.
             controller
                 .send(values(
                     "a",

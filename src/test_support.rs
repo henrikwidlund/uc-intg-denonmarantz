@@ -45,7 +45,7 @@ const UPDATE_NAMES: [&str; 13] = [
     "GetDeletedSource",
     "GetZoneName",
     "GetFriendlyName",
-    // Only receivers of the 2016 type are asked.
+    // Tone control is off, so a bass or treble command turns it on first.
     "GetToneControl",
 ];
 
@@ -96,7 +96,7 @@ fn update_answer(power_on: bool) -> Vec<u8> {
             <list><name>CD</name><FuncName>CD</FuncName><use>0</use></list></functiondelete></cmd>\
         <cmd><zone1>MAIN ZONE </zone1><zone2>Kitchen</zone2></cmd>\
         <cmd><friendlyname>Denon AVR</friendlyname></cmd>\
-        <cmd><status>0</status><adjust>1</adjust><basslevel>0dB</basslevel>\
+        <cmd><status>0</status><adjust>0</adjust><basslevel>0dB</basslevel>\
             <bassvalue>6</bassvalue><treblelevel>0dB</treblelevel><treblevalue>6</treblevalue></cmd>\
         </rx>"
     )
@@ -109,6 +109,8 @@ pub struct Fake {
     commands: Arc<Mutex<Vec<String>>>,
     /// How often the receiver got an `AppCommand` request.
     app_commands: Arc<AtomicUsize>,
+    /// How often the receiver got an `AppCommand0300` request.
+    audyssey_reads: Arc<AtomicUsize>,
     /// The receiver is gone from its address: it closes every connection.
     gone: Arc<AtomicBool>,
     /// The tasks that accept connections. They end when the receiver leaves.
@@ -141,10 +143,12 @@ impl Fake {
         let (port, listeners) = bind_loopback("bind the fake receiver").await;
         let commands = Arc::new(Mutex::new(Vec::new()));
         let app_commands = Arc::new(AtomicUsize::new(0));
+        let audyssey_reads = Arc::new(AtomicUsize::new(0));
         let gone = Arc::new(AtomicBool::new(false));
         let mut accepts = Vec::with_capacity(listeners.len());
         for listener in listeners {
             let (seen, asked, closed) = (commands.clone(), app_commands.clone(), gone.clone());
+            let audyssey = audyssey_reads.clone();
             let description = description.clone();
             let task = tokio::spawn(async move {
                 while let Ok((socket, _)) = listener.accept().await {
@@ -157,6 +161,7 @@ impl Fake {
                         seen.clone(),
                         description.clone(),
                         asked.clone(),
+                        audyssey.clone(),
                         closed.clone(),
                     ));
                 }
@@ -167,6 +172,7 @@ impl Fake {
             port,
             commands,
             app_commands,
+            audyssey_reads,
             gone,
             accepts,
         }
@@ -188,6 +194,12 @@ impl Fake {
     /// How often the receiver got an `AppCommand` request: the reads of the state.
     pub fn app_commands(&self) -> usize {
         self.app_commands.load(Ordering::SeqCst)
+    }
+
+    /// How often the receiver got an `AppCommand0300` request: the reads of Audyssey and the
+    /// signal.
+    pub fn audyssey_reads(&self) -> usize {
+        self.audyssey_reads.load(Ordering::SeqCst)
     }
 
     /// The commands that the receiver got, as they are in the path: a space is `%20`.
@@ -230,6 +242,7 @@ async fn serve(
     commands: Arc<Mutex<Vec<String>>>,
     description: Arc<[u8]>,
     app_commands: Arc<AtomicUsize>,
+    audyssey_reads: Arc<AtomicUsize>,
     gone: Arc<AtomicBool>,
 ) {
     let mut buffer = Vec::new();
@@ -258,10 +271,11 @@ async fn serve(
                 app_commands.fetch_add(1, Ordering::SeqCst);
                 Some(answer_for(&body, power_on))
             }
-            // Only a receiver of the 2016 type is asked. A receiver with Dirac Live answers the
-            // Audyssey values blank.
+            // Every receiver that is read with `AppCommand` is asked. A receiver with Dirac Live
+            // answers the Audyssey values blank.
             // It answers late, like a busy receiver: after the telnet answers of the start.
             ("POST", "/goform/AppCommand0300.xml") => {
+                audyssey_reads.fetch_add(1, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(400)).await;
                 Some(APPCOMMAND0300.to_vec())
             }

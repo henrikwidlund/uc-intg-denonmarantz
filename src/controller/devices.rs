@@ -427,13 +427,21 @@ impl Handler<DeviceEvent> for Controller {
                 let Some(device) = self.devices.get_mut(&*key) else {
                     return;
                 };
-                // Only take the address that the actor found on the network. The event can be
-                // older than the settings of the controller.
-                if device.cfg.address == cfg.address {
+                // Only take what the actor found on the receiver: the address, the generation
+                // and the HTTP read method. The event can be older than the settings of the
+                // controller.
+                let kind = (cfg.receiver_type, cfg.update_method);
+                let new_kind = kind != (device.cfg.receiver_type, device.cfg.update_method);
+                if device.cfg.address == cfg.address && !new_kind {
                     return;
                 }
-                info!("[{}] saving the new address", cfg.name);
+                info!("[{}] saving what the receiver reported", cfg.name);
                 device.cfg.address = cfg.address;
+                (device.cfg.receiver_type, device.cfg.update_method) = kind;
+                if new_kind {
+                    // The receiver can have fewer entities now.
+                    self.purge_entities();
+                }
                 // The device actors share this thread: do not wait for the disk.
                 if let Err(e) = self.queue_devices() {
                     warn!("Saving the configuration failed: {e}");

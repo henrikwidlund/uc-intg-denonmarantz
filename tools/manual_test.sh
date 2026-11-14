@@ -443,7 +443,9 @@ step "HTTP connection mode" \
 "ASK FIRST: this changes dimmer and the input source. The receiver is on." \
 "Configure the receiver with 'Use HTTP connection'. Check the entities. Change the dimmer and select
 another input source. Select a sound mode group (for example STEREO). Switch back to telnet." \
-"With HTTP there are 7 sensors and 6 selects, and no switches or numbers. Commands work. The new value shows within about 3 seconds
+"With HTTP on the AVC-A10H there are 13 sensors, 7 selects, 2 switches (tone control, Dynamic EQ) and
+2 numbers (bass, treble). MultEQ and Dynamic EQ show unknown (the receiver answers them blank). config.json
+has receiver_type avr_x2016 and update_method app_command. Commands work. The new value shows within about 3 seconds
 (source and sound mode can take 2 s). The sound mode select lists groups such as MOVIE and STEREO.
 Other changes show within 10 seconds." \
 "$LOG_PROBLEMS"

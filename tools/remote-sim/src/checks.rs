@@ -609,7 +609,11 @@ pub async fn source(ctx: &mut Ctx) -> Check {
     let old = ctx.client.text(&mp, "source");
     let list = strings(ctx.client.attr(&mp, "source_list").unwrap_or(&Value::Null));
     // The receiver lists a `Source` entry that cannot be selected: it is not used here.
-    let Some(new) = list.iter().find(|s| **s != old && *s != "Source").cloned() else {
+    let Some(new) = list
+        .iter()
+        .find(|s| **s != old && *s != "Source" && ctx.opt.may_select(s))
+        .cloned()
+    else {
         return Err(Fail::skip("only one source"));
     };
     let start = Instant::now();
@@ -920,16 +924,24 @@ async fn http_checks(ctx: &mut Ctx) -> Check {
         "{count} entities in HTTP mode, {before} with telnet"
     );
     let list = entity_ids(ctx).await?;
-    let (selects, sensors) = (
-        list.iter().filter(|i| i.starts_with("select.")).count(),
-        list.iter().filter(|i| i.starts_with("sensor.")).count(),
+    let count = |prefix: &str| list.iter().filter(|i| i.starts_with(prefix)).count();
+    let found = (
+        count("select."),
+        count("sensor."),
+        count("switch."),
+        count("number."),
     );
+    let config = read_config(ctx).await?;
+    let expected = http_counts(config_device(ctx, &config)?);
     ensure!(
-        selects == 6 && sensors == 7,
-        "{selects} selects, {sensors} sensors"
+        found == expected,
+        "selects, sensors, switches, numbers: {found:?}, expected {expected:?}"
     );
     wait_available(ctx, 20).await?;
-    let mut note = vec![format!("{selects} selects, {sensors} sensors")];
+    let (selects, sensors, switches, numbers) = found;
+    let mut note = vec![format!(
+        "{selects} selects, {sensors} sensors, {switches} switches, {numbers} numbers"
+    )];
 
     let start = Instant::now();
     let (old, new) = change_select(ctx, "dimmer", 12).await?;
@@ -942,7 +954,11 @@ async fn http_checks(ctx: &mut Ctx) -> Check {
     let old = ctx.client.text(&mp, "source");
     let list = strings(ctx.client.attr(&mp, "source_list").unwrap_or(&Value::Null));
     ensure!(!list.is_empty(), "no source list over HTTP");
-    if let Some(new) = list.iter().find(|s| **s != old && *s != "Source").cloned() {
+    if let Some(new) = list
+        .iter()
+        .find(|s| **s != old && *s != "Source" && ctx.opt.may_select(s))
+        .cloned()
+    {
         let start = Instant::now();
         ctx.client
             .command_ok(
@@ -1109,12 +1125,27 @@ const PYTHON_FIELDS: [&str; 13] = [
     "is_dirac_supported",
 ];
 
-pub async fn config_file(ctx: &mut Ctx) -> Check {
-    let config = read_config(ctx).await?;
-    let device = config
+/// The entry of the receiver in `config.json`.
+fn config_device<'a>(ctx: &Ctx, config: &'a Value) -> Result<&'a Value, Fail> {
+    config
         .as_array()
         .and_then(|a| a.iter().find(|d| d["id"] == ctx.key.as_str()))
-        .ok_or_else(|| Fail::new("the receiver is not in config.json"))?;
+        .ok_or_else(|| Fail::new("the receiver is not in config.json"))
+}
+
+/// The selects, sensors, switches and numbers in HTTP mode for the receiver kind in
+/// `config.json`. Receivers read with `AppCommand` get MultEQ, tone control, Dynamic EQ, bass and
+/// treble. The 2016 generation also gets 6 signal sensors.
+fn http_counts(device: &Value) -> (usize, usize, usize, usize) {
+    let app_command = device["update_method"] == "app_command";
+    let signal = app_command && device["receiver_type"] == "avr_x2016";
+    let extra = usize::from(app_command);
+    (6 + extra, 7 + 6 * usize::from(signal), 2 * extra, 2 * extra)
+}
+
+pub async fn config_file(ctx: &mut Ctx) -> Check {
+    let config = read_config(ctx).await?;
+    let device = config_device(ctx, &config)?;
     let missing: Vec<_> = PYTHON_FIELDS
         .iter()
         .filter(|f| device.get(**f).is_none())
@@ -1123,9 +1154,13 @@ pub async fn config_file(ctx: &mut Ctx) -> Check {
         missing.is_empty(),
         "fields missing in config.json: {missing:?}"
     );
+    ensure!(
+        device.get("receiver_type").is_some() && device.get("update_method").is_some(),
+        "receiver_type or update_method missing in config.json"
+    );
     Ok(format!(
-        "id is the serial number, address {}, use_telnet {}",
-        device["address"], device["use_telnet"]
+        "id is the serial number, address {}, use_telnet {}, receiver_type {}, update_method {}",
+        device["address"], device["use_telnet"], device["receiver_type"], device["update_method"]
     ))
 }
 
