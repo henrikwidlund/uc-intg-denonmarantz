@@ -900,11 +900,25 @@ pub async fn http_mode(ctx: &mut Ctx) -> Check {
     match (result, back) {
         (Ok(note), Ok(_)) => {
             let mp = ctx.mp();
-            let list = strings(
-                ctx.client
-                    .attr(&mp, "sound_mode_list")
-                    .unwrap_or(&Value::Null),
-            );
+            // The list of the receiver comes over telnet after the connect. Until then the list has
+            // the groups of HTTP mode, which do not have every mode.
+            let has_old = |v: &Value| {
+                v.as_array().is_some_and(|modes| {
+                    modes.iter().any(|m| {
+                        m.as_str()
+                            .is_some_and(|m| m.eq_ignore_ascii_case(&old_sound))
+                    })
+                })
+            };
+            let wait = if old_sound.is_empty() { 0 } else { 10 };
+            let list = ctx
+                .client
+                .wait_attr(&mp, "sound_mode_list", wait, has_old)
+                .await
+                .ok()
+                .or_else(|| ctx.client.attr(&mp, "sound_mode_list").cloned())
+                .unwrap_or(Value::Null);
+            let list = strings(&list);
             let restored = restore_sound(ctx, &old_sound, &list).await;
             Ok(format!("{note}, {restored}"))
         }
