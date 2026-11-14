@@ -6,7 +6,8 @@ It controls Denon and Marantz network receivers with the `denon-marantz` library
 The driver is an alternative to the Python integration that is part of the Remote software. It has its own
 driver id (`denonavr_rs`), because the Python integration cannot be stopped or uninstalled. The `config.json`,
 the entity names and the command names are the same, so receivers that are set up with the Python integration
-work without a new setup.
+work without a new setup. The driver adds the receiver type and the HTTP read method to `config.json`; the
+Python integration ignores them.
 
 ## Features
 
@@ -17,13 +18,14 @@ work without a new setup.
 - **Selects**: sound mode, input source, reference level, dynamic volume, dimmer, eco mode. With telnet also
   monitor output, speaker preset, picture mode, digital codec and, if the receiver has Dirac, the Dirac filter (only the slots that have a filter).
   With telnet, the sound mode select offers the modes that the receiver lists for the current input.
-- **More entities** (with telnet): switches for tone control, Dynamic EQ, the three trigger outputs and the
+- **More entities** (with telnet, some also with HTTP only, see [Requirements](#requirements)): switches for tone control, Dynamic EQ, the three trigger outputs and the
   Bluetooth transmitter; numbers for bass and treble; selects for the Audyssey MultEQ mode, the quick select
   (smart select on Marantz), the tuner band and the Bluetooth output; a sensor for the active Dirac filter.
   A quick select can change the volume.
 - **Sensors**: volume, sound mode, input, mute, dimmer and eco mode. With telnet also sleep timer, audio delay,
   audio and video signal, channels, resolution and bandwidth, video output port, HDR, pixel depth, FRL,
-  color space, picture mode, tuner frequency, all zone stereo and digital codec.
+  color space (with BT.2020, for example `4:2:2/BT.2020`), picture mode, tuner frequency, all zone stereo and
+  digital codec. Some signal sensors also exist with HTTP only.
 
 With telnet, all entities exist on every receiver, except the Dirac select and sensor, which need a
 receiver with Dirac. A value that the receiver does not have, for example the picture mode
@@ -35,8 +37,8 @@ to the log that says why.
 ## Compared to the Python integration
 
 - The receiver is read in a fraction of a second after the Remote wakes up. The values of telnet and the web pages follow in the background.
-- Values come from the receiver as events. The signal info is not read on a timer. The setup has an option
-  to read it every N seconds for receivers that do not report it.
+- With telnet, values come from the receiver as events. The signal info is not read on a timer. The setup has
+  an option to read it every N seconds for receivers that do not report it.
 - Entities keep their state while the Remote sleeps.
 
 ## Network and wake-up
@@ -62,7 +64,9 @@ to the log that says why.
   source, mute, dimmer, eco mode). Receivers that the driver reads with the newer HTTP interface also have
   the MultEQ select, the tone control and Dynamic EQ switches, and the bass and treble numbers. Models from
   2016 and later also have the sensors for the audio signal, sampling rate, HDMI video in and out, and the
-  input and output channels. The sound mode select offers the sound mode groups, for example `MOVIE`.
+  input and output channels. The sound mode select offers the sound mode groups, for example `MOVIE`. While
+  the receiver is busy, mostly in the first seconds after a connect, a changed dimmer or eco mode can take up
+  to 10 seconds to show.
 
 Changing the connection mode does not remove entities. If you add entities while using telnet and then change to
 HTTP only, the entities that need telnet stay in the integration as unavailable. Remove them in the web

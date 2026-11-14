@@ -57,7 +57,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 [[package]]
 name = "denon-marantz"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=dcc53d7#dcc53d7695a3d9a02516af40b8648c6aef7164a9"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=103f96a#103f96a8a2076c883ed9d648ab785cdeb684f374"
 dependencies = [
  "bytes",
  "denon-marantz-proto",
@@ -72,7 +72,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz-proto"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=dcc53d7#dcc53d7695a3d9a02516af40b8648c6aef7164a9"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=103f96a#103f96a8a2076c883ed9d648ab785cdeb684f374"
 dependencies = [
  "quick-xml",
  "thiserror",

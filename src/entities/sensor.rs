@@ -186,12 +186,17 @@ fn value(v: &View<'_>, kind: SensorKind) -> (Value, Option<&'static str>) {
         SensorKind::MaxResolution => text(signal.max_hdmi_resolution.as_deref()),
         SensorKind::HdrInput => text(pick(&signal.hdr, true, Clone::clone)),
         SensorKind::HdrOutput => text(pick(&signal.hdr, false, Clone::clone)),
-        SensorKind::PixelDepthInput => text(pick(&signal.pixel_depth, true, |x| x.label())),
+        // An input depth that the receiver reports as unknown while a signal comes in shows the
+        // output depth.
+        SensorKind::PixelDepthInput => {
+            text(pick(&signal.effective_pixel_depth(), true, |x| x.label()))
+        }
         SensorKind::PixelDepthOutput => text(pick(&signal.pixel_depth, false, |x| x.label())),
         SensorKind::MaxFrlInput => text(pick(&signal.max_frl, true, Clone::clone)),
         SensorKind::MaxFrlOutput => text(pick(&signal.max_frl, false, Clone::clone)),
-        SensorKind::ColorspaceInput => text(pick(&signal.color_space, true, |x| x.label())),
-        SensorKind::ColorspaceOutput => text(pick(&signal.color_space, false, |x| x.label())),
+        // The color space with BT.2020, for example `4:2:2/BT.2020`.
+        SensorKind::ColorspaceInput => text(signal.video_color().input),
+        SensorKind::ColorspaceOutput => text(signal.video_color().output),
         SensorKind::PictureMode => text(device.picture_settings.mode.map(|x| x.label())),
         SensorKind::TunerFrequency => text(tuner_text(device)),
         SensorKind::AllZoneStereo => text(

@@ -521,3 +521,44 @@ fn volume_and_delay_are_empty_while_they_are_unknown() {
     assert_eq!(json!("--"), sensor(&v, SensorKind::VolumeAbsolute)["value"]);
     assert_eq!(json!("--"), sensor(&v, SensorKind::AudioDelay)["value"]);
 }
+
+#[test]
+fn the_color_space_sensors_add_bt2020() {
+    let cfg = cfg();
+    // `9` is 4:2:2 with BT.2020.
+    let state = state(&["PWON", "SSINFSIGCOS 99"]);
+    let v = view(&state, &cfg);
+    assert_eq!(
+        json!("4:2:2/BT.2020"),
+        sensor(&v, SensorKind::ColorspaceInput)["value"]
+    );
+    // The receiver reports BT.2020 for each side.
+    let state = self::state(&["PWON", "SSINFSIGCOS 22", "SSINFSIGECI 05"]);
+    let v = view(&state, &cfg);
+    assert_eq!(
+        json!("4:4:4"),
+        sensor(&v, SensorKind::ColorspaceInput)["value"]
+    );
+    assert_eq!(
+        json!("4:4:4/BT.2020"),
+        sensor(&v, SensorKind::ColorspaceOutput)["value"]
+    );
+}
+
+#[test]
+fn an_unknown_input_pixel_depth_shows_the_output_depth() {
+    let cfg = cfg();
+    // The input depth digit is 0 while a signal comes in.
+    let state = state(&["PWON", "SSINFSIGRES I1080p25", "SSINFSIGPIX 03"]);
+    let v = view(&state, &cfg);
+    let output = sensor(&v, SensorKind::PixelDepthOutput)["value"].clone();
+    assert_ne!(json!("--"), output);
+    assert_eq!(output, sensor(&v, SensorKind::PixelDepthInput)["value"]);
+    // Without an input signal the input depth stays as reported.
+    let state = self::state(&["PWON", "SSINFSIGRES I---", "SSINFSIGPIX 03"]);
+    let v = view(&state, &cfg);
+    assert_ne!(
+        sensor(&v, SensorKind::PixelDepthOutput)["value"],
+        sensor(&v, SensorKind::PixelDepthInput)["value"]
+    );
+}
