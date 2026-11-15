@@ -112,13 +112,14 @@ fn media_state(events: &Mutex<Vec<DeviceEvent>>) -> Option<Value> {
     })
 }
 
-/// The actor has sent this status.
-fn had_status(events: &Mutex<Vec<DeviceEvent>>, wanted: DeviceStatus) -> bool {
+/// How often the actor has sent this status.
+fn status_count(events: &Mutex<Vec<DeviceEvent>>, wanted: DeviceStatus) -> usize {
     events
         .lock()
         .expect("lock")
         .iter()
-        .any(|event| matches!(event, DeviceEvent::Status { status, .. } if *status == wanted))
+        .filter(|event| matches!(event, DeviceEvent::Status { status, .. } if *status == wanted))
+        .count()
 }
 
 /// Answers for the toggles of a receiver.
@@ -375,13 +376,15 @@ async fn a_command_sent_before_standby_reaches_the_receiver() {
         cmd_id: "off".into(),
         params: None,
     };
+    // A failed connect before can have sent this status already.
+    let before = status_count(&rig.events, DeviceStatus::Disconnected);
     // The disconnect comes while the command runs.
     let sent = rig.actor.send(command);
     rig.actor.do_send(Disconnect);
     sent.await.expect("send").expect("off");
     until("the command", 5, || rig.telnet.count("ZMOFF") == 1).await;
     until("the disconnect", 5, || {
-        had_status(&rig.events, DeviceStatus::Disconnected)
+        status_count(&rig.events, DeviceStatus::Disconnected) > before
     })
     .await;
 }
@@ -615,7 +618,7 @@ async fn a_connect_during_the_disconnect_wait_keeps_the_connection_like_a_new_on
     actor.send(Connect).await.expect("connect");
     // The connect also reads the receiver: the poll is checked after it.
     until("the connect", 5, || {
-        had_status(&events, DeviceStatus::Connected)
+        status_count(&events, DeviceStatus::Connected) > 0
     })
     .await;
     let connected = http.app_commands();
@@ -625,6 +628,7 @@ async fn a_connect_during_the_disconnect_wait_keeps_the_connection_like_a_new_on
         cmd_id: "off".into(),
         params: None,
     };
+    let disconnects = status_count(&events, DeviceStatus::Disconnected);
     // The disconnect waits for the command, and the connect comes during that wait.
     let sent = actor.send(command);
     actor.do_send(Disconnect);
@@ -632,7 +636,7 @@ async fn a_connect_during_the_disconnect_wait_keeps_the_connection_like_a_new_on
     sent.await.expect("send").expect("off");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
-        !had_status(&events, DeviceStatus::Disconnected),
+        status_count(&events, DeviceStatus::Disconnected) == disconnects,
         "the connection was closed"
     );
     let before = http.app_commands();
@@ -645,7 +649,7 @@ async fn a_connect_during_the_disconnect_wait_keeps_the_connection_like_a_new_on
     })
     .await;
     assert!(
-        !had_status(&events, DeviceStatus::Disconnected),
+        status_count(&events, DeviceStatus::Disconnected) == disconnects,
         "the entities were not unavailable before the search"
     );
 }

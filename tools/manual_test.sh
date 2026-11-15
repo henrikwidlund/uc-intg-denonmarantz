@@ -342,9 +342,10 @@ step "HTTP connection mode" \
 "The receiver is on. remote-sim checked the entity counts and the commands in HTTP mode." \
 "Configure the receiver with 'Use HTTP connection'. Look at the entities on the Remote. Change the bass (with
 the Dirac filter off). Switch back to telnet." \
-"On the AVC-A10H the Remote shows 13 sensors, 7 selects, 2 switches (tone control, Dynamic EQ) and 2 numbers
-(bass, treble). MultEQ and Dynamic EQ show '--' (the receiver answers them blank). A new bass value shows
-within about a second. The sound mode select lists groups such as MOVIE and STEREO." \
+"On the AVC-A10H the Remote shows 14 sensors, 8 selects (with the monitor output), 2 switches (tone control,
+Dynamic EQ) and 2 numbers (bass, treble). MultEQ and Dynamic EQ show '--' (the receiver answers them
+blank). A new bass value shows within about a second. The sound mode select lists groups such as MOVIE and
+STEREO." \
 "$LOG_PROBLEMS"
 
 step "Check the log for errors again" \
