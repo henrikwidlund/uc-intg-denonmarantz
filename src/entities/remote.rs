@@ -67,10 +67,45 @@ pub fn definition(mut entity: AvailableIntgEntity, cfg: &DeviceConfig) -> Availa
     let pages = if cfg.is_denon { &UI.denon } else { &UI.marantz };
     options.insert(
         IntgRemoteOptionField::UserInterface.as_ref().into(),
-        json!({ "pages": pages }),
+        json!({ "pages": pages_for(pages, cfg) }),
     );
     entity.options = Some(options);
     entity
+}
+
+/// The UI pages without the buttons of quick select slots that the receiver does not have. A page
+/// without buttons is left out.
+fn pages_for(pages: &Value, cfg: &DeviceConfig) -> Value {
+    let has = |item: &Value| {
+        item["command"]["cmd_id"]
+            .as_str()
+            .and_then(simple_commands::quick_select_slot)
+            .is_none_or(|slot| cfg.has_quick_select(slot))
+    };
+    let Some(pages) = pages.as_array() else {
+        return Value::Null;
+    };
+    if cfg.quick_select_count.is_none() {
+        return Value::Array(pages.clone());
+    }
+    Value::Array(
+        pages
+            .iter()
+            .filter_map(|page| {
+                let items = page["items"].as_array()?;
+                if items.iter().all(has) {
+                    return Some(page.clone());
+                }
+                let kept: Vec<Value> = items.iter().filter(|i| has(i)).cloned().collect();
+                if kept.is_empty() {
+                    return None;
+                }
+                let mut page = page.clone();
+                page["items"] = Value::Array(kept);
+                Some(page)
+            })
+            .collect(),
+    )
 }
 
 /// Entity state of the remote.
@@ -206,6 +241,49 @@ mod tests {
         assert_eq!(15, UI.denon.as_array().map_or(0, Vec::len));
         assert_eq!(15, UI.marantz.as_array().map_or(0, Vec::len));
         assert!(UI.buttons.as_array().is_some_and(|b| b.len() >= 15));
+    }
+
+    #[test]
+    fn the_quick_select_page_has_the_slots_of_the_receiver() {
+        let quick = |pages: &Value| -> Vec<String> {
+            pages
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|p| p["items"].as_array().into_iter().flatten())
+                .filter_map(|i| i["command"]["cmd_id"].as_str())
+                .filter(|c| c.starts_with("QUICK_SELECT"))
+                .map(str::to_owned)
+                .collect()
+        };
+        let pages = |count| {
+            let mut cfg = crate::entities::tests::cfg(true, true);
+            cfg.quick_select_count = count;
+            pages_for(&UI.denon, &cfg)
+        };
+        assert_eq!(6, quick(&pages(None)).len());
+        assert_eq!(
+            vec!["QUICK_SELECT_1", "QUICK_SELECT_2"],
+            quick(&pages(Some(2)))
+        );
+        let all = UI.denon.as_array().map_or(0, Vec::len);
+        assert_eq!(all, pages(Some(2)).as_array().map_or(0, Vec::len));
+        // A page without buttons is left out.
+        assert_eq!(all - 1, pages(Some(0)).as_array().map_or(0, Vec::len));
+    }
+
+    #[test]
+    fn no_page_has_two_buttons_with_the_same_command() {
+        for pages in [&UI.denon, &UI.marantz] {
+            for page in pages.as_array().into_iter().flatten() {
+                let mut seen = std::collections::HashSet::new();
+                for item in page["items"].as_array().into_iter().flatten() {
+                    if let Some(cmd) = item["command"]["cmd_id"].as_str() {
+                        assert!(seen.insert(cmd), "{}: {cmd}", page["page_id"]);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
