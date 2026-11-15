@@ -146,8 +146,9 @@ cargo test --locked
 cargo deny check
 ```
 
-`tools/manual_test.sh` runs the tests with a real receiver and Remote, one step at a time. It saves the
-results to `manual-test-results-<time>.md`.
+`tools/manual_test.sh` runs the tests that need a real Remote or a person, one step at a time: the setup pages,
+the entity lists, the buttons, the sleep of the Remote and a real signal. It saves the results to
+`manual-test-results-<time>.md`. Run `tools/remote-sim` (below) for everything else.
 
 `tools/remote-sim` is a program that acts as the Remote and runs most of these tests by itself with a real
 receiver. It opens a second connection to the receiver and checks that every select and sensor shows what
@@ -165,7 +166,8 @@ Options:
 - `--only a,b` and `--skip a,b` select checks by name. `--only` must also name the first checks
   `metadata,setup,entities,states`: the other checks need them.
 - `--kinds a,b` limits the select sweep to these selects, for example `dirac_filter`.
-- `--avoid-sources a,b`: the checks never select these sources. Names are compared without case.
+- `--avoid-sources a,b`: the checks never select a source whose name contains one of these, without case.
+  The simple command check then sends no source commands.
 - `--no-power` skips the power check. The other checks still switch the receiver on if it is off.
 - `--no-oracle` does not open the second connection. The values are then not compared with the receiver.
 - `--driver <path>`, `--port <port>` and `--commands <path>` change the driver binary, the port and the

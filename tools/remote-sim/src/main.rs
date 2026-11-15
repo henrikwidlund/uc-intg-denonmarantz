@@ -68,17 +68,19 @@ pub struct Options {
     pub commands: PathBuf,
     /// Selects for the sweep. Empty: all.
     pub kinds: Vec<String>,
-    /// Sources that the checks never select. The names are compared without case.
+    /// Sources that the checks never select: a source whose name contains one of these, without
+    /// case.
     pub avoid_sources: Vec<String>,
 }
 
 impl Options {
     /// A source that the checks may select.
     pub fn may_select(&self, source: &str) -> bool {
+        let source = source.to_lowercase();
         !self
             .avoid_sources
             .iter()
-            .any(|a| a.eq_ignore_ascii_case(source))
+            .any(|a| source.contains(&a.to_lowercase()))
     }
 }
 

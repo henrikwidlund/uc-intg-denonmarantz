@@ -4,8 +4,12 @@
 #
 # Guided manual test with a real Remote and receiver.
 #
-# The program tools/remote-sim tests most of the driver without a Remote. This script covers what
-# only the Remote shows: the setup pages, the entity lists and the buttons.
+# The program tools/remote-sim tests most of the driver without a Remote: power, sources, sound
+# modes, selects, switches, numbers, volume, the simple commands, the configuration file, the
+# takeover of a Python configuration, a broken configuration, backup and restore, a receiver that
+# cannot be reached and the values in HTTP mode. Run it first. This script covers only what the
+# Remote shows or what needs a person: the setup pages, the entity lists, the buttons, the sleep of
+# the Remote and a real signal.
 #
 # The script shows one numbered step at a time: what to prepare, what to do and what to watch
 # for. Enter runs the step command (if the step has one). You then type what happened. All
@@ -122,30 +126,6 @@ start_driver() {
     fi
 }
 
-break_config() {
-    # Make config.json invalid, start the driver, then put the file back.
-    if [[ "$IDE" = 1 ]]; then
-        read -r -p "Stop the driver in RustRover now, then press Enter: " _
-    else
-        stop_driver
-    fi
-    give_files_back
-    cp "$CONFIG_DIR/config.json" "$CONFIG_DIR/config.json.before-broken-test"
-    printf '[{"broken": ' >"$CONFIG_DIR/config.json"
-    start_driver
-    sleep 3
-    recent_log 'Invalid|moved|WARN|ERROR'
-    ls -l "$CONFIG_DIR"/config.json*
-    if [[ "$IDE" = 1 ]]; then
-        read -r -p "Stop the driver in RustRover now, then press Enter: " _
-    else
-        stop_driver
-    fi
-    mv "$CONFIG_DIR/config.json.before-broken-test" "$CONFIG_DIR/config.json"
-    rm -f "$CONFIG_DIR"/config.json.bad-*
-    echo "config.json is back. The moved file was deleted."
-    start_driver
-}
 
 recent_log() {
     # Log lines of the driver from this run, without the HTTP server lines.
@@ -254,7 +234,7 @@ printf '%s\n' "$avr" "$remote" "$address" >"$SETUP_FILE"
 
 save "# Manual test $(date '+%Y-%m-%d %H:%M')" "" \
     "- Driver: $(git describe --always --dirty 2>/dev/null || echo unknown)" \
-    "- Library: $(git -C ../rusty-denon describe --always --dirty 2>/dev/null || echo unknown)" \
+    "- Library: $(awk '/^name = "denon-marantz"$/ { f = 1 } f && /^source/ { sub(/.*rev=/, ""); sub(/#.*/, ""); print; exit }' Cargo.lock 2>/dev/null || echo unknown)" \
     "- Receiver: $avr" \
     "- Remote: $remote"
 
@@ -312,69 +292,7 @@ With telnet there are 15 selects (14 without Dirac), 30 sensors (29 without Dira
 2 numbers, besides the media player and the remote." \
 "recent_log 'connected|WARN|ERROR'"
 
-step "Configuration file" \
-"Setup is done." \
-"Press Enter to show the configuration file." \
-"The file has the fields of the Python integration (id = serial number, address, use_telnet, ...).
-The mode is -rw------- and there is no config.json.tmp file left." \
-"give_files_back && ls -l \"$CONFIG_DIR\"/config.json* && cat \"$CONFIG_DIR/config.json\""
-
-step "Take over a configuration of the Python integration" \
-"Copy config.json of the Python integration into the config folder of this driver. Stop the driver first." \
-"Start the driver. Open the Remote and look at the entities of the receiver." \
-"The receiver is set up without a new setup. It has the entity ids and names of the Python integration
-(media_player.<serial>, sensor.<kind>.<serial>) and the new entities of this driver." \
-"recent_log 'configured|connected|WARN|ERROR'"
-
 # ---------------------------------------------------------------- control
-
-step "Power off and on" \
-"$RECEIVER_ON" \
-"Media player: press Off. Wait 5 s. Press On." \
-"Off: the receiver goes to standby, the state is Off, the media info and the source are empty.
-Sensors show '--', the mute sensor shows 'off'. Selects show '--'.
-On: the receiver wakes, the state is On, values come back." \
-"$LOG_PROBLEMS"
-
-step "Input source and sound mode" \
-"ASK FIRST: this can start sound. The receiver is on." \
-"Select another input source in the media player and in the select entity.
-Select a sound mode, for example Stereo and Dolby Surround." \
-"The receiver switches. The media player, the select and the sensor show the new value.
-The sound mode shows the name that the receiver reports for the mode." \
-"$LOG_PROBLEMS"
-
-step "Selects and sensors" \
-"$RECEIVER_ON" \
-"Change dimmer and eco mode with the select entities. Change the HDMI monitor output only if
-you have two TVs." \
-"The receiver changes. The sensor of the same value follows within a second." \
-"$LOG_PROBLEMS"
-
-step "Remote entity commands" \
-"$RECEIVER_ON" \
-"Send these with the remote entity: DIMMER_TOGGLE, OUTPUT_AUTO, INFO_MENU, and one UI page button
-(for example Sound Modes)." \
-"Each command changes the receiver, and the UI pages of the remote entity have 15 pages." \
-"$LOG_PROBLEMS"
-
-step "Tone, Audyssey and Dirac" \
-"ASK FIRST: this changes the sound. The receiver is on." \
-"Use the switches Tone Control and Dynamic EQ, and the numbers Bass and Treble. Use the selects Audyssey
-MultEQ, Reference Level and Dynamic Volume. If the receiver has Dirac: use the select Dirac Filter and look at
-the sensor Active Dirac Filter." \
-"The receiver changes and the entities follow. With a Dirac filter selected, the tone control and the
-Audyssey settings are refused with a message that says why. The Dirac select has the slots that have a
-filter, and the saved filter names. A receiver without Audyssey or Dirac shows '--' or has no Dirac
-entities." \
-"$LOG_PROBLEMS"
-
-step "Quick select, triggers, tuner and Bluetooth" \
-"ASK FIRST: a quick select can change the volume and the source. The triggers can switch other equipment." \
-"Select a quick select. Switch a trigger on and off. Select the tuner band. Switch the Bluetooth
-transmitter and select the Bluetooth output." \
-"Each change shows on the receiver and in the entity. The tuner sensor shows the frequency with its unit." \
-"$LOG_PROBLEMS"
 
 step "Media info and navigation" \
 "Play something from a network source, for example HEOS or internet radio." \
@@ -388,9 +306,11 @@ The tuner shows the frequency as the title and the band as the artist. The keys 
 step "Signal sensors and the signal read option" \
 "A source with a video and audio signal is playing." \
 "Look at the sensors for audio and video signal, channels, resolution, HDR, pixel depth, FRL and color space.
-Change the source. Then set 'Read the signal info every N seconds' to 10 in the setup." \
-"The sensors show the signal of the receiver. They follow a change of source. With the option on, they
-follow also when the receiver does not report a change." \
+Play an HDR10 or Dolby Vision source, then an SDR source. Then set 'Read the signal info every N seconds' to 10
+in the setup." \
+"The sensors show the signal of the receiver. With HDR the color space shows the BT.2020 part, for example
+4:2:2/BT.2020; with SDR it does not. They follow a change of source. With the option on, they follow also when
+the receiver does not report a change." \
 "recent_log 'signal|WARN|ERROR'"
 
 step "Simple commands and pages" \
@@ -409,20 +329,7 @@ Then add and remove a receiver if you have a second one." \
 input source select has more sources. The debug log option writes more lines and stays on after a restart." \
 "$LOG_PROBLEMS"
 
-step "Settings that the receiver does not accept" \
-"The receiver is in standby, or a Dirac filter is selected." \
-"Switch the tone control on. In standby, change a switch, a number and a select." \
-"With a Dirac filter the tone control is refused with a clear message. In standby the commands are
-accepted and do nothing. The log shows no WARN line for the refused command." \
-"$LOG_PROBLEMS"
-
-step "Volume (ask first)" \
-"ASK FIRST: this changes the main volume. Set the volume low." \
-"Press volume up and down on the Remote. Change the volume step in the setup and try again." \
-"One press changes the volume by the step. The volume sensors follow." \
-"$LOG_PROBLEMS"
-
-# ---------------------------------------------------------------- wake and loss
+# ---------------------------------------------------------------- wake and modes
 
 step "Sleep and wake of the Remote" \
 "$RECEIVER_ON" \
@@ -431,44 +338,19 @@ step "Sleep and wake of the Remote" \
 The log shows 'connected in' and the time." \
 "recent_log 'connected in|network not ready|WARN|ERROR'"
 
-step "Receiver not reachable" \
-"$RECEIVER_ON" \
-"Unplug the network cable or the power of the receiver. Press volume up on the Remote at once, and
-again after 30 seconds." \
-"The entities become unavailable. A command fails at once (not after many seconds).
-After the receiver is back, the entities become available again without a restart." \
-"recent_log 'connect failed|not found|connected|WARN|ERROR'"
-
 step "HTTP connection mode" \
-"ASK FIRST: this changes dimmer and the input source. The receiver is on." \
-"Configure the receiver with 'Use HTTP connection'. Check the entities. Change the dimmer and select
-another input source. Select a sound mode group (for example STEREO). Switch back to telnet." \
-"With HTTP on the AVC-A10H there are 13 sensors, 7 selects, 2 switches (tone control, Dynamic EQ) and
-2 numbers (bass, treble). MultEQ and Dynamic EQ show unknown (the receiver answers them blank). config.json
-has receiver_type avr_x2016 and update_method app_command. Commands work. The new value shows within about 3 seconds
-(source and sound mode can take 2 s). The sound mode select lists groups such as MOVIE and STEREO.
-Other changes show within 10 seconds." \
+"The receiver is on. remote-sim checked the entity counts and the commands in HTTP mode." \
+"Configure the receiver with 'Use HTTP connection'. Look at the entities on the Remote. Change the bass (with
+the Dirac filter off). Switch back to telnet." \
+"On the AVC-A10H the Remote shows 13 sensors, 7 selects, 2 switches (tone control, Dynamic EQ) and 2 numbers
+(bass, treble). MultEQ and Dynamic EQ show '--' (the receiver answers them blank). A new bass value shows
+within about a second. The sound mode select lists groups such as MOVIE and STEREO." \
 "$LOG_PROBLEMS"
-
-step "Backup and restore" \
-"At least one receiver is configured." \
-"Setup > Backup configuration: copy the text. Then Setup > Reset. Then Restore from backup with the text." \
-"The receiver is back with the same entity ids." \
-"$LOG_PROBLEMS"
-
-step "Broken configuration file" \
-"The driver runs." \
-"Press Enter. The script stops the driver, makes config.json invalid and starts the driver.
-It then shows the log, puts the old config.json back and starts the driver again." \
-"The log shows 'Invalid ... The file was moved to ...config.json.bad-<time>'.
-The driver starts with no devices. After the restore, the receiver connects again." \
-"break_config"
 
 step "Check the log for errors again" \
 "The steps above are done." \
 "Press Enter to show warnings and errors from the driver log." \
-"Each WARN or ERROR line is about a step above where something did not work.
-The broken configuration step gives one expected ERROR line." \
+"Each WARN or ERROR line is about a step above where something did not work." \
 "recent_log 'WARN|ERROR' 40"
 
 save "" "Done."

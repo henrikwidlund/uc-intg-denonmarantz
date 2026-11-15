@@ -100,13 +100,17 @@ const NOT_REPORTED: [&str; 4] = [
 ];
 
 /// Values that come from the web pages of the receiver.
-const WEB_PAGE_VALUES: [&str; 6] = [
+const WEB_PAGE_VALUES: [&str; 10] = [
     "select.monitor_output",
     "sensor.monitor_output",
     "select.picture_mode",
     "sensor.picture_mode",
     "select.digital_codec",
     "sensor.digital_codec",
+    "sensor.colorspace_input",
+    "sensor.colorspace_output",
+    "sensor.pixel_depth_input",
+    "sensor.pixel_depth_output",
 ];
 
 /// Values of selects and sensors that differ from the values of the receiver.
@@ -1663,12 +1667,17 @@ pub async fn simple_commands(ctx: &mut Ctx) -> Check {
     let table = tokio::fs::read_to_string(&ctx.opt.commands)
         .await
         .map_err(|e| Fail::new(format!("{}: {e}", ctx.opt.commands.display())))?;
+    // With sources to avoid, no command selects a source: the names do not tell which source a
+    // code is.
+    let avoid = !ctx.opt.avoid_sources.is_empty();
     let names: Vec<&str> = table
         .lines()
         .filter_map(|line| {
             let mut parts = line.split('\t');
             let name = parts.next()?;
-            (parts.nth(1)? != "marantz").then_some(name)
+            let brand = parts.nth(1)?;
+            let text = parts.next().unwrap_or_default();
+            (brand != "marantz" && !(avoid && text.starts_with("SI"))).then_some(name)
         })
         .filter(|n| offered.iter().any(|o| o == n) && !skipped(n))
         .collect();

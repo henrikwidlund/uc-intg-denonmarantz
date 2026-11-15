@@ -77,6 +77,9 @@ pub fn expected(state: &State) -> Vec<Expected> {
     let picture = label(device.picture_settings.mode, PictureMode::label);
     let codec = label(device.digital_codec, DigitalCodec::label);
     let db = zone.volume.map(|v| f64::from(v.db()));
+    let signal = &device.signal;
+    let color = signal.video_color();
+    let depth = signal.effective_pixel_depth();
     vec![
         ("select.input_source", source.clone()),
         ("select.dimmer", dimmer.clone()),
@@ -117,6 +120,23 @@ pub fn expected(state: &State) -> Vec<Expected> {
             ),
         ),
         ("sensor.volume_db", db.map(|d| format!("{d:.1}"))),
+        // The color space with BT.2020, as the driver shows it.
+        (
+            "sensor.colorspace_input",
+            color.input.map(|c| c.to_string()),
+        ),
+        (
+            "sensor.colorspace_output",
+            color.output.map(|c| c.to_string()),
+        ),
+        (
+            "sensor.pixel_depth_input",
+            depth.input.map(|d| d.label().to_owned()),
+        ),
+        (
+            "sensor.pixel_depth_output",
+            depth.output.map(|d| d.label().to_owned()),
+        ),
         ("select.multi_eq", label(device.multi_eq, MultiEq::label)),
         (
             "select.tuner_band",
