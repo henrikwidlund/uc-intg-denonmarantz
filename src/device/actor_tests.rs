@@ -5,6 +5,7 @@
 //! The tests check what the actor asks for and shows when the receiver answers, does not answer,
 //! sends events or closes the connection.
 
+use super::actor::CurrentAvr;
 use super::discovery::{TEST_BUILDER, TEST_DISCOVERY, TestBuilder};
 use super::{Command, Connect, DenonActor, DeviceEvent, DeviceStatus, Disconnect};
 use crate::config_store::{self, DeviceConfig};
@@ -108,6 +109,19 @@ fn media_state(events: &Mutex<Vec<DeviceEvent>>) -> Option<Value> {
             .find(|(kind, _)| *kind == EntityKind::MediaPlayer)
             .and_then(|(_, attrs)| attrs.get("state").cloned()),
         _ => None,
+    })
+}
+
+/// The actor has sent the status `Disconnected`.
+fn disconnected(events: &Mutex<Vec<DeviceEvent>>) -> bool {
+    events.lock().expect("lock").iter().any(|event| {
+        matches!(
+            event,
+            DeviceEvent::Status {
+                status: DeviceStatus::Disconnected,
+                ..
+            }
+        )
     })
 }
 
@@ -246,6 +260,21 @@ async fn toggles_that_the_receiver_does_not_answer_are_asked_for_again_once() {
 }
 
 #[actix::test]
+async fn a_disconnect_drops_the_receiver_at_once() {
+    // A toggle has no answer: the start waits 60 s before it asks again.
+    let rig = rig(leaves_out_the_dynamic_eq, Duration::from_secs(60)).await;
+    toggle_queries_after_the_start(&rig).await;
+    let avr = rig
+        .actor
+        .send(CurrentAvr)
+        .await
+        .expect("send")
+        .expect("avr");
+    rig.actor.send(Disconnect).await.expect("disconnect");
+    until("the receiver is dropped", 3, || avr.upgrade().is_none()).await;
+}
+
+#[actix::test]
 async fn toggles_that_the_receiver_answers_are_not_asked_for_again() {
     let rig = rig(answers_all, Duration::from_secs(3)).await;
     let base = toggle_queries_after_the_start(&rig).await;
@@ -355,18 +384,7 @@ async fn a_command_sent_before_standby_reaches_the_receiver() {
     rig.actor.do_send(Disconnect);
     sent.await.expect("send").expect("off");
     until("the command", 5, || rig.telnet.count("ZMOFF") == 1).await;
-    until("the disconnect", 5, || {
-        rig.events.lock().expect("lock").iter().any(|event| {
-            matches!(
-                event,
-                DeviceEvent::Status {
-                    status: DeviceStatus::Disconnected,
-                    ..
-                }
-            )
-        })
-    })
-    .await;
+    until("the disconnect", 5, || disconnected(&rig.events)).await;
 }
 
 #[actix::test]
@@ -578,6 +596,50 @@ async fn the_connect_adds_the_receiver_kind_to_the_configuration() {
         })
     };
     until("the receiver kind", 5, reported).await;
+}
+
+#[actix::test]
+async fn a_connect_during_the_disconnect_wait_keeps_the_connection_like_a_new_one() {
+    let http = Fake::start(true).await;
+    let http_port = http.port();
+    let setup: TestBuilder = Rc::new(move |_, builder| test_builder(http_port, 1, builder));
+    TEST_BUILDER.with(|slot| *slot.borrow_mut() = Some(setup));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let collector = Collector(events.clone()).start();
+    let cfg = DeviceConfig {
+        use_telnet: false,
+        ..cfg()
+    };
+    let actor = DenonActor::new("SERIAL0000001".into(), cfg, collector.recipient())
+        .with_poll_interval(QUICK)
+        .start();
+    actor.send(Connect).await.expect("connect");
+    until("the first poll", 5, || http.app_commands() >= 2).await;
+    let command = Command {
+        kind: EntityKind::MediaPlayer,
+        cmd_id: "off".into(),
+        params: None,
+    };
+    // The disconnect waits for the command, and the connect comes during that wait.
+    let sent = actor.send(command);
+    actor.do_send(Disconnect);
+    actor.do_send(Connect);
+    sent.await.expect("send").expect("off");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!disconnected(&events), "the connection was closed");
+    let before = http.app_commands();
+    until("more polls", 5, || http.app_commands() >= before + 3).await;
+    // A failed read shows the entities as unavailable before the driver searches the receiver
+    // again.
+    http.leave();
+    until("unavailable", 5, || {
+        media_state(&events) == Some(Value::from("UNAVAILABLE"))
+    })
+    .await;
+    assert!(
+        !disconnected(&events),
+        "the entities were not unavailable before the search"
+    );
 }
 
 #[actix::test]

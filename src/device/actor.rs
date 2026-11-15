@@ -55,6 +55,12 @@ struct Changed(u64, Option<Change>);
 #[rtype(result = "()")]
 struct LinkChanged(u64, bool);
 
+/// The receiver of the current connection, for the tests.
+#[cfg(test)]
+#[derive(Message)]
+#[rtype(result = "Option<std::sync::Weak<Avr>>")]
+pub struct CurrentAvr;
+
 /// Result of a connect: the receiver, its changes and its address.
 struct Connected {
     avr: Arc<Avr>,
@@ -72,6 +78,9 @@ struct Timers {
     reconnect: Option<SpawnHandle>,
     poll: Option<SpawnHandle>,
     signal: Option<SpawnHandle>,
+    /// The reads after a connect: missing web pages and toggles. Cancelling it drops its copy of
+    /// the old `Avr`.
+    pages: Option<SpawnHandle>,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -422,12 +431,17 @@ impl DenonActor {
         );
         if self.cfg.use_telnet {
             // With HTTP only, a page read could delay a command: the pages are not read again.
-            actix::spawn(discovery::read_missing_pages(
-                avr.clone(),
-                started,
-                self.cfg.name.clone(),
-                self.page_retry_delay,
-            ));
+            self.timers.pages = Some(
+                ctx.spawn(
+                    discovery::read_missing_pages(
+                        avr.clone(),
+                        started,
+                        self.cfg.name.clone(),
+                        self.page_retry_delay,
+                    )
+                    .into_actor(self),
+                ),
+            );
             let status = WatchStream::from_changes(avr.telnet_status())
                 .map(move |s| LinkChanged(generation, s == TelnetStatus::Connected));
             ctx.add_message_stream(status);
@@ -596,6 +610,7 @@ impl DenonActor {
             self.timers.connect.take(),
             self.timers.poll.take(),
             self.timers.signal.take(),
+            self.timers.pages.take(),
         ]
         .into_iter()
         .flatten()
@@ -611,7 +626,7 @@ impl DenonActor {
 
     fn cancel_timers(&mut self, ctx: &mut Context<Self>) {
         let t = std::mem::take(&mut self.timers);
-        for handle in [t.connect, t.reconnect, t.poll, t.signal]
+        for handle in [t.connect, t.reconnect, t.poll, t.signal, t.pages]
             .into_iter()
             .flatten()
         {
@@ -966,7 +981,14 @@ impl Handler<Disconnect> for DenonActor {
 
     fn handle(&mut self, _: Disconnect, ctx: &mut Self::Context) {
         self.want = false;
-        self.cancel_timers(ctx);
+        // The other timers stop in `close`: a connect that is asked for during the wait below
+        // keeps the connection and needs them.
+        for handle in [self.timers.connect.take(), self.timers.reconnect.take()]
+            .into_iter()
+            .flatten()
+        {
+            ctx.cancel_future(handle);
+        }
         // Asked for, for example at standby: the entities keep their state. Only a lost
         // connection makes them unavailable.
         self.keep_state = true;
@@ -983,12 +1005,27 @@ impl Handler<Disconnect> for DenonActor {
                 .map(|guard, act, ctx| {
                     drop(guard);
                     // A connect that was asked for meanwhile keeps the connection.
-                    if !act.want {
+                    if act.want {
+                        // Like after a connect: a lost link makes the entities unavailable.
+                        act.keep_state = false;
+                        if !act.linked() {
+                            act.schedule_emit(ctx);
+                        }
+                    } else {
                         act.close(ctx);
                         act.set_status(DeviceStatus::Disconnected);
                     }
                 }),
         );
+    }
+}
+
+#[cfg(test)]
+impl Handler<CurrentAvr> for DenonActor {
+    type Result = Option<std::sync::Weak<Avr>>;
+
+    fn handle(&mut self, _: CurrentAvr, _: &mut Self::Context) -> Self::Result {
+        self.avr.as_ref().map(Arc::downgrade)
     }
 }
 
