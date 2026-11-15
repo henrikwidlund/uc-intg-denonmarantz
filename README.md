@@ -10,20 +10,29 @@ work without a new setup. The driver adds what it finds on the receiver to `conf
 the HTTP read method, if the HDMI output can be read over HTTP, the number of quick selects, and the values
 that the receiver lists for HTTP. The Python integration ignores them.
 
+## Status
+
+Preview. Tested with a Denon AVC-A10H. Marantz receivers are only tested with simulated receivers. The
+Audyssey values (MultEQ, Dynamic EQ) are not tested on a receiver with Audyssey. HEOS (media info of network
+sources on newer receivers) is not done yet. Please report problems as
+[issues](https://github.com/henrikwidlund/uc-intg-denonmarantz/issues).
+
 ## Features
 
 - **Media player**: power, volume and mute, input source, sound mode, navigation, menu, options, info,
-  channel up and down, play and pause, next and previous. Title, artist, album and cover for network audio.
+  channel up and down, play and pause, next and previous. Title, artist, album and cover for network audio
+  and HD radio, on receivers that do not use HEOS for network audio.
 - **Remote**: the simple commands of the Python integration (about 370), 15 UI pages, button mapping,
   repeat and button sequences. Text of up to 28 characters is sent to the receiver as it is.
 - **Selects**: sound mode, input source, reference level, dynamic volume, dimmer, eco mode. With telnet also
-  monitor output, speaker preset, picture mode, digital codec and, if the receiver has Dirac, the Dirac filter (only the slots that have a filter).
+  monitor output, speaker preset, picture mode, digital codec and, if the receiver has Dirac, the Dirac filter
+  (only the slots that have a filter).
   With telnet, the sound mode select offers the modes that the receiver lists for the current input.
-- **More entities** (with telnet, some also with HTTP only, see [Requirements](#requirements)): switches for tone control, Dynamic EQ, the three trigger outputs and the
-  Bluetooth transmitter; numbers for bass and treble; selects for the Audyssey MultEQ mode, the quick select
-  (smart select on Marantz), the tuner band and the Bluetooth output; a sensor for the active Dirac filter.
-  A quick select can change the volume. The quick select, its simple commands and its UI page offer only
-  the slots that the receiver has.
+- **More entities** (with telnet, some also with HTTP only, see [Requirements](#requirements)): switches for
+  tone control, Dynamic EQ, the three trigger outputs and the Bluetooth transmitter; numbers for bass and
+  treble; selects for the Audyssey MultEQ mode, the quick select (smart select on Marantz), the tuner band and
+  the Bluetooth output; a sensor for the active Dirac filter. A quick select can change the volume. The quick
+  select, its simple commands and its UI page offer only the slots that the receiver has.
 - **Sensors**: volume, sound mode, input, mute, dimmer and eco mode. With telnet also sleep timer, audio delay,
   audio and video signal, channels, resolution and bandwidth, video output port, HDR, pixel depth, FRL,
   color space (with BT.2020, for example `4:2:2/BT.2020`), picture mode, tuner frequency, all zone stereo and
@@ -38,7 +47,8 @@ to the log that says why.
 
 ## Compared to the Python integration
 
-- The receiver is read in a fraction of a second after the Remote wakes up. The values of telnet and the web pages follow in the background.
+- The receiver is read in a fraction of a second after the Remote wakes up. The values of telnet and the web
+  pages follow in the background.
 - With telnet, values come from the receiver as events. The signal info is not read on a timer. The setup has
   an option to read it every N seconds for receivers that do not report it.
 - Entities keep their state while the Remote sleeps.
@@ -55,12 +65,12 @@ to the log that says why.
 
 ## Requirements
 
-- A Denon or Marantz network receiver. Tested with a Denon AVC-A10H.
+- A Denon or Marantz network receiver.
 - The receiver and the Remote are on the same network, or you enter the address of the receiver in the setup.
 - Network control is on in the receiver, also in standby. A fixed IP address (reservation in the router)
   is recommended.
-- Some receivers allow only one telnet connection. If telnet does not work for you, use the connection mode
-  _Use HTTP connection_. In this mode the driver reads the receiver every 10 seconds and after each
+- Some old receivers allow only one telnet connection. If telnet does not work for you, use the connection
+  mode _Use HTTP connection_. In this mode the driver reads the receiver every 10 seconds and after each
   command. All receivers have the media player, the remote, 6 selects (sound mode, input source, reference
   level, dynamic volume, dimmer, eco mode) and 7 sensors (volume in dB, absolute volume, sound mode, input
   source, mute, dimmer, eco mode). Receivers that the driver reads with the newer HTTP interface also have
@@ -68,9 +78,9 @@ to the log that says why.
   2016 and later also have the sensors for the audio signal, sampling rate, HDMI video in and out, and the
   input and output channels. Receivers that report the HDMI output over HTTP also have the monitor output
   select and sensor. If the receiver lists the values it can send over HTTP, the driver offers only those:
-  tone control, bass and treble; MultEQ and Dynamic EQ; audio signal and sampling rate. The sound mode select offers the sound mode groups, for example `MOVIE`. While
-  the receiver is busy, mostly in the first seconds after a connect, a changed dimmer or eco mode can take up
-  to 10 seconds to show.
+  tone control, bass and treble; MultEQ and Dynamic EQ; audio signal and sampling rate. The sound mode select
+  offers the sound mode groups, for example `MOVIE`. While the receiver is busy, mostly in the first seconds
+  after a connect, a changed dimmer or eco mode can take up to 10 seconds to show.
 
 Changing the connection mode does not remove entities. If you add entities while using telnet and then change to
 HTTP only, the entities that need telnet stay in the integration as unavailable. Remove them in the web
@@ -86,6 +96,9 @@ configurator of the Remote.
    the driver. Otherwise start the setup. Leave the address empty to search the network.
 
 Run the setup again to add, remove or configure a receiver, make a backup, or restore one.
+
+After an update, add the remote entity again to get new UI pages and simple commands. The Remote keeps the
+list that it got when the entity was added.
 
 ## Run on a computer
 
@@ -155,10 +168,10 @@ the entity lists, the buttons, the sleep of the Remote and a real signal. It sav
 `manual-test-results-<time>.md`. Run `tools/remote-sim` (below) for everything else.
 
 `tools/remote-sim` is a program that acts as the Remote and runs most of these tests by itself with a real
-receiver. It opens a second connection to the receiver and checks that every select and sensor shows what
-the receiver has, after each change. It also sends the simple commands of the remote entity. It starts the driver without mDNS, so it needs no root rights. The checks switch the receiver on
-and off and change source, sound mode and some settings, and restore them. The volume never goes above
--40 dB.
+receiver. It opens a second connection to the receiver and checks that every select and sensor shows what the
+receiver has, after each change. It also sends the simple commands of the remote entity. It starts the driver
+without mDNS, so it needs no root rights. The checks switch the receiver on and off and change source, sound
+mode and some settings, and restore them. The volume never goes above -40 dB.
 
 ```shell
 cargo build --release
