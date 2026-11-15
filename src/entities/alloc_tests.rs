@@ -31,6 +31,7 @@ fn cfg() -> DeviceConfig {
         update_method: None,
         hdmi_output_over_http: None,
         quick_select_count: None,
+        listed_queries: None,
     }
 }
 

@@ -1178,14 +1178,19 @@ fn config_device<'a>(ctx: &Ctx, config: &'a Value) -> Result<&'a Value, Fail> {
 fn http_counts(device: &Value) -> (usize, usize, usize, usize) {
     let app_command = device["update_method"] == "app_command";
     let signal = app_command && device["receiver_type"] == "avr_x2016";
-    let extra = usize::from(app_command);
+    // Without a list of queries, the receiver is asked for all of them.
+    let queries = &device["listed_queries"];
+    let listed = |name: &str| queries.is_null() || queries[name] == true;
+    let tone = usize::from(app_command && listed("tone_control"));
+    let audyssey = usize::from(app_command && listed("audyssey"));
+    let audio = usize::from(signal && listed("audio_info"));
     // The monitor output select and sensor.
     let hdmi = usize::from(device["hdmi_output_over_http"] == true);
     (
-        6 + extra + hdmi,
-        7 + 6 * usize::from(signal) + hdmi,
-        2 * extra,
-        2 * extra,
+        6 + audyssey + hdmi,
+        7 + 2 * audio + 4 * usize::from(signal) + hdmi,
+        tone + audyssey,
+        2 * tone,
     )
 }
 

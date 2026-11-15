@@ -35,11 +35,15 @@ pub const fn name(kind: SwitchKind) -> &'static str {
     }
 }
 
-/// The values come with telnet. Tone control and Dynamic EQ also come with `AppCommand` over HTTP.
+/// The values come with telnet. Tone control and Dynamic EQ also come with `AppCommand` over HTTP, if
+/// the receiver lists the query.
 pub const fn available(cfg: &DeviceConfig, kind: SwitchKind) -> bool {
     cfg.use_telnet
-        || (cfg.reads_app_command()
-            && matches!(kind, SwitchKind::ToneControl | SwitchKind::DynamicEq))
+        || match kind {
+            SwitchKind::ToneControl => cfg.reads_tone_control(),
+            SwitchKind::DynamicEq => cfg.reads_audyssey(),
+            _ => false,
+        }
 }
 
 /// The setting is on or off. `None` if the receiver did not report it.

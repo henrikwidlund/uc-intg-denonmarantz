@@ -36,9 +36,9 @@ pub const fn name(kind: NumberKind) -> &'static str {
     }
 }
 
-/// The values come with telnet, or with `AppCommand` over HTTP.
+/// The values come with telnet, or with `AppCommand` over HTTP if the receiver lists the query.
 pub const fn available(cfg: &DeviceConfig, _kind: NumberKind) -> bool {
-    cfg.use_telnet || cfg.reads_app_command()
+    cfg.use_telnet || cfg.reads_tone_control()
 }
 
 /// The level in dB. `None` if the receiver did not report it.

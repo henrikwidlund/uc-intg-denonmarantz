@@ -16,7 +16,7 @@ mdns-sd = ["dep:mdns-sd"]
 
 [dependencies]
 uc_api = { git = "https://github.com/unfoldedcircle/api-model-rs", rev = "336beb1" }
-denon-marantz = { git = "https://github.com/henrikwidlund/rusty-denon-marantz", rev = "661c27e", features = ["mdns"] }
+denon-marantz = { git = "https://github.com/henrikwidlund/rusty-denon-marantz", rev = "8489a36", features = ["mdns"] }
 
 # WebSocket server
 actix = "0.13.5"

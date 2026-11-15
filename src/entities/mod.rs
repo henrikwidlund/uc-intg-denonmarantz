@@ -360,6 +360,7 @@ pub(crate) mod tests {
             update_method: None,
             hdmi_output_over_http: None,
             quick_select_count: None,
+            listed_queries: None,
         }
     }
 
@@ -459,6 +460,55 @@ pub(crate) mod tests {
                 EntityKind::Sensor(SensorKind::MonitorOutput)
             ],
             extra
+        );
+    }
+
+    #[test]
+    fn http_mode_leaves_out_what_the_receiver_does_not_list() {
+        use crate::config_store::{HttpQueries, HttpReadMethod, ReceiverGeneration};
+        let http = |listed_queries| DeviceConfig {
+            receiver_type: Some(ReceiverGeneration::AvrX2016),
+            update_method: Some(HttpReadMethod::AppCommand),
+            listed_queries,
+            ..cfg(false, true)
+        };
+        let all: Vec<EntityKind> = EntityKind::all(&http(None)).collect();
+        let listed: Vec<EntityKind> = EntityKind::all(&http(Some(HttpQueries {
+            tone_control: true,
+            audyssey: true,
+            video_info: true,
+            audio_info: true,
+            input_signal: true,
+            active_speaker: true,
+            output_settings: false,
+        })))
+        .collect();
+        assert_eq!(all, listed);
+        let missing: Vec<EntityKind> = all
+            .iter()
+            .copied()
+            .filter(|k| !EntityKind::all(&http(Some(HttpQueries::default()))).any(|o| o == *k))
+            .collect();
+        assert_eq!(
+            vec![
+                EntityKind::Select(SelectKind::MultiEq),
+                EntityKind::Sensor(SensorKind::AudioSignal),
+                EntityKind::Sensor(SensorKind::AudioSamplingRate),
+                EntityKind::Switch(SwitchKind::ToneControl),
+                EntityKind::Switch(SwitchKind::DynamicEq),
+                EntityKind::Number(NumberKind::Bass),
+                EntityKind::Number(NumberKind::Treble),
+            ],
+            missing
+        );
+        // Telnet mode does not use the list.
+        let telnet = DeviceConfig {
+            listed_queries: Some(HttpQueries::default()),
+            ..cfg(true, true)
+        };
+        assert_eq!(
+            EntityKind::all(&cfg(true, true)).count(),
+            EntityKind::all(&telnet).count()
         );
     }
 

@@ -7,8 +7,8 @@ The driver is an alternative to the Python integration that is part of the Remot
 driver id (`denonavr_rs`), because the Python integration cannot be stopped or uninstalled. The `config.json`,
 the entity names and the command names are the same, so receivers that are set up with the Python integration
 work without a new setup. The driver adds what it finds on the receiver to `config.json`: the receiver type,
-the HTTP read method, if the HDMI output can be read over HTTP, and the number of quick selects. The Python
-integration ignores them.
+the HTTP read method, if the HDMI output can be read over HTTP, the number of quick selects, and the values
+that the receiver lists for HTTP. The Python integration ignores them.
 
 ## Features
 
@@ -67,7 +67,8 @@ to the log that says why.
   the MultEQ select, the tone control and Dynamic EQ switches, and the bass and treble numbers. Models from
   2016 and later also have the sensors for the audio signal, sampling rate, HDMI video in and out, and the
   input and output channels. Receivers that report the HDMI output over HTTP also have the monitor output
-  select and sensor. The sound mode select offers the sound mode groups, for example `MOVIE`. While
+  select and sensor. If the receiver lists the values it can send over HTTP, the driver offers only those:
+  tone control, bass and treble; MultEQ and Dynamic EQ; audio signal and sampling rate. The sound mode select offers the sound mode groups, for example `MOVIE`. While
   the receiver is busy, mostly in the first seconds after a connect, a changed dimmer or eco mode can take up
   to 10 seconds to show.
 

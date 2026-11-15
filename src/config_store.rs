@@ -98,6 +98,28 @@ pub struct DeviceConfig {
         deserialize_with = "none_if_unknown"
     )]
     pub quick_select_count: Option<u8>,
+    /// The `AppCommand` queries that the receiver lists. `None` if it has no list: then it is asked
+    /// for all of them. It is found at the setup and checked at each connect.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "none_if_unknown"
+    )]
+    pub listed_queries: Option<HttpQueries>,
+}
+
+/// The `AppCommand` queries that the receiver lists in `Deviceinfo.xml`.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HttpQueries {
+    pub tone_control: bool,
+    pub audyssey: bool,
+    pub video_info: bool,
+    pub audio_info: bool,
+    pub input_signal: bool,
+    pub active_speaker: bool,
+    pub output_settings: bool,
 }
 
 /// What the driver found on the receiver. Entities and their options depend on it.
@@ -107,6 +129,7 @@ pub struct ReceiverKind {
     pub update_method: Option<HttpReadMethod>,
     pub hdmi_output_over_http: Option<bool>,
     pub quick_select_count: Option<u8>,
+    pub listed_queries: Option<HttpQueries>,
 }
 
 /// The receiver generation, as the library reports it.
@@ -151,6 +174,33 @@ impl DeviceConfig {
         matches!(self.hdmi_output_over_http, Some(true))
     }
 
+    /// Tone control, bass and treble come over HTTP.
+    pub const fn reads_tone_control(&self) -> bool {
+        self.reads_app_command()
+            && match self.listed_queries {
+                Some(q) => q.tone_control,
+                None => true,
+            }
+    }
+
+    /// `MultEq` and Dynamic EQ come over HTTP.
+    pub const fn reads_audyssey(&self) -> bool {
+        self.reads_app_command()
+            && match self.listed_queries {
+                Some(q) => q.audyssey,
+                None => true,
+            }
+    }
+
+    /// The audio signal and the sampling rate come over HTTP.
+    pub const fn reads_audio_info(&self) -> bool {
+        self.reads_signal()
+            && match self.listed_queries {
+                Some(q) => q.audio_info,
+                None => true,
+            }
+    }
+
     /// The receiver has this quick select slot, counted from 1. Without a count, all slots.
     pub const fn has_quick_select(&self, slot: u8) -> bool {
         match self.quick_select_count {
@@ -165,6 +215,7 @@ impl DeviceConfig {
             update_method: self.update_method,
             hdmi_output_over_http: self.hdmi_output_over_http,
             quick_select_count: self.quick_select_count,
+            listed_queries: self.listed_queries,
         }
     }
 
@@ -173,6 +224,7 @@ impl DeviceConfig {
         self.update_method = kind.update_method;
         self.hdmi_output_over_http = kind.hdmi_output_over_http;
         self.quick_select_count = kind.quick_select_count;
+        self.listed_queries = kind.listed_queries;
     }
 }
 
@@ -563,6 +615,7 @@ mod tests {
             update_method: None,
             hdmi_output_over_http: None,
             quick_select_count: None,
+            listed_queries: None,
         }
     }
 
@@ -598,7 +651,8 @@ mod tests {
             !text.contains("receiver_type")
                 && !text.contains("update_method")
                 && !text.contains("hdmi_output_over_http")
-                && !text.contains("quick_select_count"),
+                && !text.contains("quick_select_count")
+                && !text.contains("listed_queries"),
             "{text}"
         );
 
@@ -607,6 +661,10 @@ mod tests {
             update_method: Some(HttpReadMethod::AppCommand),
             hdmi_output_over_http: Some(true),
             quick_select_count: Some(4),
+            listed_queries: Some(HttpQueries {
+                audyssey: true,
+                ..HttpQueries::default()
+            }),
             ..device()
         };
         let text = serde_json::to_string(&d).expect("json");
@@ -614,7 +672,8 @@ mod tests {
             text.contains(r#""receiver_type":"avr_x2016""#)
                 && text.contains(r#""update_method":"app_command""#)
                 && text.contains(r#""hdmi_output_over_http":true"#)
-                && text.contains(r#""quick_select_count":4"#),
+                && text.contains(r#""quick_select_count":4"#)
+                && text.contains(r#""audyssey":true"#),
             "{text}"
         );
         assert_eq!(d, serde_json::from_str(&text).expect("json"));
@@ -623,7 +682,7 @@ mod tests {
     #[test]
     fn an_unknown_receiver_kind_reads_as_none() {
         let d: DeviceConfig = serde_json::from_str(
-            r#"{"id":"A","name":"C","address":"h","receiver_type":"avr_z","update_method":7,"hdmi_output_over_http":"yes","quick_select_count":300}"#,
+            r#"{"id":"A","name":"C","address":"h","receiver_type":"avr_z","update_method":7,"hdmi_output_over_http":"yes","quick_select_count":300,"listed_queries":[1]}"#,
         )
         .expect("json");
         assert_eq!(ReceiverKind::default(), d.kind());

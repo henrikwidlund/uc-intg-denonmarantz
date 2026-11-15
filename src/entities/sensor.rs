@@ -79,19 +79,23 @@ pub const fn name(kind: SensorKind) -> &'static str {
 }
 
 /// The first seven sensors always exist, the others only with a telnet connection. The signal
-/// sensors and the HDMI output that `Avr::update_signal_and_settings` reads also come over HTTP.
+/// sensors and the HDMI output that `Avr::update_signal_and_settings` reads also come over HTTP. The
+/// audio signal and the sampling rate need the receiver to list the query.
 pub const fn available(cfg: &DeviceConfig, kind: SensorKind) -> bool {
     if matches!(kind, SensorKind::DiracFilter) {
         return cfg.use_telnet && cfg.has_dirac();
     }
     cfg.use_telnet
         || (cfg.reads_hdmi_output() && matches!(kind, SensorKind::MonitorOutput))
+        || (cfg.reads_audio_info()
+            && matches!(
+                kind,
+                SensorKind::AudioSignal | SensorKind::AudioSamplingRate
+            ))
         || (cfg.reads_signal()
             && matches!(
                 kind,
-                SensorKind::AudioSignal
-                    | SensorKind::AudioSamplingRate
-                    | SensorKind::VideoHdmiSignalIn
+                SensorKind::VideoHdmiSignalIn
                     | SensorKind::VideoHdmiSignalOut
                     | SensorKind::InputChannels
                     | SensorKind::OutputChannels

@@ -641,6 +641,7 @@ impl Controller {
                         update_method: identified.kind.update_method,
                         hdmi_output_over_http: identified.kind.hdmi_output_over_http,
                         quick_select_count: identified.kind.quick_select_count,
+                        listed_queries: identified.kind.listed_queries,
                     };
                     if let Some(device) = act.devices.get_mut(cfg.key()) {
                         device.cfg = cfg.clone();

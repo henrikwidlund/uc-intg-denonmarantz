@@ -275,6 +275,18 @@ pub const fn receiver_kind(info: &denon_marantz::Info) -> config_store::Receiver
         update_method: update_method(info),
         hdmi_output_over_http: Some(info.hdmi_output_over_http),
         quick_select_count: info.quick_select_count,
+        listed_queries: match &info.queries {
+            Some(q) => Some(config_store::HttpQueries {
+                tone_control: q.tone_control,
+                audyssey: q.audyssey,
+                video_info: q.video_info,
+                audio_info: q.audio_info,
+                input_signal: q.input_signal,
+                active_speaker: q.active_speaker,
+                output_settings: q.output_settings,
+            }),
+            None => None,
+        },
     }
 }
 
