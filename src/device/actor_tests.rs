@@ -112,17 +112,13 @@ fn media_state(events: &Mutex<Vec<DeviceEvent>>) -> Option<Value> {
     })
 }
 
-/// The actor has sent the status `Disconnected`.
-fn disconnected(events: &Mutex<Vec<DeviceEvent>>) -> bool {
-    events.lock().expect("lock").iter().any(|event| {
-        matches!(
-            event,
-            DeviceEvent::Status {
-                status: DeviceStatus::Disconnected,
-                ..
-            }
-        )
-    })
+/// The actor has sent this status.
+fn had_status(events: &Mutex<Vec<DeviceEvent>>, wanted: DeviceStatus) -> bool {
+    events
+        .lock()
+        .expect("lock")
+        .iter()
+        .any(|event| matches!(event, DeviceEvent::Status { status, .. } if *status == wanted))
 }
 
 /// Answers for the toggles of a receiver.
@@ -384,7 +380,10 @@ async fn a_command_sent_before_standby_reaches_the_receiver() {
     rig.actor.do_send(Disconnect);
     sent.await.expect("send").expect("off");
     until("the command", 5, || rig.telnet.count("ZMOFF") == 1).await;
-    until("the disconnect", 5, || disconnected(&rig.events)).await;
+    until("the disconnect", 5, || {
+        had_status(&rig.events, DeviceStatus::Disconnected)
+    })
+    .await;
 }
 
 #[actix::test]
@@ -614,7 +613,13 @@ async fn a_connect_during_the_disconnect_wait_keeps_the_connection_like_a_new_on
         .with_poll_interval(QUICK)
         .start();
     actor.send(Connect).await.expect("connect");
-    until("the first poll", 5, || http.app_commands() >= 2).await;
+    // The connect also reads the receiver: the poll is checked after it.
+    until("the connect", 5, || {
+        had_status(&events, DeviceStatus::Connected)
+    })
+    .await;
+    let connected = http.app_commands();
+    until("the first poll", 5, || http.app_commands() > connected).await;
     let command = Command {
         kind: EntityKind::MediaPlayer,
         cmd_id: "off".into(),
@@ -626,7 +631,10 @@ async fn a_connect_during_the_disconnect_wait_keeps_the_connection_like_a_new_on
     actor.do_send(Connect);
     sent.await.expect("send").expect("off");
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!disconnected(&events), "the connection was closed");
+    assert!(
+        !had_status(&events, DeviceStatus::Disconnected),
+        "the connection was closed"
+    );
     let before = http.app_commands();
     until("more polls", 5, || http.app_commands() >= before + 3).await;
     // A failed read shows the entities as unavailable before the driver searches the receiver
@@ -637,7 +645,7 @@ async fn a_connect_during_the_disconnect_wait_keeps_the_connection_like_a_new_on
     })
     .await;
     assert!(
-        !disconnected(&events),
+        !had_status(&events, DeviceStatus::Disconnected),
         "the entities were not unavailable before the search"
     );
 }
