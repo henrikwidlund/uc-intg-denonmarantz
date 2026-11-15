@@ -46,7 +46,7 @@ impl Handler<R2EventMsg> for Controller {
                 session.standby = false;
                 self.connect_devices();
                 self.send_device_state(&msg.ws_id);
-                self.send_cached_states(&msg.ws_id);
+                self.send_missed_states(&msg.ws_id);
             }
             R2Event::AbortDriverSetup => {
                 ctx.notify(AbortDriverSetup {

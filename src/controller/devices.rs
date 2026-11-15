@@ -146,7 +146,14 @@ impl Controller {
     }
 
     /// States of the subscribed entities, or of all entities without subscriptions.
-    pub(super) fn entity_states(&self, ws_id: &str) -> Vec<EntityChangeRef<'_>> {
+    pub(super) fn entity_states(&mut self, ws_id: &str) -> Vec<EntityChangeRef<'_>> {
+        if let Some(session) = self.sessions.get_mut(ws_id) {
+            session.read_states = true;
+            session.read_all = session.subscribed_entities.is_empty();
+            if session.read_all {
+                session.missed.clear();
+            }
+        }
         let subscribed = self.sessions.get(ws_id).map(|s| &s.subscribed_entities);
         self.entities
             .iter()
@@ -155,21 +162,38 @@ impl Controller {
             .collect()
     }
 
+    /// Subscribe a Remote to entities, and send only the states that it does not have. One event
+    /// per entity can fill the event queue of the Remote, and the Remote then closes the
+    /// connection.
     pub(super) fn subscribe(&mut self, ws_id: &str, entity_ids: Vec<String>) {
         let Some(session) = self.sessions.get_mut(ws_id) else {
             return;
         };
+        // At the start of a session the Remote reads the states with `get_entity_states` before
+        // or after it subscribes. Before: it has all states, and gets only the changes since.
+        // After: it gets nothing now. Entities added later get their state.
+        let read_all = std::mem::take(&mut session.read_all);
         let mut new = Vec::new();
+        let mut send = Vec::new();
         for id in entity_ids {
             if session.subscribed_entities.insert(id.clone()) {
+                if session.read_states && (!read_all || session.missed.remove(&id)) {
+                    send.push(id.clone());
+                }
                 new.push(id);
             }
         }
-        // Send the current states, and connect the devices.
-        for id in &new {
+        if read_all {
+            let subscribed = &session.subscribed_entities;
+            session.missed.retain(|id| subscribed.contains(id));
+        }
+        for id in &send {
             if let Some(change) = self.entities.get(id).and_then(|a| entity_change(id, a)) {
                 self.send_entity_change(ws_id, &change);
             }
+        }
+        // Connect the devices.
+        for id in &new {
             if let Some((key, _)) = EntityKind::parse(id)
                 && let Some(device) = self.devices.get(key)
             {
@@ -178,14 +202,21 @@ impl Controller {
         }
     }
 
-    /// Send the cached states of the subscribed entities to a Remote. It missed the changes while
-    /// it was in standby, if another Remote stayed awake.
-    pub(super) fn send_cached_states(&self, ws_id: &str) {
-        let Some(session) = self.sessions.get(ws_id) else {
+    /// Send the cached states of the entities that changed while a Remote was in standby. This
+    /// happens mostly if another Remote stayed awake. Sending all entities at each wake-up can fill
+    /// the event queue of the Remote.
+    pub(super) fn send_missed_states(&mut self, ws_id: &str) {
+        let Some(session) = self.sessions.get_mut(ws_id) else {
             return;
         };
-        for id in &session.subscribed_entities {
-            if let Some(change) = self.entities.get(id).and_then(|a| entity_change(id, a)) {
+        let missed = std::mem::take(&mut session.missed);
+        for id in &missed {
+            if self
+                .sessions
+                .get(ws_id)
+                .is_some_and(|s| s.subscribed_entities.contains(id))
+                && let Some(change) = self.entities.get(id).and_then(|a| entity_change(id, a))
+            {
                 self.send_entity_change(ws_id, &change);
             }
         }
@@ -314,14 +345,15 @@ impl Controller {
         for (kind, attrs) in updates {
             entity_id.clear();
             kind.write_entity_id(key, &mut entity_id);
-            let subscribed = self
+            // A Remote that read all states and did not subscribe yet also needs the changes.
+            let wanted = self
                 .sessions
                 .values()
-                .any(|s| s.subscribed_entities.contains(&entity_id));
+                .any(|s| s.read_all || s.subscribed_entities.contains(&entity_id));
             let changed = if let Some(cache) = self.entities.get_mut(&entity_id) {
-                diff(cache, attrs, subscribed)
+                diff(cache, attrs, wanted)
             } else {
-                let changed = if subscribed {
+                let changed = if wanted {
                     attrs.keys().cloned().collect()
                 } else {
                     Vec::new()
@@ -337,11 +369,21 @@ impl Controller {
 
     /// Send `entity_change` with the attributes of `keys` to the Remotes that subscribed the
     /// entity. The message is serialized once.
-    fn send_changes(&self, kind: EntityKind, entity_id: &str, keys: &[String]) {
+    fn send_changes(&mut self, kind: EntityKind, entity_id: &str, keys: &[String]) {
+        // A Remote in standby gets the state when it wakes up. A Remote that read all states and
+        // did not subscribe yet gets it when it subscribes.
+        for session in self.sessions.values_mut() {
+            let subscribed = session.subscribed_entities.contains(entity_id);
+            if ((session.standby && subscribed) || (session.read_all && !subscribed))
+                && !session.missed.contains(entity_id)
+            {
+                session.missed.insert(entity_id.to_owned());
+            }
+        }
         let mut targets = self
             .sessions
             .iter()
-            .filter(|(_, s)| s.subscribed_entities.contains(entity_id))
+            .filter(|(_, s)| !s.standby && s.subscribed_entities.contains(entity_id))
             .map(|(ws_id, _)| &**ws_id)
             .peekable();
         let Some(cache) = self.entities.get(entity_id) else {
@@ -460,7 +502,119 @@ impl Handler<DeviceEvent> for Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config_store::DriverSettings;
+    use crate::configuration::{HeartbeatSettings, Settings};
+    use crate::controller::R2Session;
     use serde_json::json;
+    use std::sync::Mutex;
+
+    /// Collects the texts sent to a Remote.
+    struct Remote(Arc<Mutex<Vec<String>>>);
+
+    impl Actor for Remote {
+        type Context = Context<Self>;
+    }
+
+    impl Handler<SendWsMessage> for Remote {
+        type Result = ();
+        fn handle(&mut self, msg: SendWsMessage, _: &mut Context<Self>) {
+            if let SendWsMessage::Text(text) = msg
+                && let Ok(mut texts) = self.0.lock()
+            {
+                texts.push(text.to_string());
+            }
+        }
+    }
+
+    fn sent(texts: &Mutex<Vec<String>>) -> Vec<String> {
+        texts.lock().expect("lock").clone()
+    }
+
+    fn new_controller() -> Controller {
+        let settings = Settings {
+            interface: "127.0.0.1".into(),
+            http_port: 0,
+            config_home: std::env::temp_dir().join("uc-intg-denonmarantz-missed"),
+            heartbeat: HeartbeatSettings::default(),
+        };
+        let metadata = serde_json::from_value(json!({})).expect("metadata");
+        Controller::new(settings, DriverSettings::default(), metadata)
+    }
+
+    async fn settle() {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+
+    #[actix::test]
+    async fn a_remote_that_read_all_states_gets_only_the_changes_when_it_subscribes() {
+        let mut controller = new_controller();
+        let ids = ["media_player.KEY", "remote.KEY", "sensor.mute.KEY"];
+        for id in ids {
+            controller
+                .entities
+                .insert(id.into(), map(json!({ "state": "ON" })));
+        }
+        let texts = Arc::default();
+        let session = R2Session::new(Remote(Arc::clone(&texts)).start().recipient());
+        controller.sessions.insert("a".into(), session);
+        // The Remote reads the states before it subscribes, for example after a restart of the
+        // driver or at the end of a setup.
+        assert_eq!(3, controller.entity_states("a").len());
+        let (_, kind) = EntityKind::parse(ids[0]).expect("id");
+        controller
+            .entities
+            .insert(ids[0].into(), map(json!({ "state": "OFF" })));
+        controller.send_changes(kind, ids[0], &["state".into()]);
+        controller.subscribe("a", vec![ids[0].into(), ids[1].into()]);
+        settle().await;
+        let sent_now = sent(&texts);
+        assert_eq!(1, sent_now.len());
+        assert!(sent_now[0].contains(ids[0]), "{}", sent_now[0]);
+        // An entity that is added later gets its state.
+        controller.subscribe("a", vec![ids[2].into()]);
+        settle().await;
+        assert_eq!(2, sent(&texts).len());
+    }
+
+    #[actix::test]
+    async fn a_remote_that_wakes_up_gets_only_the_changes_it_missed() {
+        let mut controller = new_controller();
+        let id = "media_player.KEY";
+        let (_, kind) = EntityKind::parse(id).expect("id");
+        controller
+            .entities
+            .insert(id.into(), map(json!({ "state": "ON" })));
+        let (a, b) = (Arc::default(), Arc::default());
+        for (ws_id, texts) in [("a", &a), ("b", &b)] {
+            let mut session = R2Session::new(Remote(Arc::clone(texts)).start().recipient());
+            session.subscribed_entities.insert(id.into());
+            controller.sessions.insert(ws_id.into(), session);
+        }
+        let set_standby = |c: &mut Controller, standby| {
+            c.sessions.get_mut("a").expect("session").standby = standby;
+        };
+
+        set_standby(&mut controller, true);
+        controller
+            .entities
+            .insert(id.into(), map(json!({ "state": "OFF" })));
+        controller.send_changes(kind, id, &["state".into()]);
+        settle().await;
+        assert_eq!(1, sent(&b).len());
+        assert_eq!(0, sent(&a).len());
+        set_standby(&mut controller, false);
+        controller.send_missed_states("a");
+        settle().await;
+        let texts = sent(&a);
+        assert_eq!(1, texts.len());
+        assert!(texts[0].contains(r#""state":"OFF""#), "{}", texts[0]);
+        // Nothing changed during this standby.
+        set_standby(&mut controller, true);
+        set_standby(&mut controller, false);
+        controller.send_missed_states("a");
+        settle().await;
+        assert_eq!(1, sent(&a).len());
+    }
 
     fn map(v: Value) -> Map<String, Value> {
         v.as_object().cloned().expect("object")

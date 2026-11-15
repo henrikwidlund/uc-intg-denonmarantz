@@ -67,6 +67,13 @@ struct R2Session {
     ws_id: u32,
     standby: bool,
     subscribed_entities: HashSet<String>,
+    /// The Remote read the entity states with `get_entity_states` in this session.
+    read_states: bool,
+    /// The last `get_entity_states` answer had all entities, and the Remote did not subscribe
+    /// since.
+    read_all: bool,
+    /// Entities that changed while the Remote was in standby, or after it read all states.
+    missed: HashSet<String>,
     /// Flag if the session is in a reconfiguration setup flow.
     reconfiguring: Option<bool>,
 }
@@ -78,6 +85,9 @@ impl R2Session {
             ws_id: 0,
             standby: false,
             subscribed_entities: HashSet::default(),
+            read_states: false,
+            read_all: false,
+            missed: HashSet::default(),
             reconfiguring: None,
         }
     }

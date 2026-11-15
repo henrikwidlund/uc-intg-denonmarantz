@@ -1659,6 +1659,78 @@ mod tests {
             assert_eq!(15, entity_states(&controller).await.len());
         }
 
+        /// Collects the `entity_change` events sent to a Remote.
+        struct Changes(Arc<Mutex<Vec<String>>>);
+
+        impl Actor for Changes {
+            type Context = Context<Self>;
+        }
+
+        impl Handler<SendWsMessage> for Changes {
+            type Result = ();
+            fn handle(&mut self, msg: SendWsMessage, _: &mut Context<Self>) {
+                if let SendWsMessage::Text(text) = msg
+                    && text.contains(r#""msg":"entity_change""#)
+                    && let Ok(mut changes) = self.0.lock()
+                {
+                    changes.push(text.to_string());
+                }
+            }
+        }
+
+        async fn connect_changes(
+            controller: &Addr<Controller>,
+            id: &str,
+        ) -> Arc<Mutex<Vec<String>>> {
+            let changes = Arc::default();
+            let addr = Changes(Arc::clone(&changes)).start();
+            controller
+                .send(NewR2Session {
+                    addr: addr.recipient(),
+                    id: id.into(),
+                })
+                .await
+                .expect("send");
+            changes
+        }
+
+        fn count(changes: &Mutex<Vec<String>>, part: &str) -> usize {
+            changes
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|c| c.contains(part))
+                .count()
+        }
+
+        async fn subscribe(controller: &Addr<Controller>, ws_id: &str, ids: &[String]) {
+            let msg = R2RequestMsg {
+                ws_id: ws_id.into(),
+                req_id: 3,
+                request: R2Request::SubscribeEvents,
+                msg_data: Some(json!({ "entity_ids": ids })),
+            };
+            controller.send(msg).await.expect("send").expect("ok");
+        }
+
+        #[actix::test]
+        async fn a_new_session_gets_the_states_only_with_get_entity_states() {
+            let controller = controller("subscribe", Some(PYTHON_CONFIG));
+            let changes = connect_changes(&controller, "a").await;
+            settle().await;
+            let (rest, first): (Vec<String>, Vec<String>) = entity_ids(&controller)
+                .await
+                .into_iter()
+                .partition(|id| id.starts_with("media_player."));
+            // The start of a session: one event per entity can fill the event queue of the Remote.
+            subscribe(&controller, "a", &first).await;
+            assert_eq!(0, count(&changes, ""));
+            assert_eq!(first.len(), entity_states(&controller).await.len());
+            // An entity that is added later gets its state at once.
+            subscribe(&controller, "a", &rest).await;
+            assert_eq!(1, count(&changes, ""));
+        }
+
         #[actix::test]
         async fn a_receiver_can_be_removed() {
             let controller = controller("remove", Some(PYTHON_CONFIG));
