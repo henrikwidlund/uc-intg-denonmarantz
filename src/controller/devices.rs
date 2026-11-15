@@ -155,11 +155,14 @@ impl Controller {
             }
         }
         let subscribed = self.sessions.get(ws_id).map(|s| &s.subscribed_entities);
-        self.entities
+        let mut states: Vec<EntityChangeRef<'_>> = self
+            .entities
             .iter()
             .filter(|(id, _)| subscribed.is_none_or(|s| s.is_empty() || s.contains(*id)))
             .filter_map(|(id, attrs)| entity_change(id, attrs))
-            .collect()
+            .collect();
+        states.sort_by_key(|s| send_order(s.entity_id));
+        states
     }
 
     /// Subscribe a Remote to entities, and send only the states that it does not have. One event
@@ -187,6 +190,7 @@ impl Controller {
             let subscribed = &session.subscribed_entities;
             session.missed.retain(|id| subscribed.contains(id));
         }
+        send.sort_by_key(|id| send_order(id));
         for id in &send {
             if let Some(change) = self.entities.get(id).and_then(|a| entity_change(id, a)) {
                 self.send_entity_change(ws_id, &change);
@@ -209,7 +213,8 @@ impl Controller {
         let Some(session) = self.sessions.get_mut(ws_id) else {
             return;
         };
-        let missed = std::mem::take(&mut session.missed);
+        let mut missed: Vec<String> = std::mem::take(&mut session.missed).into_iter().collect();
+        missed.sort_by_key(|id| send_order(id));
         for id in &missed {
             if self
                 .sessions
@@ -439,6 +444,15 @@ fn diff(cache: &mut Map<String, Value>, attrs: Map<String, Value>, collect: bool
     changed
 }
 
+/// The media player and the remote are sent first: they are the most important on the Remote.
+fn send_order(entity_id: &str) -> u8 {
+    match EntityKind::parse(entity_id) {
+        Some((_, EntityKind::MediaPlayer)) => 0,
+        Some((_, EntityKind::Remote)) => 1,
+        _ => 2,
+    }
+}
+
 fn entity_change<'a>(
     entity_id: &'a str,
     attributes: &'a Map<String, Value>,
@@ -469,17 +483,16 @@ impl Handler<DeviceEvent> for Controller {
                 let Some(device) = self.devices.get_mut(&*key) else {
                     return;
                 };
-                // Only take what the actor found on the receiver: the address, the generation
-                // and the HTTP read method. The event can be older than the settings of the
-                // controller.
-                let kind = (cfg.receiver_type, cfg.update_method);
-                let new_kind = kind != (device.cfg.receiver_type, device.cfg.update_method);
+                // Only take what the actor found on the receiver: the address and the receiver
+                // kind. The event can be older than the settings of the controller.
+                let kind = cfg.kind();
+                let new_kind = kind != device.cfg.kind();
                 if device.cfg.address == cfg.address && !new_kind {
                     return;
                 }
                 info!("[{}] saving what the receiver reported", cfg.name);
                 device.cfg.address = cfg.address;
-                (device.cfg.receiver_type, device.cfg.update_method) = kind;
+                device.cfg.set_kind(kind);
                 if new_kind {
                     // The receiver can have fewer entities now.
                     self.purge_entities();
@@ -574,6 +587,41 @@ mod tests {
         controller.subscribe("a", vec![ids[2].into()]);
         settle().await;
         assert_eq!(2, sent(&texts).len());
+    }
+
+    #[actix::test]
+    async fn the_media_player_and_the_remote_come_first() {
+        let mut controller = new_controller();
+        let ids = [
+            "sensor.mute.KEY",
+            "select.dimmer.KEY",
+            "remote.KEY",
+            "switch.tone_control.KEY",
+            "media_player.KEY",
+        ];
+        for id in ids {
+            controller
+                .entities
+                .insert(id.into(), map(json!({ "state": "ON" })));
+        }
+        let texts = Arc::default();
+        let session = R2Session::new(Remote(Arc::clone(&texts)).start().recipient());
+        controller.sessions.insert("a".into(), session);
+        let first: Vec<&str> = controller
+            .entity_states("a")
+            .iter()
+            .take(2)
+            .map(|s| s.entity_id)
+            .collect();
+        assert_eq!(vec!["media_player.KEY", "remote.KEY"], first);
+        // Entities that are added later get their state.
+        controller.subscribe("a", vec!["number.bass.KEY".into()]);
+        controller.subscribe("a", ids.map(str::to_owned).to_vec());
+        settle().await;
+        let sent_now = sent(&texts);
+        assert_eq!(5, sent_now.len());
+        assert!(sent_now[0].contains("media_player.KEY"), "{}", sent_now[0]);
+        assert!(sent_now[1].contains("remote.KEY"), "{}", sent_now[1]);
     }
 
     #[actix::test]

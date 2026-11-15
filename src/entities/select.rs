@@ -98,11 +98,11 @@ pub const fn available(cfg: &DeviceConfig, kind: SelectKind) -> bool {
         | SelectKind::DynamicVolume
         | SelectKind::Dimmer
         | SelectKind::EcoMode => true,
-        SelectKind::MonitorOutput
-        | SelectKind::SpeakerPreset
+        SelectKind::MonitorOutput => cfg.use_telnet || cfg.reads_hdmi_output(),
+        SelectKind::QuickSelect => cfg.use_telnet && cfg.has_quick_select(1),
+        SelectKind::SpeakerPreset
         | SelectKind::PictureMode
         | SelectKind::DigitalCodec
-        | SelectKind::QuickSelect
         | SelectKind::TunerBand
         | SelectKind::BluetoothOutput => cfg.use_telnet,
         SelectKind::MultiEq => cfg.use_telnet || cfg.reads_app_command(),
@@ -286,7 +286,11 @@ fn quick_select_number(labels: &[String], option: &str) -> Option<u8> {
 fn quick_select_labels(v: &View<'_>) -> Vec<String> {
     let names = &v.state.device().quick_select_names;
     let kind = if v.cfg.is_denon { "Quick" } else { "Smart" };
-    (0..names.len().clamp(QUICK_SELECTS, 6))
+    let count = v.cfg.quick_select_count.map_or_else(
+        || names.len().clamp(QUICK_SELECTS, 6),
+        |n| usize::from(n).min(6),
+    );
+    (0..count)
         .map(|i| {
             names
                 .get(i)

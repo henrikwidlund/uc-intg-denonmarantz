@@ -79,12 +79,13 @@ pub const fn name(kind: SensorKind) -> &'static str {
 }
 
 /// The first seven sensors always exist, the others only with a telnet connection. The signal
-/// sensors that `Avr::update_signal_and_audyssey` reads also come over HTTP.
+/// sensors and the HDMI output that `Avr::update_signal_and_settings` reads also come over HTTP.
 pub const fn available(cfg: &DeviceConfig, kind: SensorKind) -> bool {
     if matches!(kind, SensorKind::DiracFilter) {
         return cfg.use_telnet && cfg.has_dirac();
     }
     cfg.use_telnet
+        || (cfg.reads_hdmi_output() && matches!(kind, SensorKind::MonitorOutput))
         || (cfg.reads_signal()
             && matches!(
                 kind,
@@ -183,7 +184,7 @@ fn value(v: &View<'_>, kind: SensorKind) -> (Value, Option<&'static str>) {
         SensorKind::VideoHdmiSignalOut => text(pick(&signal.video, false, Clone::clone)),
         SensorKind::InputChannels => text(pick(&signal.channels, true, ToString::to_string)),
         SensorKind::OutputChannels => text(pick(&signal.channels, false, ToString::to_string)),
-        SensorKind::MaxResolution => text(signal.max_hdmi_resolution.as_deref()),
+        SensorKind::MaxResolution => text(signal.max_hdmi_resolution.map(|x| x.label())),
         SensorKind::HdrInput => text(pick(&signal.hdr, true, Clone::clone)),
         SensorKind::HdrOutput => text(pick(&signal.hdr, false, Clone::clone)),
         // An input depth that the receiver reports as unknown while a signal comes in shows the

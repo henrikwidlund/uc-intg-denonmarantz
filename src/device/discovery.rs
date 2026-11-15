@@ -245,8 +245,7 @@ pub struct Identified {
     pub is_denon: bool,
     pub is_dirac_supported: bool,
     pub support_sound_mode: bool,
-    pub receiver_type: Option<config_store::ReceiverGeneration>,
-    pub update_method: Option<config_store::HttpReadMethod>,
+    pub kind: config_store::ReceiverKind,
 }
 
 impl Identified {
@@ -264,15 +263,24 @@ impl Identified {
             is_dirac_supported: info.dirac_live,
             // Receivers that are not AVR-X have no sound mode list.
             support_sound_mode: info.receiver_type != ReceiverType::Avr,
-            receiver_type: receiver_type(info),
-            update_method: update_method(info),
+            kind: receiver_kind(info),
         })
+    }
+}
+
+/// What the configuration keeps of the receiver.
+pub const fn receiver_kind(info: &denon_marantz::Info) -> config_store::ReceiverKind {
+    config_store::ReceiverKind {
+        receiver_type: receiver_type(info),
+        update_method: update_method(info),
+        hdmi_output_over_http: Some(info.hdmi_output_over_http),
+        quick_select_count: info.quick_select_count,
     }
 }
 
 /// The receiver generation for the configuration. `None` for a generation that this version does
 /// not know.
-pub const fn receiver_type(info: &denon_marantz::Info) -> Option<config_store::ReceiverGeneration> {
+const fn receiver_type(info: &denon_marantz::Info) -> Option<config_store::ReceiverGeneration> {
     match info.receiver_type {
         ReceiverType::Avr => Some(config_store::ReceiverGeneration::Avr),
         ReceiverType::AvrX => Some(config_store::ReceiverGeneration::AvrX),
@@ -283,7 +291,7 @@ pub const fn receiver_type(info: &denon_marantz::Info) -> Option<config_store::R
 
 /// How the receiver is read over HTTP, for the configuration. `None` for a method that this
 /// version does not know.
-pub const fn update_method(info: &denon_marantz::Info) -> Option<config_store::HttpReadMethod> {
+const fn update_method(info: &denon_marantz::Info) -> Option<config_store::HttpReadMethod> {
     match info.update_method {
         UpdateMethod::AppCommand => Some(config_store::HttpReadMethod::AppCommand),
         UpdateMethod::StatusPages => Some(config_store::HttpReadMethod::StatusPages),

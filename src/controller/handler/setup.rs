@@ -637,8 +637,10 @@ impl Controller {
                         is_denon: options.is_denon,
                         is_dirac_supported: Some(identified.is_dirac_supported),
                         signal_poll_secs: options.signal_poll_secs,
-                        receiver_type: identified.receiver_type,
-                        update_method: identified.update_method,
+                        receiver_type: identified.kind.receiver_type,
+                        update_method: identified.kind.update_method,
+                        hdmi_output_over_http: identified.kind.hdmi_output_over_http,
+                        quick_select_count: identified.kind.quick_select_count,
                     };
                     if let Some(device) = act.devices.get_mut(cfg.key()) {
                         device.cfg = cfg.clone();

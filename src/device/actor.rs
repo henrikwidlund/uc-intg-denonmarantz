@@ -445,22 +445,16 @@ impl DenonActor {
         self.emit();
     }
 
-    /// Take the generation and the HTTP read method of the receiver. A configuration of the Python
+    /// Take what the configuration keeps of the receiver: the generation, the HTTP read method, the
+    /// HDMI output over HTTP and the number of quick selects. A configuration of the Python
     /// integration does not have them. The controller saves them.
     fn update_receiver_kind(&mut self, avr: &Avr, version: u64) {
-        let info = avr.info();
-        let kind = (
-            discovery::receiver_type(info),
-            discovery::update_method(info),
-        );
-        if self.cfg_version != version || kind == (self.cfg.receiver_type, self.cfg.update_method) {
+        let kind = discovery::receiver_kind(avr.info());
+        if self.cfg_version != version || kind == self.cfg.kind() {
             return;
         }
-        info!(
-            "[{}] receiver type {:?}, read with {:?}",
-            self.cfg.name, kind.0, kind.1
-        );
-        (self.cfg.receiver_type, self.cfg.update_method) = kind;
+        info!("[{}] receiver: {kind:?}", self.cfg.name);
+        self.cfg.set_kind(kind);
         self.controller.do_send(DeviceEvent::Config {
             key: self.key.clone(),
             cfg: self.cfg.clone(),
@@ -485,9 +479,10 @@ impl DenonActor {
     }
 
     /// Read the state over HTTP and show if the receiver answers. It does nothing while telnet
-    /// reports the changes, or while an earlier read runs. In HTTP mode Audyssey and the signal are
-    /// read after the state: the library asks only receivers that use `AppCommand`. In telnet mode
-    /// they are not: while telnet is down, a blank answer would clear the values of telnet.
+    /// reports the changes, or while an earlier read runs. In HTTP mode Audyssey, the signal and
+    /// the HDMI output are read after the state: the library asks only receivers that use
+    /// `AppCommand`. In telnet mode they are not: while telnet is down, a blank answer would clear
+    /// the values of telnet.
     fn poll_http(&mut self, ctx: &mut Context<Self>) {
         if !self.needs_poll() || self.polling {
             return;
@@ -495,12 +490,12 @@ impl DenonActor {
         let Some(avr) = self.avr.clone() else { return };
         self.polling = true;
         let generation = self.generation;
-        let audyssey = !self.cfg.use_telnet;
+        let settings = !self.cfg.use_telnet;
         ctx.spawn(
             async move {
                 let result = avr.update().await;
                 let extra = match &result {
-                    Ok(()) if audyssey => Some(avr.update_signal_and_audyssey().await),
+                    Ok(()) if settings => Some(avr.update_signal_and_settings().await),
                     _ => None,
                 };
                 (result, extra)
@@ -513,7 +508,7 @@ impl DenonActor {
                 }
                 act.polling = false;
                 if let Some(Err(e)) = &extra {
-                    debug!("[{}] Audyssey and signal not read: {e}", act.cfg.name);
+                    debug!("[{}] signal and settings not read: {e}", act.cfg.name);
                 }
                 let ok = result.is_ok();
                 if let Err(e) = &result {
@@ -1158,6 +1153,8 @@ mod tests {
             signal_poll_secs: 0,
             receiver_type: None,
             update_method: None,
+            hdmi_output_over_http: None,
+            quick_select_count: None,
         }
     }
 

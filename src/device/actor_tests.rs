@@ -58,6 +58,8 @@ fn cfg() -> DeviceConfig {
         signal_poll_secs: 0,
         receiver_type: None,
         update_method: None,
+        hdmi_output_over_http: None,
+        quick_select_count: None,
     }
 }
 

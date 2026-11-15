@@ -82,6 +82,31 @@ pub struct DeviceConfig {
         deserialize_with = "none_if_unknown"
     )]
     pub update_method: Option<HttpReadMethod>,
+    /// The receiver reads and sets the HDMI output over HTTP. It is found at the setup and checked
+    /// at each connect.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "none_if_unknown"
+    )]
+    pub hdmi_output_over_http: Option<bool>,
+    /// Number of quick select (smart select on Marantz) slots. It is found at the setup and checked
+    /// at each connect.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "none_if_unknown"
+    )]
+    pub quick_select_count: Option<u8>,
+}
+
+/// What the driver found on the receiver. Entities and their options depend on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReceiverKind {
+    pub receiver_type: Option<ReceiverGeneration>,
+    pub update_method: Option<HttpReadMethod>,
+    pub hdmi_output_over_http: Option<bool>,
+    pub quick_select_count: Option<u8>,
 }
 
 /// The receiver generation, as the library reports it.
@@ -119,6 +144,35 @@ impl DeviceConfig {
     /// The signal comes over HTTP. This is tested only on the 2016 generation.
     pub const fn reads_signal(&self) -> bool {
         self.reads_app_command() && matches!(self.receiver_type, Some(ReceiverGeneration::AvrX2016))
+    }
+
+    /// The HDMI output comes over HTTP.
+    pub const fn reads_hdmi_output(&self) -> bool {
+        matches!(self.hdmi_output_over_http, Some(true))
+    }
+
+    /// The receiver has this quick select slot, counted from 1. Without a count, all slots.
+    pub const fn has_quick_select(&self, slot: u8) -> bool {
+        match self.quick_select_count {
+            Some(count) => slot <= count,
+            None => true,
+        }
+    }
+
+    pub const fn kind(&self) -> ReceiverKind {
+        ReceiverKind {
+            receiver_type: self.receiver_type,
+            update_method: self.update_method,
+            hdmi_output_over_http: self.hdmi_output_over_http,
+            quick_select_count: self.quick_select_count,
+        }
+    }
+
+    pub const fn set_kind(&mut self, kind: ReceiverKind) {
+        self.receiver_type = kind.receiver_type;
+        self.update_method = kind.update_method;
+        self.hdmi_output_over_http = kind.hdmi_output_over_http;
+        self.quick_select_count = kind.quick_select_count;
     }
 }
 
@@ -507,6 +561,8 @@ mod tests {
             signal_poll_secs: 10,
             receiver_type: None,
             update_method: None,
+            hdmi_output_over_http: None,
+            quick_select_count: None,
         }
     }
 
@@ -539,19 +595,26 @@ mod tests {
         // A file without the values stays without them.
         let text = serde_json::to_string(&python[0]).expect("json");
         assert!(
-            !text.contains("receiver_type") && !text.contains("update_method"),
+            !text.contains("receiver_type")
+                && !text.contains("update_method")
+                && !text.contains("hdmi_output_over_http")
+                && !text.contains("quick_select_count"),
             "{text}"
         );
 
         let d = DeviceConfig {
             receiver_type: Some(ReceiverGeneration::AvrX2016),
             update_method: Some(HttpReadMethod::AppCommand),
+            hdmi_output_over_http: Some(true),
+            quick_select_count: Some(4),
             ..device()
         };
         let text = serde_json::to_string(&d).expect("json");
         assert!(
             text.contains(r#""receiver_type":"avr_x2016""#)
-                && text.contains(r#""update_method":"app_command""#),
+                && text.contains(r#""update_method":"app_command""#)
+                && text.contains(r#""hdmi_output_over_http":true"#)
+                && text.contains(r#""quick_select_count":4"#),
             "{text}"
         );
         assert_eq!(d, serde_json::from_str(&text).expect("json"));
@@ -560,10 +623,10 @@ mod tests {
     #[test]
     fn an_unknown_receiver_kind_reads_as_none() {
         let d: DeviceConfig = serde_json::from_str(
-            r#"{"id":"A","name":"C","address":"h","receiver_type":"avr_z","update_method":7}"#,
+            r#"{"id":"A","name":"C","address":"h","receiver_type":"avr_z","update_method":7,"hdmi_output_over_http":"yes","quick_select_count":300}"#,
         )
         .expect("json");
-        assert_eq!((None, None), (d.receiver_type, d.update_method));
+        assert_eq!(ReceiverKind::default(), d.kind());
     }
 
     #[test]

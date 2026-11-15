@@ -465,15 +465,36 @@ pub async fn remote_ui(ctx: &mut Ctx) -> Check {
     let pages = options["user_interface"]["pages"]
         .as_array()
         .map_or(0, Vec::len);
+    // The quick select page has a button for each slot of the receiver, and is left out without
+    // slots.
+    let config = read_config(ctx).await?;
+    let slots = config_device(ctx, &config)?["quick_select_count"].as_u64();
+    let quick = options["user_interface"]["pages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|p| p["items"].as_array().into_iter().flatten())
+        .filter_map(|i| i["command"]["cmd_id"].as_str())
+        .filter(|c| c.starts_with("QUICK_SELECT_") || c.starts_with("SMART_SELECT_"))
+        .count();
     ensure!(simple > 300, "{simple} simple commands");
-    ensure!(pages == 15, "{pages} UI pages");
+    ensure!(
+        pages == 15 - usize::from(slots == Some(0)),
+        "{pages} UI pages"
+    );
+    ensure!(
+        slots.is_none_or(|n| usize::try_from(n).is_ok_and(|n| n.min(6) == quick)),
+        "{quick} quick select buttons, the receiver has {slots:?}"
+    );
     ensure!(options["button_mapping"].is_array(), "no button mapping");
     let features = strings(&remote["features"]);
     ensure!(
         features.contains(&"send_cmd".to_owned()),
         "features: {features:?}"
     );
-    Ok(format!("{simple} simple commands, {pages} pages"))
+    Ok(format!(
+        "{simple} simple commands, {pages} pages, {quick} quick select buttons"
+    ))
 }
 
 // ---------------------------------------------------------------- wake and sleep
@@ -1158,7 +1179,14 @@ fn http_counts(device: &Value) -> (usize, usize, usize, usize) {
     let app_command = device["update_method"] == "app_command";
     let signal = app_command && device["receiver_type"] == "avr_x2016";
     let extra = usize::from(app_command);
-    (6 + extra, 7 + 6 * usize::from(signal), 2 * extra, 2 * extra)
+    // The monitor output select and sensor.
+    let hdmi = usize::from(device["hdmi_output_over_http"] == true);
+    (
+        6 + extra + hdmi,
+        7 + 6 * usize::from(signal) + hdmi,
+        2 * extra,
+        2 * extra,
+    )
 }
 
 pub async fn config_file(ctx: &mut Ctx) -> Check {
@@ -1172,13 +1200,21 @@ pub async fn config_file(ctx: &mut Ctx) -> Check {
         missing.is_empty(),
         "fields missing in config.json: {missing:?}"
     );
+    // `quick_select_count` is missing if the receiver does not report it.
+    let kind = ["receiver_type", "update_method", "hdmi_output_over_http"];
+    let missing: Vec<_> = kind.iter().filter(|f| device.get(**f).is_none()).collect();
     ensure!(
-        device.get("receiver_type").is_some() && device.get("update_method").is_some(),
-        "receiver_type or update_method missing in config.json"
+        missing.is_empty(),
+        "fields missing in config.json: {missing:?}"
     );
     Ok(format!(
-        "id is the serial number, address {}, use_telnet {}, receiver_type {}, update_method {}",
-        device["address"], device["use_telnet"], device["receiver_type"], device["update_method"]
+        "id is the serial number, address {}, use_telnet {}, receiver_type {}, update_method {}, hdmi_output_over_http {}, quick_select_count {}",
+        device["address"],
+        device["use_telnet"],
+        device["receiver_type"],
+        device["update_method"],
+        device["hdmi_output_over_http"],
+        device["quick_select_count"]
     ))
 }
 

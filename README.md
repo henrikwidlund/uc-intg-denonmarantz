@@ -6,8 +6,9 @@ It controls Denon and Marantz network receivers with the `denon-marantz` library
 The driver is an alternative to the Python integration that is part of the Remote software. It has its own
 driver id (`denonavr_rs`), because the Python integration cannot be stopped or uninstalled. The `config.json`,
 the entity names and the command names are the same, so receivers that are set up with the Python integration
-work without a new setup. The driver adds the receiver type and the HTTP read method to `config.json`; the
-Python integration ignores them.
+work without a new setup. The driver adds what it finds on the receiver to `config.json`: the receiver type,
+the HTTP read method, if the HDMI output can be read over HTTP, and the number of quick selects. The Python
+integration ignores them.
 
 ## Features
 
@@ -21,7 +22,8 @@ Python integration ignores them.
 - **More entities** (with telnet, some also with HTTP only, see [Requirements](#requirements)): switches for tone control, Dynamic EQ, the three trigger outputs and the
   Bluetooth transmitter; numbers for bass and treble; selects for the Audyssey MultEQ mode, the quick select
   (smart select on Marantz), the tuner band and the Bluetooth output; a sensor for the active Dirac filter.
-  A quick select can change the volume.
+  A quick select can change the volume. The quick select, its simple commands and its UI page offer only
+  the slots that the receiver has.
 - **Sensors**: volume, sound mode, input, mute, dimmer and eco mode. With telnet also sleep timer, audio delay,
   audio and video signal, channels, resolution and bandwidth, video output port, HDR, pixel depth, FRL,
   color space (with BT.2020, for example `4:2:2/BT.2020`), picture mode, tuner frequency, all zone stereo and
@@ -64,7 +66,8 @@ to the log that says why.
   source, mute, dimmer, eco mode). Receivers that the driver reads with the newer HTTP interface also have
   the MultEQ select, the tone control and Dynamic EQ switches, and the bass and treble numbers. Models from
   2016 and later also have the sensors for the audio signal, sampling rate, HDMI video in and out, and the
-  input and output channels. The sound mode select offers the sound mode groups, for example `MOVIE`. While
+  input and output channels. Receivers that report the HDMI output over HTTP also have the monitor output
+  select and sensor. The sound mode select offers the sound mode groups, for example `MOVIE`. While
   the receiver is busy, mostly in the first seconds after a connect, a changed dimmer or eco mode can take up
   to 10 seconds to show.
 

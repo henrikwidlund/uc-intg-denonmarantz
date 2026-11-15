@@ -337,10 +337,10 @@ pub const fn availability(v: &View<'_>) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn cfg(use_telnet: bool, dirac: bool) -> DeviceConfig {
+    pub(crate) fn cfg(use_telnet: bool, dirac: bool) -> DeviceConfig {
         DeviceConfig {
             id: "SERIAL0000001".into(),
             name: "AVR".into(),
@@ -358,6 +358,8 @@ mod tests {
             signal_poll_secs: 0,
             receiver_type: None,
             update_method: None,
+            hdmi_output_over_http: None,
+            quick_select_count: None,
         }
     }
 
@@ -439,6 +441,25 @@ mod tests {
             let c = http(receiver_type, update_method);
             assert!(extra(&c).is_empty(), "{receiver_type:?} {update_method:?}");
         }
+    }
+
+    #[test]
+    fn http_mode_offers_the_monitor_output_if_the_receiver_reads_it() {
+        let base = cfg(false, true);
+        let c = DeviceConfig {
+            hdmi_output_over_http: Some(true),
+            ..cfg(false, true)
+        };
+        let extra: Vec<EntityKind> = EntityKind::all(&c)
+            .filter(|k| !EntityKind::all(&base).any(|b| b == *k))
+            .collect();
+        assert_eq!(
+            vec![
+                EntityKind::Select(SelectKind::MonitorOutput),
+                EntityKind::Sensor(SensorKind::MonitorOutput)
+            ],
+            extra
+        );
     }
 
     #[test]

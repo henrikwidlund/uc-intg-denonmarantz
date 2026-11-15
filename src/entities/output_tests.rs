@@ -31,6 +31,8 @@ fn cfg() -> DeviceConfig {
         signal_poll_secs: 0,
         receiver_type: None,
         update_method: None,
+        hdmi_output_over_http: None,
+        quick_select_count: None,
     }
 }
 
@@ -561,4 +563,34 @@ fn an_unknown_input_pixel_depth_shows_the_output_depth() {
         sensor(&v, SensorKind::PixelDepthOutput)["value"],
         sensor(&v, SensorKind::PixelDepthInput)["value"]
     );
+}
+
+#[test]
+fn the_max_resolution_shows_the_label() {
+    let cfg = cfg();
+    let state = state(&["PWON", "SYHDMIDIAGMAXRES NO"]);
+    let v = view(&state, &cfg);
+    assert_eq!(
+        json!("No Limit"),
+        sensor(&v, SensorKind::MaxResolution)["value"]
+    );
+}
+
+#[test]
+fn the_quick_select_offers_the_slots_of_the_receiver() {
+    let cfg = DeviceConfig {
+        quick_select_count: Some(3),
+        ..cfg()
+    };
+    let state = state(&["PWON"]);
+    let v = view(&state, &cfg);
+    assert_eq!(
+        json!(["Quick Select 1", "Quick Select 2", "Quick Select 3"]),
+        select(&v, SelectKind::QuickSelect)["options"]
+    );
+    let none = DeviceConfig {
+        quick_select_count: Some(0),
+        ..self::cfg()
+    };
+    assert!(!EntityKind::all(&none).any(|k| k == EntityKind::Select(SelectKind::QuickSelect)));
 }

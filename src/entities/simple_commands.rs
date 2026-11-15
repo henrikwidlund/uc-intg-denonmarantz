@@ -33,6 +33,8 @@ pub struct Entry {
     telnet_only: bool,
     brand: Brand,
     text: &'static str,
+    /// The quick select (smart select on Marantz) slot that the command uses.
+    quick_select: Option<u8>,
 }
 
 static ENTRIES: LazyLock<Vec<Entry>> = LazyLock::new(|| {
@@ -53,6 +55,7 @@ static ENTRIES: LazyLock<Vec<Entry>> = LazyLock::new(|| {
                 telnet_only,
                 brand,
                 text,
+                quick_select: quick_select_slot(name),
             })
         })
         .collect()
@@ -85,9 +88,14 @@ impl Entry {
         self.brand != Brand::Denon
     }
 
-    /// The receiver has the command: it has the brand, and telnet is on if the command needs it.
+    /// The receiver has the command: it has the brand and the quick select slot, and telnet is on
+    /// if the command needs it.
     const fn is_supported(&self, cfg: &DeviceConfig) -> bool {
         (cfg.use_telnet || !self.telnet_only)
+            && match self.quick_select {
+                Some(slot) => cfg.has_quick_select(slot),
+                None => true,
+            }
             && match self.brand {
                 Brand::All => true,
                 Brand::Denon => cfg.is_denon,
@@ -109,6 +117,14 @@ impl Entry {
             None => self.text.to_owned(),
         }
     }
+}
+
+/// The slot of a quick select or smart select command, for example 2 for `QUICK_SELECT_MEMORY_2`.
+pub fn quick_select_slot(name: &str) -> Option<u8> {
+    let rest = name
+        .strip_prefix("QUICK_SELECT_")
+        .or_else(|| name.strip_prefix("SMART_SELECT_"))?;
+    rest.strip_prefix("MEMORY_").unwrap_or(rest).parse().ok()
 }
 
 /// The names of the commands that a receiver has.
@@ -203,7 +219,24 @@ mod tests {
             signal_poll_secs: 0,
             receiver_type: None,
             update_method: None,
+            hdmi_output_over_http: None,
+            quick_select_count: None,
         }
+    }
+
+    #[test]
+    fn a_command_of_a_missing_quick_select_slot_is_not_offered() {
+        assert_eq!(Some(2), quick_select_slot("QUICK_SELECT_MEMORY_2"));
+        assert_eq!(Some(6), quick_select_slot("SMART_SELECT_6"));
+        assert_eq!(None, quick_select_slot("ZONE_FAVORITE_1"));
+        let c = DeviceConfig {
+            quick_select_count: Some(3),
+            ..cfg(true, true)
+        };
+        let names = supported(&c);
+        assert!(names.contains(&"QUICK_SELECT_3"));
+        assert!(!names.contains(&"QUICK_SELECT_4"));
+        assert!(!names.contains(&"QUICK_SELECT_MEMORY_4"));
     }
 
     #[test]
