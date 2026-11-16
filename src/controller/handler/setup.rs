@@ -1175,7 +1175,7 @@ fn configure_page(cfg: &DeviceConfig) -> Value {
 /// The receivers at one address, or all that answer the search.
 async fn find_receivers(address: Option<String>) -> Result<Vec<Found>, AvrError> {
     if let Some(host) = address {
-        let avr = discovery::identify(&host).await?;
+        let avr = discovery::identify(&host, None).await?;
         let id = discovery::Identified::new(&avr)
             .ok_or_else(|| AvrError::InvalidRequest("the receiver has no serial number".into()))?;
         return Ok(vec![Found::from_identified(&host, &id)]);
@@ -1199,7 +1199,7 @@ async fn detect_dirac(host: &str) -> bool {
 }
 
 async fn detect_dirac_opt(host: &str) -> Option<bool> {
-    let avr = tokio::time::timeout(DETECT_TIMEOUT, discovery::identify(host))
+    let avr = tokio::time::timeout(DETECT_TIMEOUT, discovery::identify(host, None))
         .await
         .ok()?
         .ok()?;
@@ -1208,7 +1208,7 @@ async fn detect_dirac_opt(host: &str) -> Option<bool> {
 
 /// Read the id and the name of the receiver at an address.
 async fn identify_host(host: &str) -> Result<discovery::Identified, IntegrationSetupError> {
-    let avr = discovery::identify(host)
+    let avr = discovery::identify(host, None)
         .await
         .map_err(|e| setup_error(&e))?;
     discovery::Identified::new(&avr).ok_or(IntegrationSetupError::Other)

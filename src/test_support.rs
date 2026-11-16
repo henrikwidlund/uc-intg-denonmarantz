@@ -117,12 +117,12 @@ pub struct Fake {
     accepts: Vec<AbortHandle>,
 }
 
-/// The description of a Marantz receiver: the manufacturer is the only difference.
-fn marantz_description() -> Vec<u8> {
+/// The description with another manufacturer: the manufacturer is the only difference.
+fn description_by(manufacturer: &str) -> Vec<u8> {
     String::from_utf8_lossy(DESCRIPTION)
         .replace(
             "<manufacturer>Denon</manufacturer>",
-            "<manufacturer>Marantz</manufacturer>",
+            &format!("<manufacturer>{manufacturer}</manufacturer>"),
         )
         .into_bytes()
 }
@@ -130,16 +130,30 @@ fn marantz_description() -> Vec<u8> {
 impl Fake {
     /// Start a Denon receiver. The main zone is on if `power_on`.
     pub async fn start(power_on: bool) -> Self {
-        Self::start_with(power_on, DESCRIPTION.to_vec()).await
+        Self::start_with(power_on, DESCRIPTION.to_vec(), true).await
     }
 
     /// Start a Marantz receiver. The main zone is on.
     pub async fn start_marantz() -> Self {
-        Self::start_with(true, marantz_description()).await
+        Self::start_with(true, description_by("Marantz"), true).await
     }
 
-    async fn start_with(power_on: bool, description: Vec<u8>) -> Self {
-        let description: Arc<[u8]> = description.into();
+    /// Start a receiver whose description names no manufacturer. The main zone is on.
+    pub async fn start_without_brand() -> Self {
+        Self::start_with(true, description_by(""), true).await
+    }
+
+    /// Start a busy receiver: it answers the device information with HTTP 500. The main zone is
+    /// on.
+    pub async fn start_busy() -> Self {
+        Self::start_with(true, DESCRIPTION.to_vec(), false).await
+    }
+
+    async fn start_with(power_on: bool, description: Vec<u8>, device_info: bool) -> Self {
+        let pages = Arc::new(Pages {
+            description,
+            device_info,
+        });
         let (port, listeners) = bind_loopback("bind the fake receiver").await;
         let commands = Arc::new(Mutex::new(Vec::new()));
         let app_commands = Arc::new(AtomicUsize::new(0));
@@ -149,7 +163,7 @@ impl Fake {
         for listener in listeners {
             let (seen, asked, closed) = (commands.clone(), app_commands.clone(), gone.clone());
             let audyssey = audyssey_reads.clone();
-            let description = description.clone();
+            let pages = pages.clone();
             let task = tokio::spawn(async move {
                 while let Ok((socket, _)) = listener.accept().await {
                     if closed.load(Ordering::SeqCst) {
@@ -159,7 +173,7 @@ impl Fake {
                         socket,
                         power_on,
                         seen.clone(),
-                        description.clone(),
+                        pages.clone(),
                         asked.clone(),
                         audyssey.clone(),
                         closed.clone(),
@@ -236,11 +250,18 @@ async fn bind_loopback(what: &str) -> (u16, Vec<TcpListener>) {
     (port, listeners)
 }
 
+/// What differs between the fake receivers.
+struct Pages {
+    description: Vec<u8>,
+    /// `false`: the device information is answered with HTTP 500.
+    device_info: bool,
+}
+
 async fn serve(
     mut socket: TcpStream,
     power_on: bool,
     commands: Arc<Mutex<Vec<String>>>,
-    description: Arc<[u8]>,
+    pages: Arc<Pages>,
     app_commands: Arc<AtomicUsize>,
     audyssey_reads: Arc<AtomicUsize>,
     gone: Arc<AtomicBool>,
@@ -257,9 +278,16 @@ async fn serve(
         if have < body_length && socket.read_exact(&mut body[have..]).await.is_err() {
             return;
         }
+        if !pages.device_info && path == "/goform/Deviceinfo.xml" {
+            let busy = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+            if socket.write_all(busy.as_bytes()).await.is_err() {
+                return;
+            }
+            continue;
+        }
         let answer: Option<Vec<u8>> = match (method.as_str(), path.as_str()) {
             ("GET", "/goform/Deviceinfo.xml") => Some(INFO.to_vec()),
-            ("GET", "/description.xml") => Some(description.to_vec()),
+            ("GET", "/description.xml") => Some(pages.description.clone()),
             ("GET", path) if path.starts_with(COMMAND) => {
                 commands
                     .lock()

@@ -393,6 +393,14 @@ impl DenonActor {
         self.timers.connect = Some(handle);
     }
 
+    /// Stop a running connect.
+    fn cancel_connect(&mut self, ctx: &mut Context<Self>) {
+        if let Some(handle) = self.timers.connect.take() {
+            ctx.cancel_future(handle);
+            debug!("[{}] connect canceled", self.cfg.name);
+        }
+    }
+
     fn on_connected(
         &mut self,
         connected: Connected,
@@ -606,8 +614,8 @@ impl DenonActor {
         self.refreshing = false;
         // An older connect attempt must not run on: it would read the receiver in parallel with
         // the next one.
+        self.cancel_connect(ctx);
         for handle in [
-            self.timers.connect.take(),
             self.timers.poll.take(),
             self.timers.signal.take(),
             self.timers.pages.take(),
@@ -723,9 +731,10 @@ async fn connect_avr(cfg: DeviceConfig) -> Result<Connected, Option<AvrError>> {
     let mut address = None;
     let mut found = None;
     let mut last_error = None;
+    let known = Some(discovery::Known::of(&cfg));
     // The last good address first.
     if !cfg.address.is_empty() {
-        match discovery::identify_retry(&cfg.address, deadline).await {
+        match discovery::identify_retry(&cfg.address, known, deadline).await {
             Ok(avr) => found = Some(avr),
             Err(e) => {
                 debug!("[{}] last address failed: {e}", cfg.name);
@@ -739,7 +748,7 @@ async fn connect_avr(cfg: DeviceConfig) -> Result<Connected, Option<AvrError>> {
         let Some(receiver) = discovery::find(&cfg, &receivers) else {
             return Err(last_error);
         };
-        let avr = discovery::identify_retry(&receiver.host, deadline)
+        let avr = discovery::identify_retry(&receiver.host, known, deadline)
             .await
             .map_err(Some)?;
         address = Some(receiver.host.clone());
@@ -983,10 +992,8 @@ impl Handler<Disconnect> for DenonActor {
         self.want = false;
         // The other timers stop in `close`: a connect that is asked for during the wait below
         // keeps the connection and needs them.
-        for handle in [self.timers.connect.take(), self.timers.reconnect.take()]
-            .into_iter()
-            .flatten()
-        {
+        self.cancel_connect(ctx);
+        if let Some(handle) = self.timers.reconnect.take() {
             ctx.cancel_future(handle);
         }
         // Asked for, for example at standby: the entities keep their state. Only a lost

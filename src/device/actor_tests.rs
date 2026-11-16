@@ -6,7 +6,7 @@
 //! sends events or closes the connection.
 
 use super::actor::CurrentAvr;
-use super::discovery::{TEST_BUILDER, TEST_DISCOVERY, TestBuilder};
+use super::discovery::{self, Known, TEST_BUILDER, TEST_DISCOVERY, TestBuilder};
 use super::{Command, Connect, DenonActor, DeviceEvent, DeviceStatus, Disconnect};
 use crate::config_store::{self, DeviceConfig};
 use crate::entities::sensor::EMPTY;
@@ -415,6 +415,7 @@ async fn a_receiver_with_a_new_address_is_found_by_its_serial_number() {
         model_name: None,
         friendly_name: None,
         serial_number: Some("SERIAL0000001".into()),
+        mac_address: None,
     };
     TEST_DISCOVERY.with(|slot| *slot.borrow_mut() = Some(vec![found]));
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -676,4 +677,106 @@ async fn the_http_poll_reads_audyssey_and_the_signal() {
         http.audyssey_reads() >= before + 2
     })
     .await;
+}
+
+#[actix::test]
+async fn the_stored_brand_is_used_if_the_description_names_none() {
+    let http = Fake::start_without_brand().await;
+    let http_port = http.port();
+    let setup: TestBuilder = Rc::new(move |_, builder| test_builder(http_port, 1, builder));
+    TEST_BUILDER.with(|slot| *slot.borrow_mut() = Some(setup));
+    let marantz = DeviceConfig {
+        is_denon: false,
+        ..cfg()
+    };
+    let avr = discovery::identify("127.0.0.1", Some(Known::of(&marantz)))
+        .await
+        .expect("identify");
+    assert_eq!(Brand::Marantz, avr.info().brand);
+    let avr = discovery::identify("127.0.0.1", None)
+        .await
+        .expect("identify");
+    assert_eq!(Brand::Denon, avr.info().brand);
+    let stored = DeviceConfig {
+        receiver_type: Some(config_store::ReceiverGeneration::AvrX2016),
+        ..cfg()
+    };
+    assert_eq!(
+        Some(ReceiverType::AvrX2016),
+        Known::of(&stored).receiver_type
+    );
+    let oldest = DeviceConfig {
+        receiver_type: Some(config_store::ReceiverGeneration::Avr),
+        ..cfg()
+    };
+    assert_eq!(None, Known::of(&oldest).receiver_type);
+}
+
+#[actix::test]
+async fn a_changed_receiver_type_is_looked_up_again() {
+    let http = Fake::start(true).await;
+    let http_port = http.port();
+    let builders = Rc::new(std::cell::Cell::new(0));
+    let counted = builders.clone();
+    // The fake is an AVR-X receiver.
+    let setup: TestBuilder = Rc::new(move |_, builder| {
+        counted.set(counted.get() + 1);
+        test_builder(http_port, 1, builder)
+    });
+    TEST_BUILDER.with(|slot| *slot.borrow_mut() = Some(setup));
+    let known = |receiver_type| Known {
+        receiver_type: Some(receiver_type),
+        brand: Brand::Denon,
+    };
+
+    let avr = discovery::identify("127.0.0.1", Some(known(ReceiverType::AvrX)))
+        .await
+        .expect("identify");
+    assert_eq!(ReceiverType::AvrX, avr.info().receiver_type);
+    assert_eq!(1, builders.get());
+
+    let avr = discovery::identify("127.0.0.1", Some(known(ReceiverType::AvrX2016)))
+        .await
+        .expect("identify");
+    assert_eq!(ReceiverType::AvrX, avr.info().receiver_type);
+    assert_eq!(3, builders.get());
+}
+
+#[actix::test]
+async fn an_error_answer_does_not_make_a_newer_receiver_the_oldest_type() {
+    let http = Fake::start_busy().await;
+    let http_port = http.port();
+    // Both types on the port of the fake: the error answer gives the oldest type there.
+    let setup: TestBuilder = Rc::new(move |_, builder| {
+        test_builder(http_port, 1, builder).probes(&[
+            (ReceiverType::AvrX, http_port),
+            (ReceiverType::Avr, http_port),
+        ])
+    });
+    TEST_BUILDER.with(|slot| *slot.borrow_mut() = Some(setup));
+    let known = |receiver_type| Known {
+        receiver_type: Some(receiver_type),
+        brand: Brand::Denon,
+    };
+
+    let error = discovery::identify("127.0.0.1", Some(known(ReceiverType::AvrX)))
+        .await
+        .expect_err("a newer receiver must not be the oldest type");
+    // Not a network error: the connect is not retried at once.
+    assert!(!error.is_unreachable(), "{error}");
+
+    // A stored `Avr` is looked up each time. It stays `Avr` while the receiver gives no device
+    // information.
+    let oldest = DeviceConfig {
+        receiver_type: Some(config_store::ReceiverGeneration::Avr),
+        ..cfg()
+    };
+    let avr = discovery::identify("127.0.0.1", Some(Known::of(&oldest)))
+        .await
+        .expect("identify");
+    assert_eq!(ReceiverType::Avr, avr.info().receiver_type);
+    let avr = discovery::identify("127.0.0.1", None)
+        .await
+        .expect("identify");
+    assert_eq!(ReceiverType::Avr, avr.info().receiver_type);
 }

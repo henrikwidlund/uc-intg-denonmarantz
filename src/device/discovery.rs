@@ -5,7 +5,7 @@
 
 use crate::config_store::{self, DeviceConfig};
 use denon_marantz::{
-    Ask, Avr, AvrBuilder, DiscoveredReceiver, DiscoveryConfig, Error, PageStatus, Query,
+    Ask, Avr, AvrBuilder, Brand, DiscoveredReceiver, DiscoveryConfig, Error, PageStatus, Query,
     QueryGroup, ReceiverType, StartOptions, StartReport, Started, UpdateMethod, discover_all,
 };
 use log::debug;
@@ -44,26 +44,104 @@ pub fn find<'a>(
         .find(|r| r.serial_number.as_deref() == Some(cfg.id.as_str()))
 }
 
-/// Identify a receiver. One short HTTP step. The step is started again once if it stalls.
-pub async fn identify(host: &str) -> Result<Avr, Error> {
+/// What an earlier connection found out about a receiver. The type saves the type lookup. The brand
+/// is used if the device description names none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Known {
+    /// `None`: the type is looked up.
+    pub receiver_type: Option<ReceiverType>,
+    /// Used if the device description does not name a brand.
+    pub brand: Brand,
+}
+
+impl Known {
+    pub fn of(cfg: &DeviceConfig) -> Self {
+        Self {
+            // `Avr` is looked up each time: an error answer at the setup also gives `Avr`, and a
+            // probe for `Avr` would keep that wrong type.
+            receiver_type: cfg.receiver_type.and_then(|t| match t {
+                config_store::ReceiverGeneration::Avr => None,
+                config_store::ReceiverGeneration::AvrX => Some(ReceiverType::AvrX),
+                config_store::ReceiverGeneration::AvrX2016 => Some(ReceiverType::AvrX2016),
+            }),
+            brand: if cfg.is_denon {
+                Brand::Denon
+            } else {
+                Brand::Marantz
+            },
+        }
+    }
+}
+
+/// Identify a receiver and read its description: a few short HTTP requests. They are started
+/// again once if they stall. With a known type, only the port of that type is asked.
+///
+/// If the receiver then reports another type, it is identified again without the known type.
+///
+/// An error answer to the device information makes the library report the oldest type (`Avr`).
+/// With a known type that result is not used: it is an error, so the connect is tried again later
+/// and the wrong type is not saved.
+pub async fn identify(host: &str, known: Option<Known>) -> Result<Avr, Error> {
+    let avr = identify_with(host, known).await?;
+    let Some(expected) = known.and_then(|k| k.receiver_type) else {
+        return Ok(avr);
+    };
+    if avr.info().receiver_type == expected {
+        return Ok(avr);
+    }
+    debug!(
+        "[{host}] receiver type {} is not the stored {}, looking it up again",
+        avr.info().receiver_type.name(),
+        expected.name()
+    );
+    let unknown_type = known.map(|k| Known {
+        receiver_type: None,
+        ..k
+    });
+    let avr = identify_with(host, unknown_type).await?;
+    if avr.info().receiver_type == ReceiverType::Avr {
+        return Err(Error::InvalidResponse {
+            request: format!(
+                "GET http://{host}:{}{}",
+                expected.port(),
+                denon_marantz::proto::DEVICE_INFO_PATH
+            ),
+            source: format!(
+                "no device information, the stored type is {}",
+                expected.name()
+            )
+            .into(),
+        });
+    }
+    Ok(avr)
+}
+
+async fn identify_with(host: &str, known: Option<Known>) -> Result<Avr, Error> {
     for attempt in 0..2 {
-        match timeout(STALL_TIMEOUT, builder(host).connect()).await {
+        match timeout(STALL_TIMEOUT, builder(host, known).connect()).await {
             Ok(result) => return result,
             Err(_) if attempt == 0 => debug!("[{host}] connect step stalled, starting again"),
             Err(_) => {}
         }
     }
-    builder(host).connect().await
+    builder(host, known).connect().await
 }
 
 /// The builder of a connection. A test can change it, so that the library talks to a fake
 /// receiver.
-fn builder(host: &str) -> AvrBuilder {
+fn builder(host: &str, known: Option<Known>) -> AvrBuilder {
+    let mut builder = Avr::builder(host);
+    if let Some(known) = known {
+        builder = builder.brand(known.brand);
+        if let Some(receiver_type) = known.receiver_type {
+            builder = builder.probes(&[(receiver_type, receiver_type.port())]);
+        }
+    }
     #[cfg(test)]
     if let Some(configure) = TEST_BUILDER.with(|slot| slot.borrow().clone()) {
-        return configure(host, Avr::builder(host));
+        return configure(host, builder);
     }
-    Avr::builder(host)
+    builder
 }
 
 /// A function that sets up the builder of the tests on this thread. It gets the host.
@@ -82,11 +160,15 @@ thread_local! {
 }
 
 /// Identify a receiver and retry network errors fast until `deadline`.
-pub async fn identify_retry(host: &str, deadline: Instant) -> Result<Avr, Error> {
+pub async fn identify_retry(
+    host: &str,
+    known: Option<Known>,
+    deadline: Instant,
+) -> Result<Avr, Error> {
     let mut delay = NETWORK_RETRY_INTERVAL;
     let mut first = true;
     loop {
-        match identify(host).await {
+        match identify(host, known).await {
             Err(e) if e.is_unreachable() && Instant::now() + delay < deadline => {
                 // One line for the first failure only: wake-up can need many tries.
                 if first {
@@ -259,7 +341,7 @@ impl Identified {
                 info.friendly_name.clone()
             },
             model: info.model_name.clone().unwrap_or_default(),
-            is_denon: info.brand != denon_marantz::Brand::Marantz,
+            is_denon: info.brand != Brand::Marantz,
             is_dirac_supported: info.dirac_live,
             // Receivers that are not AVR-X have no sound mode list.
             support_sound_mode: info.receiver_type != ReceiverType::Avr,
