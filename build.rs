@@ -130,7 +130,7 @@ fn write_git_info(git_version: Option<String>, git_dirty: bool, release_date: Op
     if let Some(git_version) = git_version {
         writeln!(
             f,
-            "pub const GIT_VERSION: Option<&'static str> = Some(\"{}\");",
+            "pub const GIT_VERSION: Option<&'static str> = Some({:?});",
             git_version
         )
         .unwrap();
