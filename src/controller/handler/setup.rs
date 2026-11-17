@@ -1868,6 +1868,58 @@ mod tests {
             );
         }
 
+        /// Identify the fake receiver like the setup does. The fake answers for the AVR-X and the
+        /// oldest type.
+        async fn identify_fake(
+            http: crate::test_support::Fake,
+        ) -> Result<crate::device::discovery::Identified, &'static str> {
+            use denon_marantz::ReceiverType;
+            let port = http.port();
+            let setup: crate::device::discovery::TestBuilder =
+                std::rc::Rc::new(move |_, builder| {
+                    crate::test_support::test_builder(port, 1, builder)
+                        .probes(&[(ReceiverType::AvrX, port), (ReceiverType::Avr, port)])
+                });
+            crate::device::discovery::TEST_BUILDER.with(|slot| *slot.borrow_mut() = Some(setup));
+            let avr = crate::device::discovery::identify(FAKE_HOST, None)
+                .await
+                .expect("identify");
+            crate::device::discovery::Identified::new(&avr)
+        }
+
+        #[actix::test]
+        async fn the_reason_is_given_when_a_receiver_cannot_be_used() {
+            use crate::test_support::Fake;
+            let reason = |result: Result<_, &'static str>| result.map(|_| ()).unwrap_err();
+            assert_eq!(
+                "the answers do not prove the receiver type",
+                reason(identify_fake(Fake::start_busy().await).await)
+            );
+            assert_eq!(
+                "the receiver did not send its description",
+                reason(identify_fake(Fake::start_without_description().await).await)
+            );
+            assert_eq!(
+                "the receiver gave no MAC address",
+                reason(identify_fake(Fake::start_without_mac().await).await)
+            );
+            assert_eq!(
+                "the receiver gave no serial number",
+                reason(identify_fake(Fake::start_old_with_empty_serial().await).await)
+            );
+        }
+
+        #[actix::test]
+        async fn an_old_receiver_gets_its_serial_number_as_id() {
+            let id = identify_fake(crate::test_support::Fake::start_old().await)
+                .await
+                .expect("identified");
+            assert_eq!("XXX", id.id);
+            assert_eq!(crate::config_store::IdKind::Serial, id.id_kind);
+            assert_eq!(Some("XXX"), id.serial.as_deref());
+            assert_eq!(None, id.mac);
+        }
+
         #[actix::test]
         async fn a_receiver_without_its_description_is_not_added() {
             let _fake =
@@ -1877,6 +1929,27 @@ mod tests {
             setup_fake(&controller, &events, false).await;
             wait_state(&events, "ERROR").await;
             assert_eq!(json!("OTHER"), last(&events)["error"]);
+        }
+
+        #[actix::test]
+        async fn a_receiver_without_a_serial_number_is_added_by_its_mac_address() {
+            let _fake =
+                fake_receiver_from(crate::test_support::Fake::start_with_empty_serial().await);
+            let controller = controller("no-serial", None);
+            let events = connect(&controller, "a").await;
+            setup_fake(&controller, &events, false).await;
+            controller
+                .send(values(
+                    "a",
+                    &[("choice", FAKE_HOST), ("connection_mode", "use_http")],
+                ))
+                .await
+                .expect("send")
+                .expect("ok");
+            wait_state(&events, "OK").await;
+            let device = &config_file("no-serial")[0];
+            assert_eq!(json!("0123456789AB"), device["id"]);
+            assert_eq!(None, device.get("serial"));
         }
 
         #[actix::test]

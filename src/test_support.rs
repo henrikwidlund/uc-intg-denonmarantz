@@ -17,6 +17,13 @@ const DESCRIPTION: &[u8] = include_bytes!("test_data/description.xml");
 const INFO: &[u8] =
     b"<Device_Info><CommApiVers>0301</CommApiVers><ModelName>AVC-X3700H</ModelName>\
     <DeviceZones>2</DeviceZones><MacAddress>0123456789AB</MacAddress></Device_Info>";
+/// The device information without the MAC address.
+const INFO_WITHOUT_MAC: &[u8] =
+    b"<Device_Info><CommApiVers>0301</CommApiVers><ModelName>AVC-X3700H</ModelName>\
+    <DeviceZones>2</DeviceZones></Device_Info>";
+/// The answer of old receivers that have no device information, for example the AVR-3311CI.
+const OLD_INFO: &[u8] = b"<html><head><title>Document Error: Data follows</title></head>\
+    <body><h2>Access Error: Data follows</h2><p>Form Deviceinfo.xml is not defined</p></body></html>";
 /// The answer of `AppCommand0300.xml` to the queries of the library, in its order.
 const APPCOMMAND0300: &[u8] = b"<?xml version=\"1.0\" encoding=\"utf-8\" ?><rx>\
     <cmd><name>GetAudyssey</name><list>\
@@ -117,6 +124,17 @@ pub struct Fake {
     accepts: Vec<AbortHandle>,
 }
 
+/// The description with empty serial numbers. Each part keeps its `serialNumber` element: the
+/// library chooses the part by it.
+fn description_with_empty_serial() -> Vec<u8> {
+    String::from_utf8_lossy(DESCRIPTION)
+        .replace(
+            "<serialNumber>XXX</serialNumber>",
+            "<serialNumber></serialNumber>",
+        )
+        .into_bytes()
+}
+
 /// The description with another manufacturer: the manufacturer is the only difference.
 fn description_by(manufacturer: &str) -> Vec<u8> {
     String::from_utf8_lossy(DESCRIPTION)
@@ -130,31 +148,56 @@ fn description_by(manufacturer: &str) -> Vec<u8> {
 impl Fake {
     /// Start a Denon receiver. The main zone is on if `power_on`.
     pub async fn start(power_on: bool) -> Self {
-        Self::start_with(power_on, DESCRIPTION.to_vec(), true).await
+        Self::start_with(power_on, DESCRIPTION.to_vec(), Some(INFO)).await
     }
 
     /// Start a Marantz receiver. The main zone is on.
     pub async fn start_marantz() -> Self {
-        Self::start_with(true, description_by("Marantz"), true).await
+        Self::start_with(true, description_by("Marantz"), Some(INFO)).await
     }
 
     /// Start a receiver whose description names no manufacturer. The main zone is on.
     pub async fn start_without_brand() -> Self {
-        Self::start_with(true, description_by(""), true).await
+        Self::start_with(true, description_by(""), Some(INFO)).await
     }
 
     /// Start a receiver that does not give its description. The main zone is on.
     pub async fn start_without_description() -> Self {
-        Self::start_with(true, Vec::new(), true).await
+        Self::start_with(true, Vec::new(), Some(INFO)).await
+    }
+
+    /// Start a receiver whose description has an empty serial number. The main zone is on.
+    pub async fn start_with_empty_serial() -> Self {
+        Self::start_with(true, description_with_empty_serial(), Some(INFO)).await
+    }
+
+    /// Start a newer receiver that gives no MAC address. The main zone is on.
+    pub async fn start_without_mac() -> Self {
+        Self::start_with(true, DESCRIPTION.to_vec(), Some(INFO_WITHOUT_MAC)).await
+    }
+
+    /// Start an old receiver: it has no device information, so no MAC address. The main zone is
+    /// on.
+    pub async fn start_old() -> Self {
+        Self::start_with(true, DESCRIPTION.to_vec(), Some(OLD_INFO)).await
+    }
+
+    /// Start an old receiver whose description has an empty serial number. The main zone is on.
+    pub async fn start_old_with_empty_serial() -> Self {
+        Self::start_with(true, description_with_empty_serial(), Some(OLD_INFO)).await
     }
 
     /// Start a busy receiver: it answers the device information with HTTP 500. The main zone is
     /// on.
     pub async fn start_busy() -> Self {
-        Self::start_with(true, DESCRIPTION.to_vec(), false).await
+        Self::start_with(true, DESCRIPTION.to_vec(), None).await
     }
 
-    async fn start_with(power_on: bool, description: Vec<u8>, device_info: bool) -> Self {
+    async fn start_with(
+        power_on: bool,
+        description: Vec<u8>,
+        device_info: Option<&'static [u8]>,
+    ) -> Self {
         let pages = Arc::new(Pages {
             description,
             device_info,
@@ -259,8 +302,8 @@ async fn bind_loopback(what: &str) -> (u16, Vec<TcpListener>) {
 struct Pages {
     /// Empty: the description is not found.
     description: Vec<u8>,
-    /// `false`: the device information is answered with HTTP 500.
-    device_info: bool,
+    /// `None`: the device information is answered with HTTP 500.
+    device_info: Option<&'static [u8]>,
 }
 
 async fn serve(
@@ -284,7 +327,7 @@ async fn serve(
         if have < body_length && socket.read_exact(&mut body[have..]).await.is_err() {
             return;
         }
-        if !pages.device_info && path == "/goform/Deviceinfo.xml" {
+        if pages.device_info.is_none() && path == "/goform/Deviceinfo.xml" {
             let busy = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
             if socket.write_all(busy.as_bytes()).await.is_err() {
                 return;
@@ -292,7 +335,7 @@ async fn serve(
             continue;
         }
         let answer: Option<Vec<u8>> = match (method.as_str(), path.as_str()) {
-            ("GET", "/goform/Deviceinfo.xml") => Some(INFO.to_vec()),
+            ("GET", "/goform/Deviceinfo.xml") => pages.device_info.map(<[u8]>::to_vec),
             ("GET", "/description.xml") if !pages.description.is_empty() => {
                 Some(pages.description.clone())
             }

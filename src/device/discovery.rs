@@ -340,30 +340,35 @@ pub struct Identified {
 }
 
 impl Identified {
-    /// Fails with the reason if the answers do not prove the receiver type, if the receiver
-    /// gives no serial number (its description was not read), or if it gives no MAC address and
-    /// is not an old receiver.
+    /// Fails with the reason if the answers do not prove the receiver type, if the description
+    /// was not read, or if the receiver gives no MAC address and is not an old receiver with a
+    /// serial number.
     pub fn new(avr: &Avr) -> Result<Self, &'static str> {
         let info = avr.info();
         if !info.type_proof.is_proven() {
             return Err("the answers do not prove the receiver type");
         }
-        // The name, model and brand also come from the description. They are not read again.
-        let Some(serial) = info.serial_number.clone().filter(|s| !s.is_empty()) else {
-            return Err("the receiver gave no serial number: its description was not read");
-        };
+        // The library reads no description without a manufacturer. The name, model and brand
+        // come from the description and are not read again.
+        if info.manufacturer.is_none() {
+            return Err("the receiver did not send its description");
+        }
+        let serial = info.serial_number.clone().filter(|s| !s.is_empty());
         let mac = mac_address(info);
-        let (id, id_kind) = match &mac {
-            Some(mac) => (mac.clone(), config_store::IdKind::Mac),
-            None if info.receiver_type == ReceiverType::Avr => {
+        let (id, id_kind) = match (&mac, &serial) {
+            (Some(mac), _) => (mac.clone(), config_store::IdKind::Mac),
+            (None, Some(serial)) if info.receiver_type == ReceiverType::Avr => {
                 (serial.clone(), config_store::IdKind::Serial)
             }
-            None => return Err("the receiver gave no MAC address"),
+            (None, _) if info.receiver_type != ReceiverType::Avr => {
+                return Err("the receiver gave no MAC address");
+            }
+            _ => return Err("the receiver gave no serial number"),
         };
         Ok(Self {
             id,
             id_kind,
-            serial: Some(serial),
+            serial,
             mac,
             name: if info.friendly_name.is_empty() {
                 info.model_name.clone().unwrap_or_default()
