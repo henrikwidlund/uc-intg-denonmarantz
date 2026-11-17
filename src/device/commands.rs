@@ -4,13 +4,15 @@
 //! Run entity commands on a receiver.
 
 use crate::config_store::DeviceConfig;
+use crate::device::heos;
 use crate::entities::media_player::{self, Action};
 use crate::entities::{
     EntityKind, SelectKind, View, is_off, number, remote, select, simple_commands, switch,
 };
 use crate::errors::ServiceError;
 use denon_marantz::proto::Power;
-use denon_marantz::{Avr, Command, RemoteKey, Zone};
+use denon_marantz::{Avr, Command, RemoteKey, State, Zone};
+use denon_marantz_heos::PlayState;
 use serde_json::{Map, Value};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -60,6 +62,7 @@ impl Expected {
 /// so that other commands, for example the volume buttons, do not wait for a long run.
 pub async fn run_steps(
     avr: &Avr,
+    heos: Option<&heos::Link>,
     cfg: &DeviceConfig,
     expected: &Expected,
     run: &remote::RemoteRun,
@@ -73,7 +76,7 @@ pub async fn run_steps(
             }
             first = false;
             let _guard = lock.lock().await;
-            action_run(avr, cfg, expected, action.clone()).await?;
+            action_run(avr, heos, cfg, expected, action.clone()).await?;
         }
     }
     Ok(())
@@ -82,6 +85,7 @@ pub async fn run_steps(
 /// Run an entity command.
 pub async fn run(
     avr: &Avr,
+    heos: Option<&heos::Link>,
     cfg: &DeviceConfig,
     expected: &Expected,
     kind: EntityKind,
@@ -91,7 +95,7 @@ pub async fn run(
     match kind {
         EntityKind::MediaPlayer => {
             let action = media_player::command(cmd_id, params)?;
-            action_run(avr, cfg, expected, action).await
+            action_run(avr, heos, cfg, expected, action).await
         }
         EntityKind::Remote => {
             let run = remote::command(cmd_id, params)?;
@@ -103,22 +107,14 @@ pub async fn run(
                         sleep(run.delay).await;
                     }
                     first = false;
-                    action_run(avr, cfg, expected, action.clone()).await?;
+                    action_run(avr, heos, cfg, expected, action.clone()).await?;
                 }
             }
             Ok(())
         }
         EntityKind::Select(select_kind) => {
             let state = avr.snapshot();
-            let view = View {
-                state: &state,
-                cfg,
-                connected: true,
-                artwork_url: None,
-                paused: false,
-                // Commands do not read the active sound mode.
-                sound_mode: None,
-            };
+            let view = command_view(&state, cfg);
             // The receiver ignores most settings while it is off.
             if is_off(&view) && select_kind != SelectKind::InputSource {
                 return Ok(());
@@ -245,8 +241,71 @@ async fn volume_step(
     Ok(())
 }
 
+/// What the commands read of the state. They do not read the active sound mode or HEOS. A group is
+/// a valid sound mode while the receiver gave no list.
+const fn command_view<'a>(state: &'a State, cfg: &'a DeviceConfig) -> View<'a> {
+    View {
+        state,
+        cfg,
+        connected: true,
+        artwork_url: None,
+        paused: false,
+        sound_mode: None,
+        sound_groups: true,
+        heos: None,
+        position: None,
+    }
+}
+
+/// Longest wait for HEOS to answer a command. The HEOS client sends one command at a time, so a
+/// command can wait behind a slow one. A command that is still waiting then is not sent.
+const HEOS_COMMAND_LIMIT: Duration = Duration::from_secs(5);
+
+/// Play, pause, stop, next and previous: the actions that go to HEOS while it is used.
+pub const fn is_transport(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::PlayPause | Action::Stop | Action::Next | Action::Previous
+    )
+}
+
+/// The media player shows HEOS: transport actions go to HEOS.
+pub fn heos_in_use(heos: &heos::Link, state: &State) -> bool {
+    heos.with_player(|p| p.is_some_and(|p| media_player::uses_heos(state, p)))
+}
+
+/// Run a transport action on HEOS, for at most [`HEOS_COMMAND_LIMIT`].
+pub async fn heos_run(heos: &heos::Link, action: &Action) -> Result<(), ServiceError> {
+    let run = async {
+        match action {
+            Action::PlayPause => heos.play_pause().await,
+            Action::Stop => heos.set_play_state(PlayState::Stop).await,
+            Action::Next => heos.next().await,
+            _ => heos.previous().await,
+        }
+    };
+    tokio::time::timeout(HEOS_COMMAND_LIMIT, run)
+        .await
+        .map_err(|_| ServiceError::Timeout)?
+}
+
+/// Play, pause, stop, next and previous go to HEOS while the media player shows HEOS. `None` for
+/// the other actions, and when HEOS is not used.
+async fn heos_transport(
+    heos: Option<&heos::Link>,
+    state: &State,
+    action: &Action,
+) -> Option<Result<(), ServiceError>> {
+    if !is_transport(action) {
+        return None;
+    }
+    let heos = heos.filter(|link| heos_in_use(link, state))?;
+    Some(heos_run(heos, action).await)
+}
+
 async fn action_run(
     avr: &Avr,
+    heos: Option<&heos::Link>,
     cfg: &DeviceConfig,
     expected: &Expected,
     action: Action,
@@ -254,6 +313,9 @@ async fn action_run(
     let zone = avr.zone(Zone::Main)?;
     let state = avr.snapshot();
     let main = state.zone(Zone::Main);
+    if let Some(result) = heos_transport(heos, &state, &action).await {
+        return result;
+    }
     match action {
         Action::On => zone.power_on().await?,
         Action::Off => zone.power_standby().await?,
@@ -270,6 +332,12 @@ async fn action_run(
             } else {
                 send(avr, Command::Play).await?;
             }
+        }
+        // Without HEOS, only Denon receivers offer stop.
+        Action::Stop if !cfg.is_denon => {
+            return Err(ServiceError::Blocked(
+                "stop works on Marantz receivers only while HEOS plays".into(),
+            ));
         }
         Action::Stop => send(avr, Command::Stop).await?,
         Action::Next => zone.press(RemoteKey::NextTrack).await?,
@@ -308,15 +376,7 @@ async fn action_run(
         Action::SelectSource(name) => {
             // The input switch works only if the receiver is on.
             zone.power_on().await?;
-            let view = View {
-                state: &state,
-                cfg,
-                connected: true,
-                artwork_url: None,
-                paused: false,
-                // Commands do not read the active sound mode.
-                sound_mode: None,
-            };
+            let view = command_view(&state, cfg);
             select::select_option(avr, &view, SelectKind::InputSource, &name).await?;
         }
         Action::Simple(entry) => {
@@ -335,15 +395,7 @@ async fn action_run(
         }
         Action::Raw(text) => send(avr, Command::Raw(&text)).await?,
         Action::SelectSoundMode(name) => {
-            let view = View {
-                state: &state,
-                cfg,
-                connected: true,
-                artwork_url: None,
-                paused: false,
-                // Commands do not read the active sound mode.
-                sound_mode: None,
-            };
+            let view = command_view(&state, cfg);
             select::select_option(avr, &view, SelectKind::SoundMode, &name).await?;
         }
     }

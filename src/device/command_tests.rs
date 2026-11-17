@@ -34,6 +34,7 @@ fn cfg() -> DeviceConfig {
         hdmi_output_over_http: None,
         quick_select_count: None,
         listed_queries: None,
+        heos: None,
     }
 }
 
@@ -53,7 +54,16 @@ async fn send(
 ) -> (Result<(), ServiceError>, Vec<String>) {
     let fake = Fake::start(power_on).await;
     let avr = fake.avr().await;
-    let result = run(&avr, &cfg(), &Expected::default(), kind, cmd_id, params).await;
+    let result = run(
+        &avr,
+        None,
+        &cfg(),
+        &Expected::default(),
+        kind,
+        cmd_id,
+        params,
+    )
+    .await;
     (result, fake.commands())
 }
 
@@ -61,6 +71,31 @@ async fn sent(kind: EntityKind, cmd_id: &str, params: Option<&Map<String, Value>
     let (result, commands) = send(true, kind, cmd_id, params).await;
     result.expect("the command works");
     commands
+}
+
+#[tokio::test]
+async fn stop_without_heos_is_refused_on_marantz() {
+    let fake = Fake::start(true).await;
+    let avr = fake.avr().await;
+    let marantz = DeviceConfig {
+        is_denon: false,
+        ..cfg()
+    };
+    let result = run(
+        &avr,
+        None,
+        &marantz,
+        &Expected::default(),
+        EntityKind::MediaPlayer,
+        "stop",
+        None,
+    )
+    .await;
+    assert!(
+        matches!(result, Err(ServiceError::Blocked(_))),
+        "{result:?}"
+    );
+    assert_eq!(Vec::<String>::new(), fake.commands());
 }
 
 #[tokio::test]

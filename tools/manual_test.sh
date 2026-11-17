@@ -295,11 +295,12 @@ With telnet there are 15 selects (14 without Dirac), 30 sensors (29 without Dira
 # ---------------------------------------------------------------- control
 
 step "Media info and navigation" \
-"Play something from a network source, for example HEOS or internet radio." \
-"Look at the media player: title, artist, album and cover. Then use play and pause, next and previous,
-the cursor keys, menu, back, info, channel up and down. Then select a source that has no media, and the
-tuner." \
-"Title, artist, album and cover show for network audio. A source without media shows its name as the title.
+"Play something from a network source, for example HEOS or internet radio. This makes sound." \
+"Look at the media player: title, artist, album, cover and, with HEOS, the position bar. Then use play and
+pause, next and previous, the cursor keys, menu, back, info, channel up and down. If you can, play from a
+phone over Bluetooth. Then select a source that has no media, and the tuner." \
+"Title, artist, album and cover show for network audio. With HEOS the position bar moves and pause shows
+PAUSED. Note what Bluetooth shows. A source without media shows its name as the title.
 The tuner shows the frequency as the title and the band as the artist. The keys work on the receiver." \
 "$LOG_PROBLEMS"
 

@@ -11,6 +11,7 @@
 mod checks;
 mod driver;
 mod oracle;
+mod restore;
 mod ws;
 
 use driver::Driver;
@@ -222,6 +223,9 @@ async fn main() {
         eprintln!("cannot create {}: {e}", dir.display());
         std::process::exit(2);
     }
+    if let Some(note) = restore::after_early_stop(&opt.address).await {
+        println!("{note}");
+    }
     let mut driver = Driver::new(&opt.bin, &dir, opt.port);
     if let Err(e) = driver.start().await {
         eprintln!("{e}");
@@ -275,6 +279,7 @@ async fn run(ctx: &mut Ctx) {
         return;
     }
     ctx.step("values", checks::values).await;
+    ctx.step("heos", checks::heos).await;
     ctx.step("remote_ui", checks::remote_ui).await;
     ctx.step("standby", checks::standby).await;
     ctx.step("remote_wake", checks::remote_wake).await;
@@ -293,6 +298,7 @@ async fn run(ctx: &mut Ctx) {
     ctx.step("broken_config", checks::broken_config).await;
     ctx.step("select_sweep", checks::select_sweep).await;
     ctx.step("extra_entities", checks::extra_entities).await;
+    ctx.step("settings_restore", checks::settings_restore).await;
     ctx.step("simple_commands", checks::simple_commands).await;
     ctx.step("restore_power", checks::restore_power).await;
     ctx.step("log", checks::log).await;

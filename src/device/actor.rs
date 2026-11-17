@@ -3,17 +3,18 @@
 
 //! Actor for one receiver: connection, state updates and commands.
 
-use crate::config_store::DeviceConfig;
+use crate::config_store::{self, DeviceConfig};
 use crate::device::commands::{self, Expected};
 use crate::device::{
-    Command, Connect, DeviceEvent, DeviceStatus, Disconnect, Stop, UpdateConfig, discovery,
+    Command, Connect, DeviceEvent, DeviceStatus, Disconnect, Stop, UpdateConfig, discovery, heos,
 };
-use crate::entities::{self, EntityKind, SensorKind, View, remote, select};
+use crate::entities::{self, EntityKind, SensorKind, View, media_player, remote, select};
 use crate::errors::ServiceError;
 use actix::prelude::*;
 use denon_marantz::{
-    Ask, Avr, Change, Error as AvrError, Query, Setting, Started, State, TelnetStatus,
+    Ask, Avr, Change, Error as AvrError, Query, ReceiverType, Setting, Started, State, TelnetStatus,
 };
+use denon_marantz_heos::{Change as HeosChange, Heos, PlayState, PlayerState};
 use futures::StreamExt;
 use log::{debug, info, warn};
 use serde_json::Map;
@@ -44,6 +45,20 @@ const DISCONNECT_WAIT: Duration = Duration::from_secs(2);
 /// Time between reads of the state over HTTP, while telnet does not run. The Python integration
 /// reads every 10 seconds too.
 const HTTP_POLL_INTERVAL: Duration = Duration::from_secs(10);
+/// Time before HEOS is connected again after its connect failed. After a connect, the HEOS client
+/// connects again by itself.
+/// Waits before HEOS is asked again, while a receiver with HEOS does not answer or its player is
+/// not in the HEOS list. The last wait repeats.
+#[cfg(not(test))]
+const HEOS_WAITS: [Duration; 5] = [
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(120),
+    Duration::from_secs(300),
+    Duration::from_secs(600),
+];
+#[cfg(test)]
+const HEOS_WAITS: [Duration; 5] = [Duration::from_millis(100); 5];
 
 /// A state change of the receiver. The generation tells which connection sent it.
 #[derive(Message)]
@@ -54,6 +69,53 @@ struct Changed(u64, Option<Change>);
 #[derive(Message)]
 #[rtype(result = "()")]
 struct LinkChanged(u64, bool);
+
+/// The answers of the start are in. The generation tells which connection sent it.
+#[derive(Message)]
+#[rtype(result = "()")]
+struct StartSynced(u64);
+
+/// The HEOS player or the HEOS connection changed. The generation tells which HEOS client sent it.
+/// The flag is set if only the position changed.
+#[derive(Message)]
+#[rtype(result = "()")]
+struct HeosChanged(u64, bool);
+
+/// A position that the media player shows, and when it was taken.
+#[derive(Debug, Clone, Copy)]
+struct HeosPosition {
+    shown: media_player::Position,
+    playing: bool,
+    at: Instant,
+}
+
+impl HeosPosition {
+    /// The position now, if it counts on from `at`.
+    fn expected(&self) -> u64 {
+        if self.playing {
+            self.shown.position + self.at.elapsed().as_secs()
+        } else {
+            self.shown.position
+        }
+    }
+}
+
+/// The shown position must change: it jumped, or the play state or the length changed.
+fn position_moved(old: Option<&HeosPosition>, new: Option<&HeosPosition>) -> bool {
+    match (old, new) {
+        (None, None) => false,
+        (Some(old), Some(new)) => {
+            old.playing != new.playing
+                || old.shown.duration != new.shown.duration
+                || old.expected().abs_diff(new.shown.position) >= POSITION_JUMP
+        }
+        _ => true,
+    }
+}
+
+/// A position that differs this much from the expected one is sent. HEOS reports the position
+/// every few seconds: a smaller difference is the Remote's own count.
+const POSITION_JUMP: u64 = 2;
 
 /// The receiver of the current connection, for the tests.
 #[cfg(test)]
@@ -81,6 +143,8 @@ struct Timers {
     /// The reads after a connect: missing web pages and toggles. Cancelling it drops its copy of
     /// the old `Avr`.
     pages: Option<SpawnHandle>,
+    /// The HEOS connect, or the wait before it is tried again.
+    heos: Option<SpawnHandle>,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -91,6 +155,18 @@ pub struct DenonActor {
     key: Arc<str>,
     controller: Recipient<DeviceEvent>,
     avr: Option<Arc<Avr>>,
+    /// The HEOS player. It is kept while the receiver connects again and while the Remote sleeps:
+    /// the HEOS client connects again by itself. It changes only with the address.
+    heos: Option<heos::Link>,
+    /// Incremented when the HEOS client is dropped. Results and changes of an older one are
+    /// ignored.
+    heos_generation: u64,
+    /// The address of the HEOS connect that runs or waits, or of the HEOS client.
+    heos_host: Option<String>,
+    /// How often HEOS was asked in a row without the player. Selects the wait in [`HEOS_WAITS`].
+    heos_attempt: usize,
+    /// The position that the media player shows. See `View::position`.
+    heos_position: Option<HeosPosition>,
     /// Last state of the receiver. Shown while there is no connection.
     last: State,
     /// Last address of the picture of what plays.
@@ -98,6 +174,9 @@ pub struct DenonActor {
     /// The option of the active sound mode. The last one is kept while the receiver reports a
     /// mode that is not in its list: after a change, it reports another mode for about 1 s.
     sound_mode: Option<String>,
+    /// The sound mode groups are the choices while the receiver gave no list. See
+    /// `View::sound_groups`.
+    sound_groups: bool,
     /// What plays was reported after the last source change. The receiver keeps the values of the
     /// old source, so they are not shown before.
     status: DeviceStatus,
@@ -170,9 +249,15 @@ impl DenonActor {
             cfg_version: 0,
             controller,
             avr: None,
+            heos: None,
+            heos_generation: 0,
+            heos_host: None,
+            heos_attempt: 0,
+            heos_position: None,
             last: State::new(true),
             last_artwork: None,
             sound_mode: None,
+            sound_groups: true,
             status: DeviceStatus::Disconnected,
             status_tx: watch::Sender::new(DeviceStatus::Disconnected),
             want: false,
@@ -210,41 +295,63 @@ impl DenonActor {
 
     /// Send the attributes of the entities that `keep` takes.
     fn emit_kinds(&mut self, keep: impl Fn(EntityKind) -> bool) {
-        let connected = self.linked() || self.keep_state;
-        let changes = if let Some(avr) = &self.avr {
-            // A borrow of the state: no copy. It is not held longer than this call.
-            let state = avr.state();
-            let state = state.borrow();
+        if let Some(avr) = &self.avr {
             self.last_artwork = avr.artwork_url();
-            if let Some(mode) = select::active_sound_mode(&state)
+            if let Some(mode) = select::active_sound_mode(&avr.state().borrow(), self.sound_groups)
                 && self.sound_mode.as_deref() != Some(mode)
             {
                 self.sound_mode = Some(mode.to_owned());
             }
-            build_changes(
-                &state,
-                &self.cfg,
-                connected,
-                self.last_artwork.as_deref(),
-                self.paused,
-                self.sound_mode.as_deref(),
-                keep,
-            )
-        } else {
-            build_changes(
-                &self.last,
-                &self.cfg,
-                connected,
-                self.last_artwork.as_deref(),
-                self.paused,
-                self.sound_mode.as_deref(),
-                keep,
-            )
-        };
+        }
+        let changes = self.heos.as_ref().map_or_else(
+            || self.build(None, &keep),
+            |link| link.with_player(|player| self.build(player, &keep)),
+        );
         self.controller.do_send(DeviceEvent::Changes {
             key: self.key.clone(),
             changes,
         });
+    }
+
+    /// The attributes of the entities that `keep` takes.
+    fn build(
+        &self,
+        heos: Option<&PlayerState>,
+        keep: impl Fn(EntityKind) -> bool,
+    ) -> Vec<(EntityKind, Map<String, serde_json::Value>)> {
+        let connected = self.linked() || self.keep_state;
+        let artwork = self.last_artwork.as_deref();
+        let sound_mode = self.sound_mode.as_deref();
+        if let Some(avr) = &self.avr {
+            // A borrow of the state: no copy. It is not held longer than this call.
+            let state = avr.state();
+            let state = state.borrow();
+            let view = View {
+                state: &state,
+                cfg: &self.cfg,
+                connected,
+                artwork_url: artwork,
+                paused: self.paused,
+                sound_mode,
+                sound_groups: self.sound_groups,
+                heos,
+                position: self.heos_position.map(|p| p.shown),
+            };
+            build_changes(&view, keep)
+        } else {
+            let view = View {
+                state: &self.last,
+                cfg: &self.cfg,
+                connected,
+                artwork_url: artwork,
+                paused: self.paused,
+                sound_mode,
+                sound_groups: self.sound_groups,
+                heos: None,
+                position: None,
+            };
+            build_changes(&view, keep)
+        }
     }
 
     /// Send what the changes since the last send can have changed. A volume, mute or title change
@@ -429,8 +536,9 @@ impl DenonActor {
         // Values from before the connect are not valid anymore.
         self.expected.clear();
         self.paused = false;
-        // The list of the receiver can be another one now.
+        // The list of the receiver can be another one now. With telnet, the list can still come.
         self.sound_mode = None;
+        self.sound_groups = !self.cfg.use_telnet;
         self.update_address(address, version);
         self.update_receiver_info(&avr, version);
 
@@ -446,6 +554,10 @@ impl DenonActor {
                         started,
                         self.cfg.name.clone(),
                         self.page_retry_delay,
+                        {
+                            let addr = ctx.address();
+                            move || addr.do_send(StartSynced(generation))
+                        },
                     )
                     .into_actor(self),
                 ),
@@ -465,6 +577,251 @@ impl DenonActor {
         self.avr = Some(avr);
         self.set_status(DeviceStatus::Connected);
         self.emit();
+        self.connect_heos(version, ctx);
+    }
+
+    /// Connect to the HEOS player of the receiver, if it has one or if that is not known yet. The
+    /// oldest receivers are not asked: they came before HEOS. A configuration without the value
+    /// gets it.
+    fn connect_heos(&mut self, version: u64, ctx: &mut Context<Self>) {
+        let Some(avr) = &self.avr else { return };
+        let host = &avr.info().host;
+        if self.heos_host.as_ref().is_some_and(|h| h != host) {
+            info!("[{}] new address, connecting HEOS again", self.cfg.name);
+            self.drop_heos(ctx);
+        }
+        // The client is there, or a connect or the wait before the next one runs.
+        if self.heos.is_some() || self.timers.heos.is_some() {
+            return;
+        }
+        let Some(avr) = &self.avr else { return };
+        let info = avr.info();
+        let wanted = self
+            .cfg
+            .heos
+            .unwrap_or(info.receiver_type != ReceiverType::Avr);
+        if !wanted {
+            return;
+        }
+        let host = info.host.clone();
+        self.heos_host = Some(host.clone());
+        let generation = self.heos_generation;
+        let handle = ctx.spawn(
+            async move { heos::connect(&host).await }
+                .into_actor(self)
+                .map(move |result, act, ctx| {
+                    if act.heos_generation != generation {
+                        return;
+                    }
+                    act.timers.heos = None;
+                    match result {
+                        Ok(heos::Connected::Player(link)) => {
+                            act.save_heos(true, version);
+                            act.use_heos(link, ctx);
+                        }
+                        // HEOS answers: the receiver has it.
+                        Ok(heos::Connected::NoPlayer(heos)) => {
+                            act.save_heos(true, version);
+                            act.wait_for_player(heos, ctx);
+                        }
+                        Err(e) if act.cfg.heos.is_none() => {
+                            if heos::is_absent(&e) {
+                                act.save_heos(false, version);
+                            } else {
+                                // Not known: asked again at the next connect to the receiver.
+                                debug!("[{}] HEOS not checked: {e}", act.cfg.name);
+                            }
+                        }
+                        // The receiver has HEOS, but it does not answer now.
+                        Err(e) => {
+                            debug!("[{}] HEOS connect failed: {e}", act.cfg.name);
+                            let wait = act.next_heos_wait();
+                            act.timers.heos = Some(ctx.run_later(wait, move |act, ctx| {
+                                act.timers.heos = None;
+                                if act.heos_generation == generation {
+                                    act.connect_heos(version, ctx);
+                                }
+                            }));
+                        }
+                    }
+                }),
+        );
+        self.timers.heos = Some(handle);
+    }
+
+    /// The wait before HEOS is asked again. Each call gives the next, longer wait.
+    fn next_heos_wait(&mut self) -> Duration {
+        let wait = HEOS_WAITS[self.heos_attempt.min(HEOS_WAITS.len() - 1)];
+        self.heos_attempt = self.heos_attempt.saturating_add(1);
+        wait
+    }
+
+    /// Keep the HEOS client, and read the HEOS players again after a wait until the player of the
+    /// receiver is there.
+    fn wait_for_player(&mut self, heos: Arc<Heos>, ctx: &mut Context<Self>) {
+        let generation = self.heos_generation;
+        let wait = self.next_heos_wait();
+        self.timers.heos = Some(ctx.run_later(wait, move |act, ctx| {
+            act.timers.heos = None;
+            if act.heos_generation != generation {
+                return;
+            }
+            let name = act.cfg.name.clone();
+            let find = async move {
+                if let Err(e) = heos.refresh().await {
+                    debug!("[{name}] HEOS players not read: {e}");
+                }
+                heos::find(heos).await
+            };
+            let handle = ctx.spawn(find.into_actor(act).map(move |found, act, ctx| {
+                if act.heos_generation != generation {
+                    return;
+                }
+                act.timers.heos = None;
+                match found {
+                    Ok(link) => act.use_heos(link, ctx),
+                    Err(heos) => {
+                        info!(
+                            "[{}] HEOS has no player with this address yet",
+                            act.cfg.name
+                        );
+                        act.wait_for_player(heos, ctx);
+                    }
+                }
+            }));
+            act.timers.heos = Some(handle);
+        }));
+    }
+
+    /// Drop the HEOS client. A command that runs keeps its copy until it ends.
+    fn drop_heos(&mut self, ctx: &mut Context<Self>) {
+        if let Some(handle) = self.timers.heos.take() {
+            ctx.cancel_future(handle);
+        }
+        self.heos_generation += 1;
+        self.heos = None;
+        self.heos_host = None;
+        self.heos_attempt = 0;
+        self.heos_position = None;
+    }
+
+    /// Show the HEOS player and follow its changes.
+    fn use_heos(&mut self, link: heos::Link, ctx: &mut Context<Self>) {
+        info!("[{}] HEOS connected", self.cfg.name);
+        self.heos_attempt = 0;
+        let generation = self.heos_generation;
+        let pid = link.pid();
+        // A lost change can be about this player.
+        let changes = BroadcastStream::new(link.heos().changes())
+            .filter(move |change| {
+                std::future::ready(
+                    change
+                        .as_ref()
+                        .map_or(true, |change| heos::concerns(pid, change)),
+                )
+            })
+            .map(move |change| {
+                HeosChanged(generation, matches!(change, Ok(HeosChange::Progress(_))))
+            });
+        ctx.add_message_stream(changes);
+        let status = WatchStream::from_changes(link.heos().watch_status())
+            .map(move |_| HeosChanged(generation, false));
+        ctx.add_message_stream(status);
+        self.heos = Some(link);
+        self.update_position();
+        self.dirty_part |= PART_PLAYER;
+        self.arm_emit(ctx);
+    }
+
+    /// Take the HEOS position if it jumped, or if the play state or the length changed. Returns
+    /// true if the shown position changed.
+    fn update_position(&mut self) -> bool {
+        let now = self.heos.as_ref().and_then(|link| {
+            link.with_player(|player| {
+                let player = player?;
+                let (progress, at) = (player.progress?, player.progress_at?);
+                let playing = player.play_state == Some(PlayState::Play);
+                let since = if playing { at.elapsed().as_millis() } else { 0 };
+                let position = u64::try_from(u128::from(progress.position_ms) + since)
+                    .unwrap_or(u64::MAX)
+                    / 1000;
+                Some(HeosPosition {
+                    shown: media_player::Position {
+                        position,
+                        duration: progress.duration_ms / 1000,
+                    },
+                    playing,
+                    at: Instant::now(),
+                })
+            })
+        });
+        let changed = position_moved(self.heos_position.as_ref(), now.as_ref());
+        if changed {
+            self.heos_position = now;
+        }
+        changed
+    }
+
+    /// Run play, pause, stop, next and previous on HEOS while the media player shows HEOS. They do
+    /// not wait for the commands of the receiver: HEOS is another connection. `None` if the command
+    /// does not go to HEOS.
+    fn heos_command(
+        &self,
+        msg: &Command,
+    ) -> Option<ResponseActFuture<Self, Result<(), ServiceError>>> {
+        let link = self.heos.clone()?;
+        let avr = self.avr.as_ref()?;
+        let action = match msg.kind {
+            EntityKind::MediaPlayer => {
+                media_player::command(&msg.cmd_id, msg.params.as_ref()).ok()?
+            }
+            EntityKind::Remote => {
+                let run = remote::command(&msg.cmd_id, msg.params.as_ref()).ok()?;
+                if run.steps() != 1 {
+                    return None;
+                }
+                run.actions.into_iter().next()?
+            }
+            _ => return None,
+        };
+        if !commands::is_transport(&action) || !commands::heos_in_use(&link, &avr.state().borrow())
+        {
+            return None;
+        }
+        let name = self.cfg.name.clone();
+        let cmd_id = msg.cmd_id.clone();
+        Some(Box::pin(
+            async move {
+                match commands::heos_run(&link, &action).await {
+                    // As for the receiver: the Remote gets OK, and the log says why nothing
+                    // happened.
+                    Err(ServiceError::Blocked(reason)) => {
+                        info!("[{name}] {cmd_id} ignored: {reason}");
+                        Ok(())
+                    }
+                    Err(e) => {
+                        warn!("[{name}] {cmd_id} failed: {e}");
+                        Err(e)
+                    }
+                    Ok(()) => Ok(()),
+                }
+            }
+            .into_actor(self),
+        ))
+    }
+
+    /// Store whether the receiver has HEOS, if the configuration does not have it yet. The
+    /// controller saves it. A new value changes the features of the media player.
+    fn save_heos(&mut self, found: bool, version: u64) {
+        if self.cfg_version != version || self.cfg.heos.is_some() {
+            return;
+        }
+        info!("[{}] HEOS: {found}", self.cfg.name);
+        self.cfg.heos = Some(found);
+        self.controller.do_send(DeviceEvent::Config {
+            key: self.key.clone(),
+            cfg: self.cfg.clone(),
+        });
     }
 
     /// Take what the configuration keeps of the receiver: the generation, the HTTP read method, the
@@ -479,7 +836,10 @@ impl DenonActor {
             return;
         }
         let info = avr.info();
-        let kind = discovery::receiver_kind(info);
+        let kind = config_store::ReceiverKind {
+            heos: self.cfg.heos,
+            ..discovery::receiver_kind(info)
+        };
         let new_kind = info.type_proof.is_proven() && kind != self.cfg.kind();
         if !info.type_proof.is_proven() {
             debug!(
@@ -658,8 +1018,11 @@ impl DenonActor {
         }
     }
 
+    /// Cancel the timers of the receiver connection. The HEOS connect runs on.
     fn cancel_timers(&mut self, ctx: &mut Context<Self>) {
+        let heos = self.timers.heos.take();
         let t = std::mem::take(&mut self.timers);
+        self.timers.heos = heos;
         for handle in [t.connect, t.reconnect, t.poll, t.signal, t.pages]
             .into_iter()
             .flatten()
@@ -712,13 +1075,16 @@ impl DenonActor {
             .into_actor(self)
             .then(move |(), act, _| {
                 let avr = act.avr.clone();
+                let heos = act.heos.clone();
                 let name = act.cfg.name.clone();
                 async move {
                     let Some(avr) = avr else {
                         warn!("[{name}] remote command: the receiver is not connected");
                         return;
                     };
-                    match commands::run_steps(&avr, &cfg, &expected, &run, &lock).await {
+                    match commands::run_steps(&avr, heos.as_ref(), &cfg, &expected, &run, &lock)
+                        .await
+                    {
                         Err(ServiceError::Blocked(reason)) => {
                             info!("[{name}] remote command ignored: {reason}");
                         }
@@ -835,6 +1201,7 @@ impl Actor for DenonActor {
 
     fn stopped(&mut self, ctx: &mut Self::Context) {
         self.close(ctx);
+        self.drop_heos(ctx);
     }
 }
 
@@ -866,27 +1233,14 @@ const fn part_bit(kind: EntityKind) -> u8 {
 
 /// The attributes of the entities that `keep` takes.
 fn build_changes(
-    state: &State,
-    cfg: &DeviceConfig,
-    connected: bool,
-    artwork_url: Option<&str>,
-    paused: bool,
-    sound_mode: Option<&str>,
+    view: &View<'_>,
     keep: impl Fn(EntityKind) -> bool,
 ) -> Vec<(EntityKind, Map<String, serde_json::Value>)> {
-    let view = View {
-        state,
-        cfg,
-        connected,
-        artwork_url,
-        paused,
-        sound_mode,
-    };
-    EntityKind::all(cfg)
+    EntityKind::all(view.cfg)
         .filter(|kind| keep(*kind))
         .map(|kind| {
             let mut attrs = Map::new();
-            entities::attributes(&view, kind, &mut attrs);
+            entities::attributes(view, kind, &mut attrs);
             (kind, attrs)
         })
         .collect()
@@ -984,6 +1338,19 @@ impl Handler<Changed> for DenonActor {
     }
 }
 
+impl Handler<StartSynced> for DenonActor {
+    type Result = ();
+
+    fn handle(&mut self, msg: StartSynced, ctx: &mut Self::Context) {
+        if msg.0 != self.generation {
+            return;
+        }
+        // A receiver without a list has sent none until now: the groups are the choices.
+        self.sound_groups = true;
+        self.schedule_emit(ctx);
+    }
+}
+
 impl Handler<LinkChanged> for DenonActor {
     type Result = ();
 
@@ -1025,6 +1392,22 @@ impl Handler<LinkChanged> for DenonActor {
             self.poll_http(ctx);
         }
         self.schedule_emit(ctx);
+    }
+}
+
+impl Handler<HeosChanged> for DenonActor {
+    type Result = ();
+
+    fn handle(&mut self, msg: HeosChanged, ctx: &mut Self::Context) {
+        if msg.0 != self.heos_generation {
+            return;
+        }
+        // A position that the Remote counts on by itself is not sent.
+        if !self.update_position() && msg.1 {
+            return;
+        }
+        self.dirty_part |= PART_PLAYER;
+        self.arm_emit(ctx);
     }
 }
 
@@ -1143,6 +1526,9 @@ impl Handler<Command> for DenonActor {
                 Ok(_) => {}
             }
         }
+        if let Some(run) = self.heos_command(&msg) {
+            return run;
+        }
         let lock = self.cmd_lock.clone();
         let cfg = self.cfg.clone();
         let expected = self.expected.clone();
@@ -1174,6 +1560,7 @@ impl Handler<Command> for DenonActor {
             .into_actor(self)
             .then(move |guard, act, _| {
                 let avr = act.avr.clone();
+                let heos = act.heos.clone();
                 let name = act.cfg.name.clone();
                 async move {
                     let _guard = guard?;
@@ -1182,6 +1569,7 @@ impl Handler<Command> for DenonActor {
                     };
                     let result = commands::run(
                         &avr,
+                        heos.as_ref(),
                         &cfg,
                         &expected,
                         msg.kind,
@@ -1230,10 +1618,54 @@ impl Handler<Command> for DenonActor {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_position_is_sent_only_when_it_jumps_or_the_play_state_changes() {
+        let at = |position, playing, ago: u64| HeosPosition {
+            shown: media_player::Position {
+                position,
+                duration: 200,
+            },
+            playing,
+            at: Instant::now()
+                .checked_sub(Duration::from_secs(ago))
+                .expect("time"),
+        };
+        // Played 5 s since 10: 15 is expected, the Remote counts by itself.
+        assert!(!position_moved(
+            Some(&at(10, true, 5)),
+            Some(&at(15, true, 0))
+        ));
+        assert!(!position_moved(
+            Some(&at(10, true, 5)),
+            Some(&at(16, true, 0))
+        ));
+        // A seek.
+        assert!(position_moved(
+            Some(&at(10, true, 5)),
+            Some(&at(60, true, 0))
+        ));
+        // Paused: the position stays, the state changes.
+        assert!(position_moved(
+            Some(&at(10, true, 5)),
+            Some(&at(15, false, 0))
+        ));
+        assert!(!position_moved(
+            Some(&at(15, false, 5)),
+            Some(&at(15, false, 0))
+        ));
+        // A new item with another length.
+        let mut other = at(0, true, 0);
+        other.shown.duration = 100;
+        assert!(position_moved(Some(&at(10, true, 5)), Some(&other)));
+        assert!(position_moved(None, Some(&other)));
+        assert!(position_moved(Some(&other), None));
+        assert!(!position_moved(None, None));
+    }
+
     fn test_cfg() -> DeviceConfig {
         DeviceConfig {
             id: "SERIAL0000001".into(),
-            id_kind: crate::config_store::IdKind::Serial,
+            id_kind: config_store::IdKind::Serial,
             serial: None,
             mac: None,
             name: "AVR".into(),
@@ -1254,6 +1686,7 @@ mod tests {
             hdmi_output_over_http: None,
             quick_select_count: None,
             listed_queries: None,
+            heos: None,
         }
     }
 
@@ -1271,8 +1704,19 @@ mod tests {
     fn changed_kinds(before: &State, after: &State) -> Vec<EntityKind> {
         let cfg = test_cfg();
         let all = |state: &State| {
-            let mode = select::active_sound_mode(state);
-            build_changes(state, &cfg, true, None, false, mode, |_| true)
+            let mode = select::active_sound_mode(state, true);
+            let view = View {
+                state,
+                cfg: &cfg,
+                connected: true,
+                artwork_url: None,
+                paused: false,
+                sound_mode: mode,
+                sound_groups: true,
+                heos: None,
+                position: None,
+            };
+            build_changes(&view, |_| true)
         };
         all(before)
             .into_iter()

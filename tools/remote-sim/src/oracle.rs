@@ -38,6 +38,10 @@ impl Oracle {
         self.avr.setting_status(feature)
     }
 
+    pub fn avr(&self) -> &Avr {
+        &self.avr
+    }
+
     pub fn state(&self) -> State {
         self.avr.snapshot()
     }

@@ -279,13 +279,20 @@ fn toggles_missing(avr: &Avr) -> bool {
 /// The receiver sometimes answers a web page with an error (HTTP status 500) and does not answer
 /// every telnet query when it is busy. The library asks once more at once. This reads the pages
 /// and the toggles again after a pause, so that their values do not stay empty until the next
-/// connect. It starts when the answers of the start are in. Runs in the background: commands do
-/// not wait for it.
-pub async fn read_missing_pages(avr: Arc<Avr>, started: Started, name: String, delay: Duration) {
+/// connect. It starts when the answers of the start are in, after it calls `synced`. Runs in the
+/// background: commands do not wait for it.
+pub async fn read_missing_pages(
+    avr: Arc<Avr>,
+    started: Started,
+    name: String,
+    delay: Duration,
+    synced: impl FnOnce(),
+) {
     // The extra values are queued before the wait: it covers the queries that wait at the call.
     read_extra_values(&avr).await;
     // The answers of the telnet queries of the start are in the state after this.
     let mut missing = Missing::of(&started.all_synced().await);
+    synced();
     for attempt in 1..=PAGE_RETRIES {
         if !missing.any() {
             break;
@@ -410,6 +417,8 @@ pub const fn receiver_kind(info: &denon_marantz::Info) -> config_store::Receiver
             }),
             None => None,
         },
+        // HEOS is not in `Info`: `heos::probe` finds it.
+        heos: None,
     }
 }
 
@@ -522,7 +531,7 @@ mod page_tests {
         let (web, avr, started) = started_with_web_status(500).await;
         // The actor holds the receiver while it runs: the reads stop if nobody else holds it.
         let held = avr.clone();
-        read_missing_pages(avr, started, "AVR".into(), Duration::from_millis(10)).await;
+        read_missing_pages(avr, started, "AVR".into(), Duration::from_millis(10), || ()).await;
         drop(held);
         // Two requests at the start and two for each of the three tries: the library asks twice.
         assert_eq!(2 + 3 * 2, web.requests(AUDIO_PAGE));
@@ -531,7 +540,7 @@ mod page_tests {
     #[tokio::test]
     async fn the_reads_stop_when_nobody_holds_the_receiver() {
         let (web, avr, started) = started_with_web_status(500).await;
-        read_missing_pages(avr, started, "AVR".into(), Duration::from_millis(10)).await;
+        read_missing_pages(avr, started, "AVR".into(), Duration::from_millis(10), || ()).await;
         assert_eq!(2, web.requests(AUDIO_PAGE));
     }
 
@@ -539,7 +548,7 @@ mod page_tests {
     async fn a_missing_page_is_not_asked_for_again() {
         let (web, avr, started) = started_with_web_status(404).await;
         let held = avr.clone();
-        read_missing_pages(avr, started, "AVR".into(), Duration::from_millis(10)).await;
+        read_missing_pages(avr, started, "AVR".into(), Duration::from_millis(10), || ()).await;
         drop(held);
         assert_eq!(1, web.requests(AUDIO_PAGE));
     }

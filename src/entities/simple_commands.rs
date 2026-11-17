@@ -225,6 +225,7 @@ mod tests {
             hdmi_output_over_http: None,
             quick_select_count: None,
             listed_queries: None,
+            heos: None,
         }
     }
 

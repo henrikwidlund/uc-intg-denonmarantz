@@ -650,3 +650,233 @@ pub fn test_builder(
         .telnet_config(telnet_config)
         .follow_up_read(None)
 }
+
+/// What the fake HEOS player plays.
+#[derive(Debug, Clone)]
+pub struct HeosItem {
+    /// `play`, `pause` or `stop`.
+    pub state: &'static str,
+    /// `song` or `station`.
+    pub kind: &'static str,
+    pub song: &'static str,
+    pub station: &'static str,
+    pub artist: &'static str,
+    pub album: &'static str,
+    pub image_url: &'static str,
+    /// HEOS source id: 3 is `TuneIn`, 1024 is local music.
+    pub sid: u32,
+}
+
+impl HeosItem {
+    /// A song that plays.
+    pub const fn song() -> Self {
+        Self {
+            state: "play",
+            kind: "song",
+            song: "A Song",
+            station: "",
+            artist: "An Artist",
+            album: "An Album",
+            image_url: "http://127.0.0.1/cover.jpg",
+            sid: 1024,
+        }
+    }
+
+    /// A `TuneIn` station that plays. It cannot pause, skip or go back.
+    pub const fn station() -> Self {
+        Self {
+            state: "play",
+            kind: "station",
+            song: "A Stream",
+            station: "A Station",
+            artist: "",
+            album: "",
+            image_url: "",
+            sid: 3,
+        }
+    }
+}
+
+/// The player id of the fake HEOS player.
+pub const HEOS_PID: i64 = 7;
+
+/// A fake HEOS port of a receiver. Its one player has the address `ip`. It answers the reads with
+/// `item`, answers commands with success and records the command lines.
+pub struct FakeHeos {
+    pub port: u16,
+    item: Arc<Mutex<HeosItem>>,
+    received: Arc<Mutex<Vec<String>>>,
+    events: tokio::sync::broadcast::Sender<String>,
+    /// Commands that change the play state get no answer.
+    hang: Arc<AtomicBool>,
+    /// The address of the player.
+    ip: Arc<Mutex<&'static str>>,
+}
+
+impl FakeHeos {
+    pub async fn start(ip: &'static str, item: HeosItem) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the fake HEOS port");
+        let port = listener.local_addr().expect("address").port();
+        let item = Arc::new(Mutex::new(item));
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let events = tokio::sync::broadcast::Sender::new(16);
+        let hang = Arc::new(AtomicBool::new(false));
+        let ip = Arc::new(Mutex::new(ip));
+        let (state, seen, sender) = (item.clone(), received.clone(), events.clone());
+        let (silent, address) = (hang.clone(), ip.clone());
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                tokio::spawn(serve_heos(
+                    socket,
+                    address.clone(),
+                    state.clone(),
+                    seen.clone(),
+                    sender.clone(),
+                    silent.clone(),
+                ));
+            }
+        });
+        Self {
+            port,
+            item,
+            received,
+            events,
+            hang,
+            ip,
+        }
+    }
+
+    /// Give the player another address. The client sees it when it reads the players again.
+    pub fn move_player(&self, ip: &'static str) {
+        *self.ip.lock().expect("lock") = ip;
+    }
+
+    /// From now on, commands that change the play state get no answer.
+    pub fn hang(&self) {
+        self.hang.store(true, Ordering::SeqCst);
+    }
+
+    /// How often the client sent this command, for example `player/get_players`.
+    pub fn count(&self, command: &str) -> usize {
+        self.received()
+            .iter()
+            .filter(|l| l.split('?').next() == Some(command))
+            .count()
+    }
+
+    /// Settings of the HEOS client for this port, with short times.
+    pub const fn config(&self) -> denon_marantz_heos::HeosConfig {
+        denon_marantz_heos::HeosConfig {
+            port: self.port,
+            connect_timeout: Duration::from_millis(500),
+            write_timeout: Duration::from_millis(500),
+            command_timeout: Duration::from_millis(500),
+            slow_command_limit: Duration::from_millis(1000),
+            keep_alive: Duration::from_secs(10),
+            reconnect_min: Duration::from_millis(50),
+            reconnect_max: Duration::from_millis(200),
+            now_playing_delay: Duration::from_millis(10),
+        }
+    }
+
+    /// The command lines that the client sent, without `heos://`.
+    pub fn received(&self) -> Vec<String> {
+        self.received.lock().expect("lock").clone()
+    }
+
+    /// Change what plays and send the events of the change.
+    pub fn play(&self, item: HeosItem) {
+        let state = item.state;
+        *self.item.lock().expect("lock") = item;
+        for line in [
+            format!(
+                r#"{{"heos": {{"command": "event/player_state_changed", "message": "pid={HEOS_PID}&state={state}"}}}}"#
+            ),
+            format!(
+                r#"{{"heos": {{"command": "event/player_now_playing_changed", "message": "pid={HEOS_PID}"}}}}"#
+            ),
+        ] {
+            let _ = self.events.send(line);
+        }
+    }
+}
+
+async fn serve_heos(
+    socket: TcpStream,
+    ip: Arc<Mutex<&'static str>>,
+    item: Arc<Mutex<HeosItem>>,
+    received: Arc<Mutex<Vec<String>>>,
+    events: tokio::sync::broadcast::Sender<String>,
+    hang: Arc<AtomicBool>,
+) {
+    use tokio::io::AsyncBufReadExt;
+    let (reader, mut writer) = socket.into_split();
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+    let mut registered: Option<tokio::sync::broadcast::Receiver<String>> = None;
+    loop {
+        let event = async {
+            match registered.as_mut() {
+                Some(events) => events.recv().await.ok(),
+                None => std::future::pending().await,
+            }
+        };
+        let out = tokio::select! {
+            line = lines.next_line() => {
+                let Ok(Some(line)) = line else { return };
+                let line = line.trim_end().trim_start_matches("heos://").to_owned();
+                let (name, args) = line.split_once('?').unwrap_or((&line, ""));
+                let answer = heos_answer(name, args, *ip.lock().expect("lock"), &item.lock().expect("lock"));
+                if name == "system/register_for_change_events" && args.contains("enable=on") {
+                    registered = Some(events.subscribe());
+                }
+                received.lock().expect("lock").push(line.clone());
+                if name == "player/set_play_state" && hang.load(Ordering::SeqCst) {
+                    continue;
+                }
+                answer
+            }
+            Some(line) = event => line,
+        };
+        if writer
+            .write_all(format!("{out}\r\n").as_bytes())
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+fn heos_answer(name: &str, args: &str, ip: &str, item: &HeosItem) -> String {
+    let head = |message: &str| {
+        format!(r#""heos": {{"command": "{name}", "result": "success", "message": "{message}"}}"#)
+    };
+    match name {
+        "player/get_players" => format!(
+            r#"{{{}, "payload": [{{"name": "AVR", "pid": {HEOS_PID}, "model": "Denon AVR", "ip": "{ip}", "network": "wired"}}]}}"#,
+            head("")
+        ),
+        "player/get_play_state" => format!(
+            "{{{}}}",
+            head(&format!("pid={HEOS_PID}&state={}", item.state))
+        ),
+        "player/get_play_mode" => format!(
+            "{{{}}}",
+            head(&format!("pid={HEOS_PID}&repeat=off&shuffle=off"))
+        ),
+        "player/get_now_playing_media" => format!(
+            r#"{{{}, "payload": {{"type": "{}", "song": "{}", "station": "{}", "album": "{}", "artist": "{}", "image_url": "{}", "qid": 1, "sid": {}}}, "options": []}}"#,
+            head(&format!("pid={HEOS_PID}")),
+            item.kind,
+            item.song,
+            item.station,
+            item.album,
+            item.artist,
+            item.image_url,
+            item.sid
+        ),
+        _ => format!("{{{}}}", head(args)),
+    }
+}

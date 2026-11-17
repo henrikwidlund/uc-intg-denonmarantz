@@ -25,11 +25,15 @@ pub struct Choices {
 }
 
 /// The option of the active sound mode. The receiver reports its own text for it, for example
-/// `MULTI CH IN` for the list entry `Multi Ch In`. `None` if no option fits.
-pub fn active_sound_mode(state: &State) -> Option<&str> {
+/// `MULTI CH IN` for the list entry `Multi Ch In`. `None` if no option fits. Without a list, the
+/// options are the groups if `groups` is true, else there is no option.
+pub fn active_sound_mode(state: &State, groups: bool) -> Option<&str> {
     let raw = state.zone(Zone::Main).sound_mode.as_deref()?;
     let modes = &state.device().sound_modes;
     if modes.as_slice().is_empty() {
+        if !groups {
+            return None;
+        }
         // Without the list, the options are the groups.
         return SoundModeGroup::from_raw(raw)
             .or_else(|| SoundModeGroup::guess_from_raw(raw))
@@ -158,8 +162,8 @@ pub fn choices(v: &View<'_>, kind: SelectKind) -> Choices {
                     options.push(entry.name.clone());
                 }
             }
-            // Without telnet the receiver gives no list: the groups are the choices.
-            if options.is_empty() {
+            // Without telnet, or on a receiver without a list, the groups are the choices.
+            if options.is_empty() && v.sound_groups {
                 options.extend(
                     SoundModeGroup::ALL
                         .iter()

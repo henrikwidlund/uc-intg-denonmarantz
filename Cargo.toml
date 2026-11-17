@@ -13,17 +13,21 @@ default = ["mdns-sd"]
 # mDNS service publishing. The Remote needs it to find the driver.
 # Pure Rust, works on all platforms and in cross builds.
 mdns-sd = ["dep:mdns-sd"]
+# Trace logs with the full telnet and HEOS lines. They can hold titles and account names: only
+# for tests, never in a release.
+sensitive-logs = ["denon-marantz/sensitive-logs", "denon-marantz-heos/sensitive-logs"]
 
 [dependencies]
 uc_api = { git = "https://github.com/unfoldedcircle/api-model-rs", rev = "336beb1" }
-denon-marantz = { git = "https://github.com/henrikwidlund/rusty-denon-marantz", rev = "2204eda", features = ["mdns"] }
+denon-marantz = { git = "https://github.com/henrikwidlund/rusty-denon-marantz", rev = "732a09c", features = ["mdns"] }
+denon-marantz-heos = { git = "https://github.com/henrikwidlund/rusty-denon-marantz", rev = "732a09c" }
 
 # WebSocket server
 actix = "0.13.5"
 actix-web = { version = "4.18.2", default-features = false, features = ["macros"] }
 actix-ws = "0.4.0"
 futures = { version = "0.3.34", default-features = false, features = ["std"] }
-tokio = { version = "1.54.1", features = ["macros", "sync", "time"] }
+tokio = { version = "1.54.1", features = ["macros", "net", "sync", "time"] }
 tokio-stream = { version = "0.1.19", features = ["sync"] }
 
 # mDNS publishing

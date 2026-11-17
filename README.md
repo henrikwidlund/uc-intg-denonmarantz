@@ -7,8 +7,8 @@ The driver is an alternative to the Python integration that is part of the Remot
 driver id (`denonavr_rs`), because the Python integration cannot be stopped or uninstalled. The `config.json`,
 the entity names and the command names are the same, so receivers that are set up with the Python integration
 work without a new setup. The driver adds what it finds on the receiver to `config.json`: the serial number,
-the MAC address, the receiver type, the HTTP read method, if the HDMI output can be read over HTTP, the number of quick selects, and the values
-that the receiver lists for HTTP. The Python integration ignores them.
+the MAC address, the receiver type, the HTTP read method, if the HDMI output can be read over HTTP, the number of quick selects, the values
+that the receiver lists for HTTP, and if the receiver has HEOS. The Python integration ignores them.
 
 The device id in the entity ids is the MAC address of the receiver. Receivers from about 2011 and older do not
 give it: they use the serial number. Receivers that are set up with the Python integration keep the serial
@@ -17,15 +17,17 @@ number (`id_kind` in `config.json`).
 ## Status
 
 Preview. Tested with a Denon AVC-A10H. Marantz receivers are only tested with simulated receivers. The
-Audyssey values (MultEQ, Dynamic EQ) are not tested on a receiver with Audyssey. HEOS (media info of network
-sources on newer receivers) is not done yet. Please report problems as
+Audyssey values (MultEQ, Dynamic EQ) are not tested on a receiver with Audyssey. HEOS is not tested with
+Bluetooth or with zone 2. Please report problems as
 [issues](https://github.com/henrikwidlund/uc-intg-denonmarantz/issues).
 
 ## Features
 
 - **Media player**: power, volume and mute, input source, sound mode, navigation, menu, options, info,
   channel up and down, play and pause, next and previous. Title, artist, album and cover for network audio
-  and HD radio, on receivers that do not use HEOS for network audio.
+  and HD radio. On receivers with HEOS, network audio shows what HEOS plays, with position and length, and
+  play, pause, stop, next and previous go to HEOS. Volume and mute stay on the receiver: HEOS shares one
+  volume for all zones.
 - **Remote**: the simple commands of the Python integration (about 370), 15 UI pages, button mapping,
   repeat and button sequences. Text of up to 28 characters is sent to the receiver as it is.
 - **Selects**: sound mode, input source, reference level, dynamic volume, dimmer, eco mode. With telnet also
@@ -99,6 +101,8 @@ configurator of the Remote.
 3. To keep the old setup, copy the `config.json` of the Python integration to the configuration folder of
    the driver. Otherwise start the setup. Leave the address empty to search the network. If the setup fails,
    run it again. The receiver must send its description.
+   With a copied `config.json`, the driver checks for HEOS at the first connect. If the receiver has HEOS,
+   add the media player entity again after that connect to get the position and length.
 
 Run the setup again to add, remove or configure a receiver, make a backup, or restore one.
 
@@ -174,9 +178,16 @@ the entity lists, the buttons, the sleep of the Remote and a real signal. It sav
 
 `tools/remote-sim` is a program that acts as the Remote and runs most of these tests by itself with a real
 receiver. It opens a second connection to the receiver and checks that every select and sensor shows what the
-receiver has, after each change. It also sends the simple commands of the remote entity. It starts the driver
-without mDNS, so it needs no root rights. The checks switch the receiver on and off and change source, sound
-mode and some settings, and restore them. The volume never goes above -40 dB.
+receiver has, after each change. It also sends the simple commands of the remote entity, but not the
+triggers and the remote lock. It starts the driver without mDNS, so it needs no root rights. The checks switch
+the receiver on and off and change source, sound mode and some settings, and restore them. While the simple
+commands are sent, the sound can stop for some seconds, for example when HDMI audio goes to the TV. The
+settings that they change are saved in `remote-sim-restore.txt` first. If a run stops before they are set
+back, the next run sets them back at its start. While the file is still there, the checks that change these
+settings are skipped. A source change stops HEOS and AirPlay, and they do not start
+again. The volume never goes above -40 dB. The `heos` check compares
+the media player with a second HEOS connection, pauses and plays once. Start HEOS Music on the main zone
+before the run, else the check is skipped.
 
 ```shell
 cargo build --release
@@ -194,7 +205,10 @@ Options:
 - `--no-oracle` does not open the second connection. The values are then not compared with the receiver.
 - `--driver <path>`, `--port <port>` and `--commands <path>` change the driver binary, the port and the
   command table.
-- `RUST_LOG` is passed to the driver, for example `info,denon_marantz=trace` to log the telnet lines.
+- `RUST_LOG` is passed to the driver, for example `info,denon_marantz=trace,denon_marantz_heos=trace`.
+  The trace shows the full telnet and HEOS lines only if the driver is built with
+  `cargo build --release --features sensitive-logs`. These lines can hold titles and account names: do not
+  share such a log.
 
 The results go to `remote-sim-results-<time>.md`. To check only the selects and the switches:
 

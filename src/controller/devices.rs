@@ -6,7 +6,7 @@
 use crate::config_store::{DeviceConfig, SaveWait};
 use crate::controller::{Controller, R2RequestMsg, SendWsMessage};
 use crate::device::{Command, Connect, DenonActor, DeviceEvent, DeviceStatus, Disconnect, Stop};
-use crate::entities::{self, EntityKind};
+use crate::entities::{self, EntityKind, media_player};
 use crate::errors::ServiceError;
 use crate::util::{DeserializeMsgData, return_fut_err};
 use actix::{Actor, Addr, AsyncContext, Context, Handler, ResponseFuture};
@@ -18,6 +18,9 @@ use std::sync::Arc;
 use uc_api::EntityType;
 use uc_api::intg::{AvailableIntgEntity, DeviceState, EntityCommand};
 use uc_api::ws::{EventCategory, WsMessage, WsResultMsgData};
+
+/// Attribute that changes with each new position.
+const POSITION_UPDATED_AT: &str = "media_position_updated_at";
 
 /// `entity_change` data. Borrows the attributes, so that they are not copied to serialize them.
 #[derive(Serialize)]
@@ -370,6 +373,8 @@ impl Controller {
             let changed = if let Some(cache) = self.entities.get_mut(&entity_id) {
                 diff(cache, attrs, wanted)
             } else {
+                let mut attrs = attrs;
+                stamp_first_position(&mut attrs);
                 let changed = if wanted {
                     attrs.keys().cloned().collect()
                 } else {
@@ -445,15 +450,44 @@ impl Controller {
 /// `collect` is set.
 fn diff(cache: &mut Map<String, Value>, attrs: Map<String, Value>, collect: bool) -> Vec<String> {
     let mut changed = Vec::new();
+    let mut updated_at = false;
+    let mut new_position = false;
     for (name, value) in attrs {
+        if name == POSITION_UPDATED_AT {
+            updated_at = true;
+            continue;
+        }
         if cache.get(&name) != Some(&value) {
+            // The Remote counts on from the time while playing, so a resume needs a new one.
+            new_position |= matches!(name.as_str(), "media_position" | "media_duration" | "state");
             if collect {
                 changed.push(name.clone());
             }
             cache.insert(name, value);
         }
     }
+    // The time is only sent with a new position or state.
+    if updated_at && new_position {
+        if collect {
+            changed.push(POSITION_UPDATED_AT.into());
+        }
+        cache.insert(
+            POSITION_UPDATED_AT.into(),
+            media_player::position_timestamp().into(),
+        );
+    }
     changed
+}
+
+/// The first attributes of an entity: a position gets its time, so that the Remote counts on
+/// from the start.
+fn stamp_first_position(attrs: &mut Map<String, Value>) {
+    if attrs.contains_key(POSITION_UPDATED_AT) && attrs.contains_key("media_position") {
+        attrs.insert(
+            POSITION_UPDATED_AT.into(),
+            media_player::position_timestamp().into(),
+        );
+    }
 }
 
 /// The media player and the remote are sent first: they are the most important on the Remote.
@@ -699,6 +733,40 @@ mod tests {
         let mut k: Vec<&str> = m.keys().map(String::as_str).collect();
         k.sort_unstable();
         k
+    }
+
+    #[test]
+    fn the_position_time_is_sent_only_with_a_new_position_or_state() {
+        let at =
+            || map(json!({ "state": "PLAYING", "media_position": 10, POSITION_UPDATED_AT: null }));
+        let mut cache = at();
+        // Same position and state: nothing, also no new time.
+        assert_eq!(Vec::<String>::new(), diff(&mut cache, at(), true));
+        let moved =
+            map(json!({ "state": "PLAYING", "media_position": 30, POSITION_UPDATED_AT: null }));
+        let mut changed = diff(&mut cache, moved, true);
+        changed.sort_unstable();
+        assert_eq!(vec!["media_position", POSITION_UPDATED_AT], changed);
+        assert!(cache[POSITION_UPDATED_AT].is_string());
+        let paused =
+            map(json!({ "state": "PAUSED", "media_position": 30, POSITION_UPDATED_AT: null }));
+        let mut changed = diff(&mut cache, paused, true);
+        changed.sort_unstable();
+        assert_eq!(vec![POSITION_UPDATED_AT, "state"], changed);
+        // Another attribute alone does not change the time.
+        let titled = map(json!({ "media_title": "Song", POSITION_UPDATED_AT: null }));
+        assert_eq!(vec!["media_title"], diff(&mut cache, titled, true));
+    }
+
+    #[test]
+    fn the_first_position_gets_a_time() {
+        let mut attrs = map(json!({ "media_position": 10, POSITION_UPDATED_AT: null }));
+        stamp_first_position(&mut attrs);
+        assert!(attrs[POSITION_UPDATED_AT].is_string());
+        // An entity without a position gets no time.
+        let mut other = map(json!({ "state": "ON" }));
+        stamp_first_position(&mut other);
+        assert_eq!(None, other.get(POSITION_UPDATED_AT));
     }
 
     #[test]

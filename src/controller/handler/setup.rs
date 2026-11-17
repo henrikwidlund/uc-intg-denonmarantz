@@ -7,7 +7,7 @@
 use crate::config_store::{DeviceConfig, DriverSettings, SaveWait, backup_json, parse_backup};
 use crate::controller::handler::AbortDriverSetup;
 use crate::controller::{Controller, operation_mode};
-use crate::device::{UpdateConfig, discovery};
+use crate::device::{UpdateConfig, discovery, heos};
 use crate::entities::EntityKind;
 use crate::errors::ServiceError;
 use crate::logging;
@@ -652,6 +652,7 @@ impl Controller {
                         hdmi_output_over_http: identified.kind.hdmi_output_over_http,
                         quick_select_count: identified.kind.quick_select_count,
                         listed_queries: identified.kind.listed_queries,
+                        heos: identified.kind.heos,
                     };
                     if let Some(device) = act.devices.get_mut(cfg.key()) {
                         device.cfg = cfg.clone();
@@ -1216,15 +1217,28 @@ async fn detect_dirac_opt(host: &str) -> Option<bool> {
     Some(avr.info().dirac_live)
 }
 
+/// Longest wait for the HEOS check of the setup.
+const HEOS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Read the id and the name of the receiver at an address.
 async fn identify_host(host: &str) -> Result<discovery::Identified, IntegrationSetupError> {
     let avr = discovery::identify(host, None)
         .await
         .map_err(|e| setup_error(&e))?;
-    discovery::Identified::new(&avr).map_err(|reason| {
+    let mut identified = discovery::Identified::new(&avr).map_err(|reason| {
         warn!("[{host}] not used: {reason}");
         IntegrationSetupError::Other
-    })
+    })?;
+    // A slow HEOS port must not hold up the setup: the first connect checks it again.
+    identified.kind.heos = tokio::time::timeout(
+        HEOS_PROBE_TIMEOUT,
+        heos::probe(host, identified.kind.receiver_type),
+    )
+    .await
+    .ok()
+    .flatten();
+    info!("[{host}] HEOS: {:?}", identified.kind.heos);
+    Ok(identified)
 }
 
 /// Address of a setup page. An empty text is no address.

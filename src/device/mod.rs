@@ -10,6 +10,7 @@ mod actor_tests;
 mod command_tests;
 mod commands;
 pub mod discovery;
+pub mod heos;
 
 pub use actor::DenonActor;
 

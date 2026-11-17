@@ -35,6 +35,7 @@ fn cfg() -> DeviceConfig {
         hdmi_output_over_http: None,
         quick_select_count: None,
         listed_queries: None,
+        heos: None,
     }
 }
 
@@ -74,7 +75,10 @@ fn build_some(state: &State, cfg: &DeviceConfig, keep: impl Fn(EntityKind) -> bo
         connected: true,
         artwork_url: None,
         paused: false,
-        sound_mode: super::select::active_sound_mode(state),
+        sound_mode: super::select::active_sound_mode(state, true),
+        sound_groups: true,
+        heos: None,
+        position: None,
     };
     let mut keys = 0;
     for kind in EntityKind::all(cfg).filter(|k| keep(*k)) {

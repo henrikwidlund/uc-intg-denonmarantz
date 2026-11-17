@@ -27,6 +27,8 @@ pub struct Client {
     attrs: HashMap<String, Map<String, Value>>,
     /// Setup events that were not read yet.
     setup: VecDeque<Value>,
+    /// Number of `entity_change` events with `media_position`, per entity.
+    position_changes: HashMap<String, usize>,
 }
 
 impl Client {
@@ -39,6 +41,7 @@ impl Client {
             next_id: 0,
             attrs: HashMap::new(),
             setup: VecDeque::new(),
+            position_changes: HashMap::new(),
         };
         // The driver sends the authentication answer at once.
         client
@@ -83,6 +86,9 @@ impl Client {
                         .entry(id.to_owned())
                         .or_default()
                         .extend(attrs.clone());
+                    if attrs.contains_key("media_position") {
+                        *self.position_changes.entry(id.to_owned()).or_default() += 1;
+                    }
                 }
             }
             Some("driver_setup_change") => self.setup.push_back(data.clone()),
@@ -192,6 +198,11 @@ impl Client {
     /// Forget the cached states, for example after a mode change.
     pub fn forget_states(&mut self) {
         self.attrs.clear();
+    }
+
+    /// Number of `entity_change` events with `media_position` of an entity so far.
+    pub fn position_count(&self, entity: &str) -> usize {
+        self.position_changes.get(entity).copied().unwrap_or(0)
     }
 
     pub fn attr(&self, entity: &str, attr: &str) -> Option<&Value> {

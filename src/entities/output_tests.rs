@@ -37,6 +37,7 @@ fn cfg() -> DeviceConfig {
         hdmi_output_over_http: None,
         quick_select_count: None,
         listed_queries: None,
+        heos: None,
     }
 }
 
@@ -62,7 +63,10 @@ fn view<'a>(state: &'a State, cfg: &'a DeviceConfig) -> View<'a> {
         connected: true,
         artwork_url: None,
         paused: false,
-        sound_mode: super::select::active_sound_mode(state),
+        sound_mode: super::select::active_sound_mode(state, true),
+        sound_groups: true,
+        heos: None,
+        position: None,
     }
 }
 
@@ -251,6 +255,54 @@ fn network_audio_without_text_shows_no_title() {
     assert_eq!(json!(""), player["media_title"]);
 }
 
+/// The state of the fake HEOS player.
+async fn heos_player(item: crate::test_support::HeosItem) -> denon_marantz_heos::PlayerState {
+    use crate::device::heos;
+    use crate::test_support::FakeHeos;
+    let fake = FakeHeos::start("127.0.0.1", item).await;
+    heos::TEST_HEOS.with(|slot| slot.set(Some(fake.config())));
+    let heos::Connected::Player(link) = heos::connect("127.0.0.1").await.expect("connect") else {
+        panic!("no player");
+    };
+    link.with_player(|p| p.cloned()).expect("state")
+}
+
+#[tokio::test]
+async fn heos_shows_a_station_as_radio_with_the_station_as_album() {
+    let cfg = DeviceConfig {
+        heos: Some(true),
+        ..cfg()
+    };
+    let player = heos_player(crate::test_support::HeosItem::station()).await;
+    let state = state(&["PWON", "SINET"]);
+    let position = super::media_player::Position {
+        position: 65,
+        duration: 0,
+    };
+    let shown = |state: &State| {
+        let v = View {
+            heos: Some(&player),
+            position: Some(position),
+            ..view(state, &cfg)
+        };
+        attrs(&v, EntityKind::MediaPlayer)
+    };
+    let player_attrs = shown(&state);
+    assert_eq!(json!("A Stream"), player_attrs["media_title"]);
+    assert_eq!(json!("A Station"), player_attrs["media_album"]);
+    assert_eq!(json!("radio"), player_attrs["media_type"]);
+    assert_eq!(json!("PLAYING"), player_attrs["state"]);
+    assert_eq!(json!(65), player_attrs["media_position"]);
+    assert_eq!(json!(0), player_attrs["media_duration"]);
+    assert_eq!(Value::Null, player_attrs["media_position_updated_at"]);
+
+    // Another source: no HEOS, no position.
+    let other = shown(&self::state(&["PWON", "SIDVD"]));
+    assert_eq!(json!("DVD"), other["media_title"]);
+    assert_eq!(json!(0), other["media_position"]);
+    assert_eq!(json!("ON"), other["state"]);
+}
+
 #[test]
 fn the_media_player_has_the_python_features() {
     let mut c = cfg();
@@ -267,6 +319,11 @@ fn the_media_player_has_the_python_features() {
     let marantz = features(&c);
     assert!(!has(&marantz, "select_sound_mode") && !has(&marantz, "stop"));
     assert_eq!(21, marantz.len());
+    // HEOS stops on both brands and gives the position.
+    c.heos = Some(true);
+    let heos = features(&c);
+    assert!(has(&heos, "stop") && has(&heos, "media_position") && has(&heos, "media_duration"));
+    assert_eq!(24, heos.len());
 }
 
 #[test]
@@ -427,7 +484,22 @@ fn the_sound_mode_select_marks_the_list_entry_of_the_reported_mode() {
     let mut lines = vec!["PWON"];
     lines.extend(SOUND_MODE_LIST);
     lines.push("MSDOLBY ATMOS");
-    assert_eq!(None, super::select::active_sound_mode(&state(&lines)));
+    assert_eq!(None, super::select::active_sound_mode(&state(&lines), true));
+}
+
+#[test]
+fn before_the_receiver_list_can_come_no_sound_mode_is_shown() {
+    let cfg = cfg();
+    let state = state(&["PWON", "MSSTEREO"]);
+    let v = View {
+        sound_mode: super::select::active_sound_mode(&state, false),
+        sound_groups: false,
+        ..view(&state, &cfg)
+    };
+    let player = attrs(&v, EntityKind::MediaPlayer);
+    assert_eq!(json!([]), player["sound_mode_list"]);
+    assert_eq!(json!(""), player["sound_mode"]);
+    assert_eq!(json!([]), select(&v, SelectKind::SoundMode)["options"]);
 }
 
 #[test]

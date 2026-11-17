@@ -7,9 +7,11 @@ use crate::config_store::DeviceConfig;
 use crate::entities::sensor::{self, absolute_volume};
 use crate::entities::{View, is_off, select, simple_commands};
 use crate::errors::ServiceError;
-use denon_marantz::Zone;
+use denon_marantz::proto::PlayingKind;
 use denon_marantz::proto::Power;
-use denon_marantz::proto::source::is_playing_source;
+use denon_marantz::proto::source::{is_playing_source, playing_kind};
+use denon_marantz::{State, Zone};
+use denon_marantz_heos::{MediaType, NowPlaying, PlayState, PlayerState};
 use serde_json::{Map, Value, json};
 use std::str::FromStr;
 use uc_api::intg::AvailableIntgEntity;
@@ -80,8 +82,13 @@ pub fn definition(mut entity: AvailableIntgEntity, cfg: &DeviceConfig) -> Availa
     if cfg.support_sound_mode {
         features.push(F::SelectSoundMode.as_ref().to_string());
     }
-    if cfg.is_denon {
+    // HEOS stops on both brands.
+    if cfg.is_denon || cfg.has_heos() {
         features.push(F::Stop.as_ref().to_string());
+    }
+    if cfg.has_heos() {
+        features.push(F::MediaPosition.as_ref().to_string());
+        features.push(F::MediaDuration.as_ref().to_string());
     }
     entity.features = Some(features);
     let mut options = Map::new();
@@ -100,6 +107,13 @@ pub fn state(v: &View<'_>) -> &'static str {
     }
     match v.state.zone(Zone::Main).power {
         Some(Power::On) => {
+            if let Some(play_state) = heos_player(v).and_then(|p| p.play_state) {
+                return match play_state {
+                    PlayState::Play => "PLAYING",
+                    PlayState::Pause => "PAUSED",
+                    PlayState::Stop => "ON",
+                };
+            }
             if v.paused {
                 "PAUSED"
             } else if v.state.device().now_playing.is_playing() == Some(true) {
@@ -145,6 +159,42 @@ pub fn attributes(v: &View<'_>, out: &mut Map<String, Value>) {
         );
     }
 
+    let text = |value: Option<String>| -> Value {
+        if off {
+            String::new()
+        } else {
+            value.unwrap_or_default()
+        }
+        .into()
+    };
+    let heos = if off { None } else { heos_media(v) };
+    if v.cfg.has_heos() {
+        let position = heos.and(v.position).unwrap_or_default();
+        set(out, Attr::MediaPosition, position.position.into());
+        set(out, Attr::MediaDuration, position.duration.into());
+        // The controller sets the time only if it sends a new position or state, see
+        // [`position_timestamp`].
+        set(out, Attr::MediaPositionUpdatedAt, Value::Null);
+    }
+    if let Some(media) = heos {
+        let station = media.station.as_deref().filter(|t| !is_blank(t));
+        let (title, album) = if is_blank(&media.song) {
+            (station, non_blank(&media.album))
+        } else {
+            (Some(&*media.song), non_blank(&media.album).or(station))
+        };
+        set(out, Attr::MediaTitle, title.unwrap_or_default().into());
+        set(out, Attr::MediaArtist, media.artist.as_ref().into());
+        set(out, Attr::MediaAlbum, album.unwrap_or_default().into());
+        set(out, Attr::MediaImageUrl, media.image_url.as_ref().into());
+        let kind = match media.media_type {
+            MediaType::Station => MediaContentType::Radio,
+            _ => MediaContentType::Music,
+        };
+        set(out, Attr::MediaType, kind.as_str().into());
+        return;
+    }
+
     // As in the Python integration: a source that does not play media shows its name as the title.
     // The tuner shows the frequency, the band and the station when there is no other text.
     let now = &device.now_playing;
@@ -159,14 +209,6 @@ pub fn attributes(v: &View<'_>, out: &mut Map<String, Value>) {
         .clone()
         .or_else(|| device.tuner.band.map(|b| b.label().to_owned()));
     let album = now.album.clone().or_else(|| now.station.clone());
-    let text = |value: Option<String>| -> Value {
-        if off {
-            String::new()
-        } else {
-            value.unwrap_or_default()
-        }
-        .into()
-    };
     set(out, Attr::MediaTitle, text(title));
     set(out, Attr::MediaArtist, text(artist));
     set(out, Attr::MediaAlbum, text(album));
@@ -177,6 +219,52 @@ pub fn attributes(v: &View<'_>, out: &mut Map<String, Value>) {
         Attr::MediaType,
         if off { "" } else { media_type(v) }.into(),
     );
+}
+
+/// Position in what plays on HEOS, in seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Position {
+    pub position: u64,
+    /// 0 for a live station.
+    pub duration: u64,
+}
+
+/// Time for `media_position_updated_at`, like `2026-11-04T15:37:27.106292+00:00`.
+pub fn position_timestamp() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, false)
+}
+
+/// The HEOS player, while the main zone plays network audio and HEOS plays, is paused or has an
+/// item. A stopped player without an item leaves the state to the receiver: for example Bluetooth
+/// can play without HEOS.
+fn heos_player<'a>(v: &View<'a>) -> Option<&'a PlayerState> {
+    v.heos.filter(|player| uses_heos(v.state, player))
+}
+
+/// The main zone plays network audio and HEOS plays, is paused or has an item. Then the media
+/// player shows HEOS, and play, pause, stop, next and previous go to HEOS.
+pub fn uses_heos(state: &State, player: &PlayerState) -> bool {
+    let net_audio = state
+        .zone(Zone::Main)
+        .source
+        .as_deref()
+        .is_some_and(|s| playing_kind(s) == Some(PlayingKind::NetAudio));
+    net_audio
+        && (matches!(player.play_state, Some(PlayState::Play | PlayState::Pause))
+            || player.current_media().is_some_and(|m| !m.is_empty()))
+}
+
+/// What plays on HEOS. `None` while the item has no text: `AirPlay` sends such an item first.
+fn heos_media<'a>(v: &View<'a>) -> Option<&'a NowPlaying<'static>> {
+    heos_player(v)?.current_media().filter(|m| !m.is_empty())
+}
+
+fn is_blank(text: &str) -> bool {
+    text.trim().is_empty()
+}
+
+fn non_blank(text: &str) -> Option<&str> {
+    (!is_blank(text)).then_some(text)
 }
 
 fn media_type(v: &View<'_>) -> &'static str {

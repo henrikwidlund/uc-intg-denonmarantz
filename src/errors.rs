@@ -100,6 +100,20 @@ impl From<denon_marantz::Error> for ServiceError {
     }
 }
 
+impl From<denon_marantz_heos::Error> for ServiceError {
+    fn from(e: denon_marantz_heos::Error) -> Self {
+        use denon_marantz_heos::Error;
+        match e {
+            Error::NotConnected => Self::NotConnected,
+            Error::Timeout { .. } => Self::Timeout,
+            Error::InvalidCommand(_) | Error::InvalidConfig(_) => Self::BadRequest(e.to_string()),
+            // For example an item that cannot pause. The device gives the reason.
+            Error::Failed { .. } => Self::Blocked(e.to_string()),
+            _ => Self::ServiceUnavailable(e.to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

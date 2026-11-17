@@ -23,6 +23,7 @@ mod output_tests;
 
 use crate::config_store::DeviceConfig;
 use denon_marantz::State;
+use denon_marantz_heos::PlayerState;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use uc_api::EntityType;
@@ -41,6 +42,14 @@ pub struct View<'a> {
     pub paused: bool,
     /// The option of the active sound mode. See `select::active_sound_mode`.
     pub sound_mode: Option<&'a str>,
+    /// The sound mode groups are the choices while the receiver gave no list. With telnet, only
+    /// after the answers of the start are in: until then, the list can still come.
+    pub sound_groups: bool,
+    /// The HEOS player, while HEOS is connected.
+    pub heos: Option<&'a PlayerState>,
+    /// Position in what plays on HEOS. It changes only when it jumps or the play state changes:
+    /// the Remote counts on from `media_position_updated_at`.
+    pub position: Option<media_player::Position>,
 }
 
 /// Select entities of a receiver. The names are the ones of the Python integration.
@@ -364,6 +373,7 @@ pub(crate) mod tests {
             hdmi_output_over_http: None,
             quick_select_count: None,
             listed_queries: None,
+            heos: None,
         }
     }
 

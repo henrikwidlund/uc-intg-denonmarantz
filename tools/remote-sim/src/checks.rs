@@ -4,8 +4,10 @@
 //! The checks. They follow the steps of `tools/manual_test.sh`.
 
 use crate::oracle::{self, Oracle};
+use crate::restore;
 use crate::ws::{field_ids, field_value};
 use crate::{Check, Ctx, Fail};
+use denon_marantz::{Command, Zone};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -730,9 +732,10 @@ pub async fn sound_mode(ctx: &mut Ctx) -> Check {
     ensure!(!list.is_empty(), "the sound mode list is empty");
     let new = pick_sound_mode(&list, &old).ok_or_else(|| Fail::skip("no other sound mode"))?;
     select_sound(ctx, &new).await?;
+    // The receiver can report the mode in other letter case than the list.
     ctx.client
         .wait_attr(&mp, "sound_mode", 10, |v| {
-            v.as_str().is_some_and(|m| m != old)
+            v.as_str().is_some_and(|m| m.eq_ignore_ascii_case(&new))
         })
         .await?;
     let shown = ctx.client.text(&mp, "sound_mode");
@@ -755,8 +758,14 @@ async fn restore_sound(ctx: &mut Ctx, old: &str, list: &[String]) -> String {
     if select_sound(ctx, name).await.is_err() {
         return "restore failed".into();
     }
-    match ctx.client.wait_text(&mp, "sound_mode", 10, old).await {
-        Ok(()) => "restored".into(),
+    match ctx
+        .client
+        .wait_attr(&mp, "sound_mode", 10, |v| {
+            v.as_str().is_some_and(|m| m.eq_ignore_ascii_case(old))
+        })
+        .await
+    {
+        Ok(_) => "restored".into(),
         Err(e) => format!("not restored: {e}"),
     }
 }
@@ -1613,7 +1622,11 @@ pub async fn select_sweep(ctx: &mut Ctx) -> Check {
     if dirac_original != json!("Off") && dirac_original != Value::Null {
         sweep_one(ctx, "dirac_filter", &json!("Off")).await?;
     }
-    // The reference level needs Dynamic EQ.
+    // The reference level needs Dynamic EQ. It is set back at the end.
+    let dynamic_eq = match &ctx.oracle {
+        Some(oracle) => restore::read(oracle.avr(), &["PSDYNEQ ?"]).await?,
+        None => Vec::new(),
+    };
     let remote = ctx.remote();
     ctx.client
         .command_ok(
@@ -1650,6 +1663,12 @@ pub async fn select_sweep(ctx: &mut Ctx) -> Check {
         && let Err(e) = sweep_one(ctx, "dirac_filter", &dirac_original).await
     {
         problems.push(format!("dirac_filter back to {dirac_original}: {e}"));
+    }
+    if let Some(oracle) = &ctx.oracle {
+        let missed = restore::write(oracle.avr(), &["PSDYNEQ ?"], &dynamic_eq).await?;
+        if !missed.is_empty() {
+            problems.push(format!("Dynamic EQ not set back: {missed:?}"));
+        }
     }
     verify_fresh(ctx)
         .await
@@ -1744,7 +1763,8 @@ async fn sweep_one(ctx: &mut Ctx, kind: &str, option: &Value) -> Result<Outcome,
 }
 
 /// Names that the sweep does not send: they recall settings with a volume, store settings or
-/// reset them.
+/// reset them. Triggers can switch other equipment, and the remote lock has no query, so it
+/// cannot be set back.
 fn skipped(name: &str) -> bool {
     [
         "ZONE_FAVORITE",
@@ -1754,14 +1774,97 @@ fn skipped(name: &str) -> bool {
         "MEMORY",
         "VOLUME",
         "NETWORK_RESTART",
+        "TRIGGER",
+        "REMOTE_CONTROL_LOCK",
     ]
     .iter()
     .any(|p| name.contains(p))
 }
 
+/// Check the save and restore of `simple_commands`: save the settings, change the sleep timer, set
+/// the settings back and check that they all came back. The sleep timer works on every input and
+/// does not change the sound.
+pub async fn settings_restore(ctx: &mut Ctx) -> Check {
+    ensure_on(ctx).await?;
+    let Some(oracle) = &ctx.oracle else {
+        return Err(Fail::skip("needs the second connection"));
+    };
+    restore::ensure_nothing_left()?;
+    let avr = oracle.avr();
+    let saved = restore::read(avr, restore::QUERIES).await?;
+    let sleep = saved
+        .iter()
+        .find(|l| l.starts_with("SLP"))
+        .cloned()
+        .ok_or_else(|| Fail::skip(format!("no sleep timer value. Read: {saved:?}")))?;
+    restore::save(&saved).await?;
+    let other = ["SLP120", "SLP090"]
+        .into_iter()
+        .find(|l| *l != sleep)
+        .unwrap_or("SLP120");
+    avr.telnet_send(Zone::Main, Command::Raw(other)).await?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let changed = restore::read(avr, &["SLP?"]).await?;
+    // The timer counts down: a value near the set one is also a change.
+    ensure!(
+        changed.iter().any(|l| l != &sleep && l != "SLPOFF"),
+        "the sleep timer did not change to {other}: {changed:?}"
+    );
+    let missed = restore::write(avr, restore::QUERIES, &saved).await?;
+    ensure!(
+        missed.is_empty(),
+        "not set back: {missed:?}. They stay in {}",
+        restore::FILE
+    );
+    restore::forget().await;
+    ensure!(
+        !std::path::Path::new(restore::FILE).exists(),
+        "{} was not removed",
+        restore::FILE
+    );
+    Ok(format!(
+        "{} settings read, {sleep} -> {other} -> {sleep}, all set back",
+        saved.len()
+    ))
+}
+
 /// Send every simple command of the remote entity, and check the entities against the receiver.
+/// The settings that the commands change are saved first and set back at the end, also when the
+/// check fails.
 pub async fn simple_commands(ctx: &mut Ctx) -> Check {
     ensure_on(ctx).await?;
+    let Some(oracle) = &ctx.oracle else {
+        return Err(Fail::skip(
+            "needs the second connection: it saves the settings",
+        ));
+    };
+    restore::ensure_nothing_left()?;
+    let saved = restore::read(oracle.avr(), restore::QUERIES).await?;
+    restore::save(&saved).await?;
+    let result = send_simple_commands(ctx).await;
+    let oracle = ctx
+        .oracle
+        .as_ref()
+        .ok_or_else(|| Fail::new("the second connection is gone"))?;
+    // The file stays if a setting did not come back: the next run sends them again.
+    let missed = restore::write(oracle.avr(), restore::QUERIES, &saved).await?;
+    if missed.is_empty() {
+        restore::forget().await;
+    }
+    match (result, missed.is_empty()) {
+        (Ok(note), true) => Ok(format!("{note}, {} settings set back", saved.len())),
+        (Ok(note), false) => Err(Fail::new(format!(
+            "{note}. Settings not set back: {missed:?}"
+        ))),
+        (Err(e), true) => Err(e),
+        (Err(e), false) => Err(Fail::new(format!(
+            "{}. Settings not set back: {missed:?}",
+            e.msg
+        ))),
+    }
+}
+
+async fn send_simple_commands(ctx: &mut Ctx) -> Check {
     let remote = ctx.remote();
     let list = entity_list(ctx).await?;
     let offered = strings(
@@ -1946,4 +2049,180 @@ pub async fn extra_entities(ctx: &mut Ctx) -> Check {
         }
     }
     Ok(notes.join(", "))
+}
+
+/// Time that the HEOS check watches the events of the media player while HEOS plays.
+const HEOS_QUIET_SECS: u64 = 12;
+
+/// The position may differ this much from the one of the second HEOS connection, in seconds.
+const HEOS_POSITION_SLACK: i64 = 4;
+
+/// HEOS: what plays, the position, the number of events and play and pause, compared with a second
+/// HEOS connection. HEOS must play on the main zone at the start, else the check is skipped. The
+/// volume is not changed.
+pub async fn heos(ctx: &mut Ctx) -> Check {
+    use denon_marantz_heos::{Heos, PlayState};
+    let mp = ctx.mp();
+    let entities = entity_list(ctx).await?;
+    let features = entities
+        .iter()
+        .find(|e| e["entity_id"] == json!(mp))
+        .map(|e| strings(&e["features"]))
+        .unwrap_or_default();
+    let heos = match Heos::connect(ctx.opt.address.as_str()).await {
+        Ok(heos) => heos,
+        Err(e) => {
+            ensure!(
+                !features.iter().any(|f| f == "media_position"),
+                "the media player has HEOS features, but HEOS does not answer: {e}"
+            );
+            return Err(Fail::skip(format!("no HEOS: {e}")));
+        }
+    };
+    ensure!(
+        features.iter().any(|f| f == "media_position"),
+        "HEOS answers, but the media player has no position feature"
+    );
+    let ip = ctx
+        .opt
+        .address
+        .parse()
+        .map_err(|_| Fail::skip("the address is not an IP address"))?;
+    let pid = heos
+        .player_by_ip(ip)
+        .ok_or_else(|| Fail::new("HEOS has no player with the address of the receiver"))?;
+    let player = heos
+        .player(pid)
+        .ok_or_else(|| Fail::new("HEOS player not read"))?;
+    let Some(media) = player
+        .current_media()
+        .filter(|_| player.play_state == Some(PlayState::Play))
+        .cloned()
+    else {
+        return Err(Fail::skip(
+            "HEOS does not play: start HEOS Music before the run",
+        ));
+    };
+    let blank = |t: &str| t.trim().is_empty();
+    let station = media.station.as_deref().filter(|t| !blank(t)).unwrap_or("");
+    let (title, album) = if blank(&media.song) {
+        (station, media.album.as_ref())
+    } else if blank(&media.album) {
+        (media.song.as_ref(), station)
+    } else {
+        (media.song.as_ref(), media.album.as_ref())
+    };
+    ctx.client.wait_text(&mp, "media_title", 8, title).await?;
+    ctx.client.wait_text(&mp, "state", 4, "PLAYING").await?;
+    ensure!(
+        ctx.client.text(&mp, "media_artist") == media.artist.as_ref(),
+        "artist {:?}, HEOS has {:?}",
+        ctx.client.text(&mp, "media_artist"),
+        media.artist
+    );
+    ensure!(
+        ctx.client.text(&mp, "media_album") == album,
+        "album {:?}, HEOS has {album:?}",
+        ctx.client.text(&mp, "media_album")
+    );
+
+    // The position: the Remote counts on from `media_position_updated_at`.
+    let position = heos_position(ctx, &mp)?;
+    let fresh = heos
+        .player(pid)
+        .and_then(|p| Some((p.progress?, heos_now(&p)?)));
+    let note_position = if let Some((progress, expected)) = fresh {
+        ensure!(
+            (position - expected).abs() <= HEOS_POSITION_SLACK,
+            "position {position} s, HEOS has {expected} s"
+        );
+        let duration = ctx
+            .client
+            .attr(&mp, "media_duration")
+            .and_then(Value::as_u64);
+        ensure!(
+            duration == Some(progress.duration_ms / 1000),
+            "duration {duration:?}, HEOS has {} s",
+            progress.duration_ms / 1000
+        );
+        format!("position {position} s")
+    } else {
+        "HEOS sent no position yet".to_owned()
+    };
+
+    // HEOS sends the position every few seconds. The driver sends it only when it jumps. Other
+    // events, for example a volume change, are not counted.
+    let before = ctx.client.position_count(&mp);
+    ctx.client.listen(HEOS_QUIET_SECS).await?;
+    let events = ctx.client.position_count(&mp) - before;
+    ensure!(
+        events <= 1,
+        "{events} position events in {HEOS_QUIET_SECS} s while HEOS plays"
+    );
+
+    // Play and pause go to HEOS. An item that cannot pause is not paused here: it would stop.
+    let note_pause = if player.controls().pause {
+        ctx.client
+            .command_ok("media_player", &mp, "play_pause", json!({}))
+            .await?;
+        let played_at = ctx.client.text(&mp, "media_position_updated_at");
+        ctx.client.wait_text(&mp, "state", 6, "PAUSED").await?;
+        let heos_state = heos.player(pid).and_then(|p| p.play_state);
+        ensure!(
+            heos_state == Some(PlayState::Pause),
+            "the driver shows PAUSED, HEOS has {heos_state:?}"
+        );
+        // The Remote stops its count at the time of the pause.
+        let paused_at = ctx.client.text(&mp, "media_position_updated_at");
+        ensure!(
+            paused_at != played_at,
+            "media_position_updated_at did not change with the pause"
+        );
+        ctx.client
+            .command_ok("media_player", &mp, "play_pause", json!({}))
+            .await?;
+        ctx.client.wait_text(&mp, "state", 6, "PLAYING").await?;
+        ensure!(
+            ctx.client.text(&mp, "media_position_updated_at") != paused_at,
+            "media_position_updated_at did not change with the play"
+        );
+        let position = heos_position(ctx, &mp)?;
+        if let Some(expected) = heos.player(pid).as_ref().and_then(heos_now) {
+            ensure!(
+                (position - expected).abs() <= HEOS_POSITION_SLACK,
+                "after the play: position {position} s, HEOS has {expected} s"
+            );
+        }
+        "paused and played, the position followed".to_owned()
+    } else {
+        "the item cannot pause: not paused".to_owned()
+    };
+    heos.close().await;
+    Ok(format!(
+        "{title:?}, {note_position}, {events} position events in {HEOS_QUIET_SECS} s, {note_pause}"
+    ))
+}
+
+/// The position of the second HEOS connection now, in seconds: the last reported one plus the
+/// time since then.
+fn heos_now(player: &denon_marantz_heos::PlayerState) -> Option<i64> {
+    let (progress, at) = (player.progress?, player.progress_at?);
+    Some(
+        i64::try_from(progress.position_ms / 1000).unwrap_or(i64::MAX)
+            + i64::try_from(at.elapsed().as_secs()).unwrap_or(0),
+    )
+}
+
+/// The position that the Remote shows now: the sent position plus the time since it was sent.
+fn heos_position(ctx: &Ctx, mp: &str) -> Result<i64, Fail> {
+    let sent = ctx
+        .client
+        .attr(mp, "media_position")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| Fail::new("no media_position"))?;
+    let at = ctx.client.text(mp, "media_position_updated_at");
+    let at = chrono::DateTime::parse_from_rfc3339(&at)
+        .map_err(|e| Fail::new(format!("media_position_updated_at {at:?}: {e}")))?;
+    let since = chrono::Utc::now().signed_duration_since(at).num_seconds();
+    Ok(sent + since)
 }

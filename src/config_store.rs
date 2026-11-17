@@ -129,6 +129,14 @@ pub struct DeviceConfig {
         deserialize_with = "none_if_unknown"
     )]
     pub listed_queries: Option<HttpQueries>,
+    /// The receiver has a HEOS player for network audio. It is found at the setup, or at the
+    /// first connect if it is missing.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "none_if_unknown"
+    )]
+    pub heos: Option<bool>,
 }
 
 /// What the id of a receiver is.
@@ -171,6 +179,7 @@ pub struct ReceiverKind {
     pub hdmi_output_over_http: Option<bool>,
     pub quick_select_count: Option<u8>,
     pub listed_queries: Option<HttpQueries>,
+    pub heos: Option<bool>,
 }
 
 /// The receiver generation, as the library reports it.
@@ -283,6 +292,11 @@ impl DeviceConfig {
             }
     }
 
+    /// The receiver has a HEOS player.
+    pub const fn has_heos(&self) -> bool {
+        matches!(self.heos, Some(true))
+    }
+
     /// The receiver has this quick select slot, counted from 1. Without a count, all slots.
     pub const fn has_quick_select(&self, slot: u8) -> bool {
         match self.quick_select_count {
@@ -298,6 +312,7 @@ impl DeviceConfig {
             hdmi_output_over_http: self.hdmi_output_over_http,
             quick_select_count: self.quick_select_count,
             listed_queries: self.listed_queries,
+            heos: self.heos,
         }
     }
 
@@ -307,6 +322,7 @@ impl DeviceConfig {
         self.hdmi_output_over_http = kind.hdmi_output_over_http;
         self.quick_select_count = kind.quick_select_count;
         self.listed_queries = kind.listed_queries;
+        self.heos = kind.heos;
     }
 }
 
@@ -739,6 +755,7 @@ mod tests {
             hdmi_output_over_http: None,
             quick_select_count: None,
             listed_queries: None,
+            heos: None,
         }
     }
 
@@ -841,7 +858,8 @@ mod tests {
                 && !text.contains("update_method")
                 && !text.contains("hdmi_output_over_http")
                 && !text.contains("quick_select_count")
-                && !text.contains("listed_queries"),
+                && !text.contains("listed_queries")
+                && !text.contains("heos"),
             "{text}"
         );
 
@@ -854,6 +872,7 @@ mod tests {
                 audyssey: true,
                 ..HttpQueries::default()
             }),
+            heos: Some(true),
             ..device()
         };
         let text = serde_json::to_string(&d).expect("json");
@@ -862,7 +881,8 @@ mod tests {
                 && text.contains(r#""update_method":"app_command""#)
                 && text.contains(r#""hdmi_output_over_http":true"#)
                 && text.contains(r#""quick_select_count":4"#)
-                && text.contains(r#""audyssey":true"#),
+                && text.contains(r#""audyssey":true"#)
+                && text.contains(r#""heos":true"#),
             "{text}"
         );
         assert_eq!(d, serde_json::from_str(&text).expect("json"));
@@ -871,7 +891,7 @@ mod tests {
     #[test]
     fn an_unknown_receiver_kind_reads_as_none() {
         let d: DeviceConfig = serde_json::from_str(
-            r#"{"id":"A","name":"C","address":"h","receiver_type":"avr_z","update_method":7,"hdmi_output_over_http":"yes","quick_select_count":300,"listed_queries":[1]}"#,
+            r#"{"id":"A","name":"C","address":"h","receiver_type":"avr_z","update_method":7,"hdmi_output_over_http":"yes","quick_select_count":300,"listed_queries":[1],"heos":"yes"}"#,
         )
         .expect("json");
         assert_eq!(ReceiverKind::default(), d.kind());

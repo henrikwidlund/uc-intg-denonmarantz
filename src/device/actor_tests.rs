@@ -7,11 +7,13 @@
 
 use super::actor::CurrentAvr;
 use super::discovery::{self, Known, TEST_BUILDER, TEST_DISCOVERY, TestBuilder};
+use super::heos::TEST_HEOS;
 use super::{Command, Connect, DenonActor, DeviceEvent, DeviceStatus, Disconnect};
 use crate::config_store::{self, DeviceConfig};
 use crate::entities::sensor::EMPTY;
 use crate::entities::{EntityKind, SelectKind, SensorKind, SwitchKind};
-use crate::test_support::{Fake, FakeTelnet, test_builder};
+use crate::errors::ServiceError;
+use crate::test_support::{Fake, FakeHeos, FakeTelnet, HeosItem, test_builder};
 use actix::{Actor, Addr, Context, Handler};
 use denon_marantz::{Brand, DiscoveredReceiver, ReceiverType, TypeProof};
 use serde_json::Value;
@@ -70,6 +72,7 @@ fn cfg() -> DeviceConfig {
         hdmi_output_over_http: None,
         quick_select_count: None,
         listed_queries: None,
+        heos: None,
     }
 }
 
@@ -486,6 +489,19 @@ fn keeps_the_sound_mode(line: &str) -> Vec<String> {
         }
     }
     answer
+}
+
+#[actix::test]
+async fn a_receiver_without_a_sound_mode_list_shows_the_groups_after_the_start() {
+    let rig = rig(answers_all, QUICK).await;
+    until("the first read", 5, || rig.telnet.count("SLP?") >= 1).await;
+    rig.telnet.send("PWON");
+    rig.telnet.send("MSSTEREO");
+    let select = EntityKind::Select(SelectKind::SoundMode);
+    until("the group", 5, || {
+        entity_state(&rig.events, select, "current_option") == Some("STEREO".into())
+    })
+    .await;
 }
 
 // After a change, the receiver reports a mode that is not in its list for about 1 s.
@@ -909,4 +925,150 @@ async fn another_receiver_at_the_stored_address_is_not_used() {
     })
     .await;
     assert!(!statuses().contains(&DeviceStatus::Connected));
+}
+
+#[actix::test]
+async fn the_media_player_shows_heos_on_network_audio() {
+    let heos = FakeHeos::start("127.0.0.1", HeosItem::song()).await;
+    TEST_HEOS.with(|slot| slot.set(Some(heos.config())));
+    let rig = rig(answers_all, QUICK).await;
+    let saved =
+        || {
+            rig.events.lock().expect("lock").iter().any(
+                |event| matches!(event, DeviceEvent::Config { cfg, .. } if cfg.heos == Some(true)),
+            )
+        };
+    until("HEOS saved", 5, saved).await;
+    rig.telnet.send("PWON");
+    rig.telnet.send("SINET");
+    let title = || entity_state(&rig.events, EntityKind::MediaPlayer, "media_title");
+    until("the HEOS title", 5, || title() == Some("A Song".into())).await;
+    assert_eq!(Some("PLAYING".into()), media_state(&rig.events));
+
+    let command = Command {
+        kind: EntityKind::MediaPlayer,
+        cmd_id: "play_pause".into(),
+        params: None,
+    };
+    rig.actor.send(command).await.expect("send").expect("pause");
+    assert!(
+        heos.received()
+            .iter()
+            .any(|l| l == "player/set_play_state?pid=7&state=pause")
+    );
+    heos.play(HeosItem {
+        state: "pause",
+        ..HeosItem::song()
+    });
+    until("paused", 5, || {
+        media_state(&rig.events) == Some("PAUSED".into())
+    })
+    .await;
+
+    // Another source: HEOS is not shown.
+    rig.telnet.send("SIDVD");
+    until("the source name", 5, || title() == Some("DVD".into())).await;
+    assert_eq!(Some("ON".into()), media_state(&rig.events));
+}
+
+#[actix::test]
+async fn a_receiver_without_heos_is_saved_as_such() {
+    // No fake HEOS: the port is refused.
+    TEST_HEOS.with(|slot| slot.set(None));
+    let rig = rig(answers_all, QUICK).await;
+    let saved = || {
+        rig.events.lock().expect("lock").iter().any(
+            |event| matches!(event, DeviceEvent::Config { cfg, .. } if cfg.heos == Some(false)),
+        )
+    };
+    until("no HEOS saved", 5, saved).await;
+}
+
+#[actix::test]
+async fn heos_without_the_player_is_saved_as_heos_and_used_when_the_player_comes() {
+    let heos = FakeHeos::start("192.0.2.1", HeosItem::song()).await;
+    TEST_HEOS.with(|slot| slot.set(Some(heos.config())));
+    let rig = rig(answers_all, QUICK).await;
+    let saved =
+        || {
+            rig.events.lock().expect("lock").iter().any(
+                |event| matches!(event, DeviceEvent::Config { cfg, .. } if cfg.heos == Some(true)),
+            )
+        };
+    until("HEOS saved", 5, saved).await;
+    rig.telnet.send("PWON");
+    rig.telnet.send("SINET");
+    let reads = heos.count("player/get_players");
+    until("read again", 5, || heos.count("player/get_players") > reads).await;
+    heos.move_player("127.0.0.1");
+    let title = || entity_state(&rig.events, EntityKind::MediaPlayer, "media_title");
+    until("the HEOS title", 5, || title() == Some("A Song".into())).await;
+}
+
+#[actix::test]
+async fn a_heos_command_without_an_answer_does_not_hold_up_the_receiver_commands() {
+    let heos = FakeHeos::start("127.0.0.1", HeosItem::song()).await;
+    // The HEOS client waits longer than the driver.
+    let patient = denon_marantz_heos::HeosConfig {
+        command_timeout: Duration::from_secs(20),
+        slow_command_limit: Duration::from_secs(20),
+        ..heos.config()
+    };
+    TEST_HEOS.with(|slot| slot.set(Some(patient)));
+    let rig = rig(answers_all, QUICK).await;
+    until("the first read", 5, || rig.telnet.count("SLP?") >= 1).await;
+    rig.telnet.send("PWON");
+    rig.telnet.send("SINET");
+    let title = || entity_state(&rig.events, EntityKind::MediaPlayer, "media_title");
+    until("the HEOS title", 5, || title() == Some("A Song".into())).await;
+    heos.hang();
+    let command = |cmd_id: &str| Command {
+        kind: EntityKind::MediaPlayer,
+        cmd_id: cmd_id.into(),
+        params: None,
+    };
+    let start = Instant::now();
+    let pause = async {
+        let result = rig.actor.send(command("play_pause")).await;
+        (result, start.elapsed())
+    };
+    let mute = async {
+        let result = rig.actor.send(command("mute_toggle")).await;
+        (result, start.elapsed())
+    };
+    let ((pause, paused_after), (mute, muted_after)) = tokio::join!(pause, mute);
+    mute.expect("send").expect("mute");
+    assert!(muted_after < Duration::from_secs(2), "{muted_after:?}");
+    // The driver gives up after 5 s.
+    assert_eq!(Err(ServiceError::Timeout), pause.expect("send"));
+    assert!(
+        (Duration::from_secs(5)..Duration::from_secs(7)).contains(&paused_after),
+        "{paused_after:?}"
+    );
+    until("mute sent", 2, || rig.telnet.count("MUON") >= 1).await;
+}
+
+#[actix::test]
+async fn the_heos_client_is_kept_while_the_receiver_connects_again() {
+    let heos = FakeHeos::start("127.0.0.1", HeosItem::song()).await;
+    TEST_HEOS.with(|slot| slot.set(Some(heos.config())));
+    let rig = rig(answers_all, QUICK).await;
+    until("HEOS connected", 5, || {
+        heos.count("player/get_players") >= 1
+    })
+    .await;
+    let reads = heos.count("player/get_players");
+    rig.actor.send(Disconnect).await.expect("disconnect");
+    until("disconnected", 5, || {
+        status_count(&rig.events, DeviceStatus::Disconnected) >= 1
+    })
+    .await;
+    let connected = status_count(&rig.events, DeviceStatus::Connected);
+    rig.actor.send(Connect).await.expect("connect");
+    until("connected again", 5, || {
+        status_count(&rig.events, DeviceStatus::Connected) > connected
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(reads, heos.count("player/get_players"));
 }
