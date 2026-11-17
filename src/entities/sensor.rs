@@ -192,11 +192,13 @@ fn value(v: &View<'_>, kind: SensorKind) -> (Value, Option<&'static str>) {
         SensorKind::HdrInput => text(pick(&signal.hdr, true, Clone::clone)),
         SensorKind::HdrOutput => text(pick(&signal.hdr, false, Clone::clone)),
         // An input depth that the receiver reports as unknown while a signal comes in shows the
-        // output depth.
+        // output depth. A side without a video signal has no depth.
         SensorKind::PixelDepthInput => {
             text(pick(&signal.effective_pixel_depth(), true, |x| x.label()))
         }
-        SensorKind::PixelDepthOutput => text(pick(&signal.pixel_depth, false, |x| x.label())),
+        SensorKind::PixelDepthOutput => {
+            text(pick(&signal.effective_pixel_depth(), false, |x| x.label()))
+        }
         SensorKind::MaxFrlInput => text(pick(&signal.max_frl, true, Clone::clone)),
         SensorKind::MaxFrlOutput => text(pick(&signal.max_frl, false, Clone::clone)),
         // The color space with BT.2020, for example `4:2:2/BT.2020`.

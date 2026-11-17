@@ -1128,10 +1128,24 @@ pub async fn unreachable(ctx: &mut Ctx) -> Check {
                 json!({ "option": "Dim" }),
             )
             .await?;
-        ensure!(
-            response["code"] != 200,
-            "a command worked without a connection"
-        );
+        if response["code"] == 200 {
+            // The driver can find the receiver by its id while the command waits. It saves the
+            // address a moment after the answer.
+            let mut found = false;
+            for _ in 0..10 {
+                let config = read_config(ctx).await?;
+                if config_device(ctx, &config)?["address"] == address.as_str() {
+                    found = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            ensure!(found, "a command worked without a connection");
+            return Ok(format!(
+                "the driver found the receiver again by its id while the command waited {} ms",
+                took.as_millis()
+            ));
+        }
         ensure!(
             took < Duration::from_secs(10),
             "the command took {} ms",

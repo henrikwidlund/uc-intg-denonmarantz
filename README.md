@@ -27,7 +27,8 @@ Bluetooth or with zone 2. Please report problems as
   channel up and down, play and pause, next and previous. Title, artist, album and cover for network audio
   and HD radio. On receivers with HEOS, network audio shows what HEOS plays, with position and length, and
   play, pause, stop, next and previous go to HEOS. Volume and mute stay on the receiver: HEOS shares one
-  volume for all zones.
+  volume for all zones. Covers from AirPlay and USB come from the receiver on TCP port 8015 (seen on an
+  AVC-A10H): the Remote must be able to reach this port.
 - **Remote**: the simple commands of the Python integration (about 370), 15 UI pages, button mapping,
   repeat and button sequences. Text of up to 28 characters is sent to the receiver as it is.
 - **Selects**: sound mode, input source, reference level, dynamic volume, dimmer, eco mode. With telnet also

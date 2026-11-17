@@ -632,12 +632,16 @@ fn an_unknown_input_pixel_depth_shows_the_output_depth() {
     let output = sensor(&v, SensorKind::PixelDepthOutput)["value"].clone();
     assert_ne!(json!("--"), output);
     assert_eq!(output, sensor(&v, SensorKind::PixelDepthInput)["value"]);
-    // Without an input signal the input depth stays as reported.
-    let state = self::state(&["PWON", "SSINFSIGRES I---", "SSINFSIGPIX 03"]);
+    // A side without a video signal has no depth.
+    let state = self::state(&["PWON", "SSINFSIGRES I---", "SSINFSIGPIX 00"]);
     let v = view(&state, &cfg);
-    assert_ne!(
-        sensor(&v, SensorKind::PixelDepthOutput)["value"],
+    assert_eq!(
+        json!("--"),
         sensor(&v, SensorKind::PixelDepthInput)["value"]
+    );
+    assert_eq!(
+        json!("--"),
+        sensor(&v, SensorKind::PixelDepthOutput)["value"]
     );
 }
 

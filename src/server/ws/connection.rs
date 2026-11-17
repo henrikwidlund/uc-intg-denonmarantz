@@ -30,6 +30,8 @@ struct WsSender {
     id: Arc<str>,
     session: Session,
     msg_tracing_out: bool,
+    /// The session is closed: the messages that wait are dropped.
+    closed: bool,
 }
 
 impl Actor for WsSender {
@@ -46,6 +48,9 @@ impl Handler<SendWsMessage> for WsSender {
     type Result = ();
 
     fn handle(&mut self, msg: SendWsMessage, ctx: &mut Self::Context) {
+        if self.closed {
+            return;
+        }
         let id = Arc::clone(&self.id);
         let msg_tracing_out = self.msg_tracing_out;
         let mut session = self.session.clone();
@@ -62,22 +67,29 @@ impl Handler<SendWsMessage> for WsSender {
                             if msg_tracing_out {
                                 debug!("[{id}] <- {text}");
                             }
-                            session.text(text).await.map_err(|e| {
-                                error!("[{id}] WebSocket send error: {e}");
-                                None
-                            })
+                            session.text(text).await.map_err(|_| None)
                         }
                     }
                 };
-                if timeout(SEND_TIMEOUT, send).await.is_err() {
+                let Ok(result) = timeout(SEND_TIMEOUT, send).await else {
                     // A lost message leaves an old state on the Remote. After a new connection,
                     // the Remote gets the full state again.
                     warn!("[{id}] Remote does not read, closing the connection");
                     close(session, None).await;
-                }
+                    return true;
+                };
+                result.is_err()
             }
             .into_actor(self)
-            .map(|(), _, _| ()),
+            .map(|closed, act, _| {
+                if closed && !act.closed {
+                    act.closed = true;
+                    debug!(
+                        "[{}] WebSocket closed, waiting messages are dropped",
+                        act.id
+                    );
+                }
+            }),
         );
     }
 }
@@ -105,6 +117,7 @@ impl WsConn {
             id: Arc::clone(&self.id),
             session: session.clone(),
             msg_tracing_out: self.msg_tracing_out,
+            closed: false,
         }
         .start();
 
@@ -306,10 +319,8 @@ impl WsConn {
                         debug!("[{id}] <- {text}");
                     }
                 }
-                session.text(text).await.map_err(|e| {
-                    error!("[{id}] WebSocket send error: {e}");
-                    None
-                })
+                // The only error is a closed session. The caller logs it once.
+                session.text(text).await.map_err(|_| None)
             }
             Err(e) => {
                 error!("[{id}] Error serializing outgoing message: {e}");

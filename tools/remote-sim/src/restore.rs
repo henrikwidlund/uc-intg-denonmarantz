@@ -10,6 +10,7 @@ use crate::oracle::Oracle;
 use denon_marantz::{Ask, Avr, Command, Zone};
 use std::path::Path;
 use std::time::Duration;
+use tokio::sync::broadcast::error::RecvError;
 
 /// The file with the saved settings. It exists only while settings are changed.
 pub const FILE: &str = "remote-sim-restore.txt";
@@ -24,7 +25,7 @@ pub const QUERIES: &[&str] = &[
     "VSVPM ?",
     "BTTX ?",
     "SLP?",
-    "MNZST ?",
+    "MNZST?",
     "ECO?",
     "PSDIRAC ?",
     "PSMULTEQ: ?",
@@ -61,8 +62,17 @@ pub const QUERIES: &[&str] = &[
     "CV?",
 ];
 
-/// How long the answers to the queries are collected.
-const ANSWER_WAIT: Duration = Duration::from_secs(4);
+/// The longest wait for the answers. The receiver answers late while other queries of the
+/// connection wait before them.
+const ANSWER_LIMIT: Duration = Duration::from_secs(15);
+
+/// The read ends when no answer came for this long after the answers started. The receiver does
+/// not answer some queries in some sound modes, for example `PSPAN ?`.
+const ANSWER_GAP: Duration = Duration::from_secs(2);
+
+/// How long more lines are collected after each query has an answer. Some queries have more than
+/// one answer line.
+const LAST_LINES: Duration = Duration::from_millis(300);
 
 /// The answer lines of the receiver to `queries`, a part of [`QUERIES`], in the order of
 /// [`QUERIES`]. Each answer is also the command that sets the value again.
@@ -70,12 +80,33 @@ pub async fn read(avr: &Avr, queries: &[&str]) -> Result<Vec<String>, Fail> {
     let mut events = avr.telnet_events();
     let asks: Vec<Ask<'_>> = queries.iter().map(|q| Ask::Raw(q)).collect();
     avr.telnet_ask(&asks).await?;
+    let mut waiting: Vec<&str> = queries.to_vec();
     let mut lines: Vec<String> = Vec::new();
-    let end = tokio::time::Instant::now() + ANSWER_WAIT;
-    while let Ok(Ok(event)) = tokio::time::timeout_at(end, events.recv()).await {
+    let limit = tokio::time::Instant::now() + ANSWER_LIMIT;
+    let mut end = limit;
+    loop {
+        let event = match tokio::time::timeout_at(end, events.recv()).await {
+            Ok(Ok(event)) => event,
+            Ok(Err(RecvError::Lagged(_))) => continue,
+            Ok(Err(RecvError::Closed)) | Err(_) => break,
+        };
         let line = format!("{}{}", event.event.code(), event.parameter);
-        let asked = position(&line).is_some_and(|i| queries.contains(&QUERIES[i]));
-        if asked && is_saved(&line) && !lines.contains(&line) {
+        let Some(query) = position(&line).map(|i| QUERIES[i]) else {
+            continue;
+        };
+        if !queries.contains(&query) {
+            continue;
+        }
+        let now = tokio::time::Instant::now();
+        end = limit.min(now + ANSWER_GAP);
+        // The channel levels end with `CVEND`.
+        if query != "CV?" || line == "CVEND" {
+            waiting.retain(|q| *q != query);
+            if waiting.is_empty() {
+                end = end.min(now + LAST_LINES);
+            }
+        }
+        if is_saved(&line) && !lines.contains(&line) {
             lines.push(line);
         }
     }
@@ -83,12 +114,16 @@ pub async fn read(avr: &Avr, queries: &[&str]) -> Result<Vec<String>, Fail> {
     Ok(lines)
 }
 
-/// The place of the query that a line answers, or `None` if no query asks for it.
+/// The place of the query that a line answers, or `None` if no query asks for it. The longest
+/// query wins: `SSTTRLEV 50` answers `SSTTRLEV ?`, not `SSTTR ?`.
 fn position(line: &str) -> Option<usize> {
-    QUERIES.iter().position(|q| {
-        let prefix = q.trim_end_matches('?').trim_end();
-        line.starts_with(prefix)
-    })
+    QUERIES
+        .iter()
+        .enumerate()
+        .map(|(i, q)| (i, q.trim_end_matches('?').trim_end()))
+        .filter(|(_, prefix)| line.starts_with(prefix))
+        .max_by_key(|(_, prefix)| prefix.len())
+        .map(|(i, _)| i)
 }
 
 /// Lines that set a value. `CVEND` ends the list of channel levels, and `MSQUICK` is a quick
@@ -97,8 +132,8 @@ fn is_saved(line: &str) -> bool {
     position(line).is_some() && line != "CVEND" && !line.starts_with("MSQUICK")
 }
 
-/// Send the saved lines, read with `queries`. Returns the lines that the receiver did not take:
-/// they have a different value when read again.
+/// Send the saved lines, read with `queries`. Lines that did not come back are sent once more.
+/// Returns the lines that the receiver did not take: they have a different value when read again.
 pub async fn write(avr: &Avr, queries: &[&str], lines: &[String]) -> Result<Vec<String>, Fail> {
     for line in lines {
         avr.telnet_send(Zone::Main, Command::Raw(line)).await?;
@@ -114,7 +149,12 @@ pub async fn write(avr: &Avr, queries: &[&str], lines: &[String]) -> Result<Vec<
     if missed.is_empty() {
         return Ok(missed);
     }
-    // A busy receiver can answer too late. Ask again for the missed lines only.
+    // A busy receiver can answer too late, or ignore a line while it applies the sound mode. Send
+    // the missed lines again and ask for them only.
+    for line in &missed {
+        avr.telnet_send(Zone::Main, Command::Raw(line)).await?;
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
     let mut again: Vec<&str> = Vec::new();
     for query in missed
         .iter()
@@ -204,5 +244,15 @@ mod tests {
         assert!(!is_saved("MVMAX 98"));
         assert!(is_saved("VSAUDIO TV"));
         assert!(is_saved("BTTX SP"));
+    }
+
+    #[test]
+    fn a_line_answers_the_longest_query_it_starts_with() {
+        let query = |line| position(line).map(|i| QUERIES[i]);
+        assert_eq!(Some("SSTTRLEV ?"), query("SSTTRLEV 50"));
+        assert_eq!(Some("SSTTR ?"), query("SSTTR OFF"));
+        assert_eq!(Some("PSDELAY ?"), query("PSDELAY 000"));
+        assert_eq!(Some("PSDEL ?"), query("PSDEL 000"));
+        assert_eq!(None, query("PWON"));
     }
 }
