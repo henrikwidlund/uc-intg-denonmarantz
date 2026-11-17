@@ -340,29 +340,30 @@ pub struct Identified {
 }
 
 impl Identified {
-    /// Fails with the reason if the answers do not prove the receiver type, or if the receiver
-    /// gives no MAC address and is not an old receiver with a serial number.
+    /// Fails with the reason if the answers do not prove the receiver type, if the receiver
+    /// gives no serial number (its description was not read), or if it gives no MAC address and
+    /// is not an old receiver.
     pub fn new(avr: &Avr) -> Result<Self, &'static str> {
         let info = avr.info();
         if !info.type_proof.is_proven() {
             return Err("the answers do not prove the receiver type");
         }
-        let serial = info.serial_number.clone().filter(|s| !s.is_empty());
+        // The name, model and brand also come from the description. They are not read again.
+        let Some(serial) = info.serial_number.clone().filter(|s| !s.is_empty()) else {
+            return Err("the receiver gave no serial number: its description was not read");
+        };
         let mac = mac_address(info);
-        let (id, id_kind) = match (&mac, &serial) {
-            (Some(mac), _) => (mac.clone(), config_store::IdKind::Mac),
-            (None, Some(serial)) if info.receiver_type == ReceiverType::Avr => {
+        let (id, id_kind) = match &mac {
+            Some(mac) => (mac.clone(), config_store::IdKind::Mac),
+            None if info.receiver_type == ReceiverType::Avr => {
                 (serial.clone(), config_store::IdKind::Serial)
             }
-            (None, _) if info.receiver_type != ReceiverType::Avr => {
-                return Err("the receiver gave no MAC address");
-            }
-            _ => return Err("the receiver gave no serial number"),
+            None => return Err("the receiver gave no MAC address"),
         };
         Ok(Self {
             id,
             id_kind,
-            serial,
+            serial: Some(serial),
             mac,
             name: if info.friendly_name.is_empty() {
                 info.model_name.clone().unwrap_or_default()

@@ -97,7 +97,8 @@ configurator of the Remote.
 2. Web configurator: Integrations > Add new > Install custom. Choose the file. Remove the receiver from the
    Python integration, so that only one integration is connected to it.
 3. To keep the old setup, copy the `config.json` of the Python integration to the configuration folder of
-   the driver. Otherwise start the setup. Leave the address empty to search the network.
+   the driver. Otherwise start the setup. Leave the address empty to search the network. If the setup fails,
+   run it again. The receiver must send its description.
 
 Run the setup again to add, remove or configure a receiver, make a backup, or restore one.
 

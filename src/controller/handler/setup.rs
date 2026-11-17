@@ -1779,7 +1779,10 @@ mod tests {
 
         /// A fake receiver at [`FAKE_HOST`]. Its telnet port does not answer.
         async fn fake_receiver() -> crate::test_support::Fake {
-            let http = crate::test_support::Fake::start(true).await;
+            fake_receiver_from(crate::test_support::Fake::start(true).await)
+        }
+
+        fn fake_receiver_from(http: crate::test_support::Fake) -> crate::test_support::Fake {
             let port = http.port();
             let setup: crate::device::discovery::TestBuilder =
                 std::rc::Rc::new(move |_, builder| {
@@ -1863,6 +1866,17 @@ mod tests {
                     .iter()
                     .any(|id| id == "media_player.0123456789AB")
             );
+        }
+
+        #[actix::test]
+        async fn a_receiver_without_its_description_is_not_added() {
+            let _fake =
+                fake_receiver_from(crate::test_support::Fake::start_without_description().await);
+            let controller = controller("no-description", None);
+            let events = connect(&controller, "a").await;
+            setup_fake(&controller, &events, false).await;
+            wait_state(&events, "ERROR").await;
+            assert_eq!(json!("OTHER"), last(&events)["error"]);
         }
 
         #[actix::test]

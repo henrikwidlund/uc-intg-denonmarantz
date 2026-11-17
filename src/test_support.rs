@@ -143,6 +143,11 @@ impl Fake {
         Self::start_with(true, description_by(""), true).await
     }
 
+    /// Start a receiver that does not give its description. The main zone is on.
+    pub async fn start_without_description() -> Self {
+        Self::start_with(true, Vec::new(), true).await
+    }
+
     /// Start a busy receiver: it answers the device information with HTTP 500. The main zone is
     /// on.
     pub async fn start_busy() -> Self {
@@ -252,6 +257,7 @@ async fn bind_loopback(what: &str) -> (u16, Vec<TcpListener>) {
 
 /// What differs between the fake receivers.
 struct Pages {
+    /// Empty: the description is not found.
     description: Vec<u8>,
     /// `false`: the device information is answered with HTTP 500.
     device_info: bool,
@@ -287,7 +293,9 @@ async fn serve(
         }
         let answer: Option<Vec<u8>> = match (method.as_str(), path.as_str()) {
             ("GET", "/goform/Deviceinfo.xml") => Some(INFO.to_vec()),
-            ("GET", "/description.xml") => Some(pages.description.clone()),
+            ("GET", "/description.xml") if !pages.description.is_empty() => {
+                Some(pages.description.clone())
+            }
             ("GET", path) if path.starts_with(COMMAND) => {
                 commands
                     .lock()
