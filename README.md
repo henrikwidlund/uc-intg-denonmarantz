@@ -194,6 +194,7 @@ Options:
 - `--no-oracle` does not open the second connection. The values are then not compared with the receiver.
 - `--driver <path>`, `--port <port>` and `--commands <path>` change the driver binary, the port and the
   command table.
+- `RUST_LOG` is passed to the driver, for example `info,denon_marantz=trace` to log the telnet lines.
 
 The results go to `remote-sim-results-<time>.md`. To check only the selects and the switches:
 

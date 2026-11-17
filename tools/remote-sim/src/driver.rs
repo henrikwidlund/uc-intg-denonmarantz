@@ -45,9 +45,12 @@ impl Driver {
             .env("UC_INTEGRATION_INTERFACE", "127.0.0.1")
             .env("UC_INTEGRATION_HTTP_PORT", self.port.to_string())
             .env("UC_DISABLE_MDNS_PUBLISH", "true")
+            // `RUST_LOG` of the caller, if set, for example to trace the telnet lines.
             .env(
                 "RUST_LOG",
-                "info,uc_intg_denonmarantz=debug,denon_marantz=debug",
+                std::env::var("RUST_LOG").unwrap_or_else(|_| {
+                    "info,uc_intg_denonmarantz=debug,denon_marantz=debug".to_owned()
+                }),
             )
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
