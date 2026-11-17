@@ -1861,12 +1861,23 @@ pub async fn simple_commands(ctx: &mut Ctx) -> Check {
         .as_ref()
         .ok_or_else(|| Fail::new("the second connection is gone"))?;
     // The file stays if a setting did not come back: the next run sends them again.
-    let missed = restore::write(oracle.avr(), restore::QUERIES, &saved).await?;
+    let mut missed = restore::write(oracle.avr(), restore::QUERIES, &saved).await?;
     if missed.is_empty() {
         restore::forget().await;
     }
+    // The receiver often does not take the audio restorer back here, but takes it at the start of
+    // the next run. It is not a failure: the line stays in the file for the next run.
+    let late: Vec<String> = missed
+        .extract_if(.., |line| line.starts_with("PSRSTR"))
+        .collect();
     match (result, missed.is_empty()) {
-        (Ok(note), true) => Ok(format!("{note}, {} settings set back", saved.len())),
+        (Ok(note), true) if late.is_empty() => {
+            Ok(format!("{note}, {} settings set back", saved.len()))
+        }
+        (Ok(note), true) => Ok(format!(
+            "{note}, {} settings set back, not taken: {late:?}. The next run sets them back",
+            saved.len() - late.len()
+        )),
         (Ok(note), false) => Err(Fail::new(format!(
             "{note}. Settings not set back: {missed:?}"
         ))),
@@ -2235,8 +2246,9 @@ fn heos_position(ctx: &Ctx, mp: &str) -> Result<i64, Fail> {
         .and_then(Value::as_i64)
         .ok_or_else(|| Fail::new("no media_position"))?;
     let at = ctx.client.text(mp, "media_position_updated_at");
-    let at = chrono::DateTime::parse_from_rfc3339(&at)
+    let at = at
+        .parse::<jiff::Timestamp>()
         .map_err(|e| Fail::new(format!("media_position_updated_at {at:?}: {e}")))?;
-    let since = chrono::Utc::now().signed_duration_since(at).num_seconds();
+    let since = jiff::Timestamp::now().duration_since(at).as_secs();
     Ok(sent + since)
 }

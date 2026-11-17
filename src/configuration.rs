@@ -5,7 +5,7 @@
 //! Driver settings from environment variables and the compiled-in driver metadata.
 
 use crate::{APP_VERSION, built_info};
-use chrono::NaiveDate;
+use serde::de::value::{self, StrDeserializer};
 use std::collections::HashMap;
 use std::env;
 use std::io;
@@ -106,12 +106,14 @@ pub fn get_driver_metadata() -> Result<IntegrationDriverUpdate, io::Error> {
     driver.version = Some(APP_VERSION.to_string());
     // Set by the release build.
     if let Some(date) = built_info::RELEASE_DATE {
-        let date = NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Invalid UC_RELEASE_DATE {date}: {e}"),
-            )
-        })?;
+        // Parsed by the date type of `uc_api`, so the driver does not name it.
+        let date = serde::Deserialize::deserialize(StrDeserializer::<value::Error>::new(date))
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Invalid UC_RELEASE_DATE {date}: {e}"),
+                )
+            })?;
         driver.release_date = Some(date);
     }
 
