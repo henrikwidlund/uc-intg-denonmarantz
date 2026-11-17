@@ -1275,32 +1275,76 @@ async fn restart(ctx: &mut Ctx) -> Result<(), Fail> {
     ctx.reconnect().await
 }
 
+/// The file of the Python integration: only its fields, and the serial number is the id. The
+/// driver must keep the serial number as the key and add the MAC address and the serial number.
 pub async fn python_config(ctx: &mut Ctx) -> Check {
     let ids = entity_ids(ctx).await?;
     let good = tokio::fs::read_to_string(ctx.driver.config_file()).await?;
-    let mut config = read_config(ctx).await?;
-    // The file of the Python integration has no field for the signal read.
-    for device in config.as_array_mut().into_iter().flatten() {
-        if let Some(device) = device.as_object_mut() {
-            device.remove("signal_poll_secs");
+    let config = read_config(ctx).await?;
+    let device = config_device(ctx, &config)?;
+    let serial = device["serial"]
+        .as_str()
+        .ok_or_else(|| Fail::new("config.json has no serial number"))?
+        .to_owned();
+    let mac = device["mac"].clone();
+    let mut python = serde_json::Map::new();
+    for field in PYTHON_FIELDS {
+        if let Some(value) = device.get(field) {
+            python.insert(field.to_owned(), value.clone());
         }
     }
+    python.insert("id".to_owned(), json!(serial));
+    // The same entities with the serial number as the key.
+    let mac_key = std::mem::replace(&mut ctx.key, serial.clone());
+    let expected: BTreeSet<String> = ids
+        .iter()
+        .map(|id| {
+            id.strip_suffix(mac_key.as_str())
+                .map_or_else(|| id.clone(), |kind| format!("{kind}{serial}"))
+        })
+        .collect();
     ctx.driver.stop().await;
-    tokio::fs::write(ctx.driver.config_file(), config.to_string()).await?;
+    tokio::fs::write(ctx.driver.config_file(), json!([python]).to_string()).await?;
     let result = async {
         restart(ctx).await?;
         let after = entity_ids(ctx).await?;
         ensure!(
-            after == ids,
-            "entities differ: {} before, {} after",
-            ids.len(),
+            after == expected,
+            "entities differ: {} expected with the key {serial}, {} after",
+            expected.len(),
             after.len()
         );
         subscribe_all(ctx).await?;
         let state = wait_available(ctx, 20).await?;
-        Ok(format!("same {} entities, state {state}", after.len()))
+        // The driver saves the ids off its main thread.
+        let end = Instant::now() + Duration::from_secs(5);
+        let saved = loop {
+            let config = read_config(ctx).await?;
+            let device = config_device(ctx, &config)?.clone();
+            if device.get("mac").is_some() || Instant::now() > end {
+                break device;
+            }
+            sleep(Duration::from_millis(100)).await;
+        };
+        ensure!(
+            saved["mac"] == mac && saved["serial"] == serial.as_str(),
+            "ids not added: serial {}, mac {}",
+            saved["serial"],
+            saved["mac"]
+        );
+        ensure!(
+            saved.get("id_kind").is_none(),
+            "id_kind {} written for a serial number key",
+            saved["id_kind"]
+        );
+        Ok(format!(
+            "same {} entities with the key {serial}, state {state}, mac {} added",
+            after.len(),
+            saved["mac"]
+        ))
     }
     .await;
+    ctx.key = mac_key;
     ctx.driver.stop().await;
     tokio::fs::write(ctx.driver.config_file(), good).await?;
     restart(ctx).await?;
