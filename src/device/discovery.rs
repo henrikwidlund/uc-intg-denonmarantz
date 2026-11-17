@@ -353,7 +353,7 @@ impl Identified {
         if info.manufacturer.is_none() {
             return Err("the receiver did not send its description");
         }
-        let serial = info.serial_number.clone().filter(|s| !s.is_empty());
+        let serial = info.serial_number.clone();
         let mac = mac_address(info);
         let (id, id_kind) = match (&mac, &serial) {
             (Some(mac), _) => (mac.clone(), config_store::IdKind::Mac),
