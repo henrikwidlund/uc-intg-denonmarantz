@@ -357,7 +357,7 @@ pub async fn entities(ctx: &mut Ctx) -> Check {
         "{selects} selects, {sensors} sensors"
     );
     Ok(format!(
-        "serial {}, {selects} selects, {sensors} sensors",
+        "key {}, {selects} selects, {sensors} sensors",
         ctx.key
     ))
 }
@@ -1107,7 +1107,7 @@ pub async fn unreachable(ctx: &mut Ctx) -> Check {
     let result = async {
         let down = ctx.client.wait_text(&mp, "state", 20, "UNAVAILABLE").await;
         if down.is_err() {
-            return Ok("the driver found the receiver again by its serial number".to_owned());
+            return Ok("the driver found the receiver again by its id".to_owned());
         }
         let select = ctx.select("dimmer");
         let (response, took) = ctx
@@ -1205,15 +1205,36 @@ pub async fn config_file(ctx: &mut Ctx) -> Check {
         missing.is_empty(),
         "fields missing in config.json: {missing:?}"
     );
-    // `quick_select_count` is missing if the receiver does not report it.
-    let kind = ["receiver_type", "update_method", "hdmi_output_over_http"];
+    // `quick_select_count` is missing if the receiver does not report it. `mac` is missing on
+    // receivers that do not give it. `id_kind` is missing for the serial number.
+    let kind = [
+        "receiver_type",
+        "update_method",
+        "hdmi_output_over_http",
+        "serial",
+    ];
     let missing: Vec<_> = kind.iter().filter(|f| device.get(**f).is_none()).collect();
     ensure!(
         missing.is_empty(),
         "fields missing in config.json: {missing:?}"
     );
+    let id_field = if device["id_kind"] == "mac" {
+        "mac"
+    } else {
+        "serial"
+    };
+    ensure!(
+        device[id_field] == device["id"],
+        "id {} is not the {id_field} {}",
+        device["id"],
+        device[id_field]
+    );
     Ok(format!(
-        "id is the serial number, address {}, use_telnet {}, receiver_type {}, update_method {}, hdmi_output_over_http {}, quick_select_count {}",
+        "id {} ({}), serial {}, mac {}, address {}, use_telnet {}, receiver_type {}, update_method {}, hdmi_output_over_http {}, quick_select_count {}",
+        device["id"],
+        device["id_kind"],
+        device["serial"],
+        device["mac"],
         device["address"],
         device["use_telnet"],
         device["receiver_type"],

@@ -6,9 +6,13 @@ It controls Denon and Marantz network receivers with the `denon-marantz` library
 The driver is an alternative to the Python integration that is part of the Remote software. It has its own
 driver id (`denonavr_rs`), because the Python integration cannot be stopped or uninstalled. The `config.json`,
 the entity names and the command names are the same, so receivers that are set up with the Python integration
-work without a new setup. The driver adds what it finds on the receiver to `config.json`: the receiver type,
-the HTTP read method, if the HDMI output can be read over HTTP, the number of quick selects, and the values
+work without a new setup. The driver adds what it finds on the receiver to `config.json`: the serial number,
+the MAC address, the receiver type, the HTTP read method, if the HDMI output can be read over HTTP, the number of quick selects, and the values
 that the receiver lists for HTTP. The Python integration ignores them.
+
+The device id in the entity ids is the MAC address of the receiver. Receivers from about 2011 and older do not
+give it: they use the serial number. Receivers that are set up with the Python integration keep the serial
+number (`id_kind` in `config.json`).
 
 ## Status
 
@@ -55,8 +59,8 @@ to the log that says why.
 
 ## Network and wake-up
 
-- The driver connects to the last address first. If the receiver has a new address, the driver finds it by
-  its serial number and saves the new address.
+- The driver connects to the last address first. If another receiver or none answers there, the driver
+  searches the network for its MAC address or serial number and saves the new address.
 - After the Remote wakes up, the network of the Remote can be down for a short time. The driver tries again
   with a growing delay for up to 3 seconds. A connect step without an answer in 0.5 seconds is started again
   once.

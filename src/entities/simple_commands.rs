@@ -204,6 +204,9 @@ mod tests {
     fn cfg(use_telnet: bool, is_denon: bool) -> DeviceConfig {
         DeviceConfig {
             id: "S".into(),
+            id_kind: crate::config_store::IdKind::Serial,
+            serial: None,
+            mac: None,
             name: "N".into(),
             address: "h".into(),
             support_sound_mode: true,

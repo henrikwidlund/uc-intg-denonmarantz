@@ -100,6 +100,18 @@ impl Controller {
         );
     }
 
+    /// The configured receiver with this serial number or MAC address.
+    pub(super) fn find_device(
+        &self,
+        serial: Option<&str>,
+        mac: Option<&str>,
+    ) -> Option<&DeviceConfig> {
+        self.devices
+            .values()
+            .map(|d| &d.cfg)
+            .find(|cfg| cfg.same_receiver(serial, mac) == Some(true))
+    }
+
     /// True if the key belongs to the running actor of the device.
     fn is_current(&self, key: &Arc<str>) -> bool {
         self.devices
@@ -483,11 +495,14 @@ impl Handler<DeviceEvent> for Controller {
                 let Some(device) = self.devices.get_mut(&*key) else {
                     return;
                 };
-                // Only take what the actor found on the receiver: the address and the receiver
-                // kind. The event can be older than the settings of the controller.
+                // Only take what the actor found on the receiver: the address, the receiver
+                // kind and the ids. The event can be older than the settings of the controller.
                 let kind = cfg.kind();
                 let new_kind = kind != device.cfg.kind();
-                if device.cfg.address == cfg.address && !new_kind {
+                let new_ids = device
+                    .cfg
+                    .add_ids(cfg.serial.as_deref(), cfg.mac.as_deref());
+                if device.cfg.address == cfg.address && !new_kind && !new_ids {
                     return;
                 }
                 info!("[{}] saving what the receiver reported", cfg.name);

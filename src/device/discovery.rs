@@ -34,14 +34,15 @@ pub async fn discover() -> Result<Vec<DiscoveredReceiver>, Error> {
     discover_all(&DiscoveryConfig::default()).await
 }
 
-/// Find the receiver of a configuration in the discovered ones. The serial number is the id.
+/// Find the receiver of a configuration in the discovered ones, by its MAC address or serial
+/// number.
 pub fn find<'a>(
     cfg: &DeviceConfig,
     found: &'a [DiscoveredReceiver],
 ) -> Option<&'a DiscoveredReceiver> {
-    found
-        .iter()
-        .find(|r| r.serial_number.as_deref() == Some(cfg.id.as_str()))
+    found.iter().find(|r| {
+        cfg.same_receiver(r.serial_number.as_deref(), r.mac_address.as_deref()) == Some(true)
+    })
 }
 
 /// What an earlier connection found out about a receiver. The type saves the type lookup. The brand
@@ -78,9 +79,9 @@ impl Known {
 ///
 /// If the receiver then reports another type, it is identified again without the known type.
 ///
-/// An error answer to the device information makes the library report the oldest type (`Avr`).
-/// With a known type that result is not used: it is an error, so the connect is tried again later
-/// and the wrong type is not saved.
+/// If the answers do not prove the type, the library reports the oldest type (`Avr`). With a known
+/// type that result is not used: it is an error, so the connect is tried again later and the wrong
+/// type is not saved. A proven `Avr` is an error too: the stored type is newer.
 pub async fn identify(host: &str, known: Option<Known>) -> Result<Avr, Error> {
     let avr = identify_with(host, known).await?;
     let Some(expected) = known.and_then(|k| k.receiver_type) else {
@@ -99,7 +100,8 @@ pub async fn identify(host: &str, known: Option<Known>) -> Result<Avr, Error> {
         ..k
     });
     let avr = identify_with(host, unknown_type).await?;
-    if avr.info().receiver_type == ReceiverType::Avr {
+    let info = avr.info();
+    if !info.type_proof.is_proven() || info.receiver_type == ReceiverType::Avr {
         return Err(Error::InvalidResponse {
             request: format!(
                 "GET http://{host}:{}{}",
@@ -107,7 +109,9 @@ pub async fn identify(host: &str, known: Option<Known>) -> Result<Avr, Error> {
                 denon_marantz::proto::DEVICE_INFO_PATH
             ),
             source: format!(
-                "no device information, the stored type is {}",
+                "receiver type {} ({:?}), the stored type is {}",
+                info.receiver_type.name(),
+                info.type_proof,
                 expected.name()
             )
             .into(),
@@ -320,8 +324,13 @@ pub async fn read_missing_pages(avr: Arc<Avr>, started: Started, name: String, d
 /// What the setup needs to know about a receiver.
 #[derive(Debug, Clone)]
 pub struct Identified {
-    /// Serial number. It is the id of the receiver.
+    /// The MAC address, or the serial number on old receivers that do not give a MAC address. It
+    /// is the id of the receiver.
     pub id: String,
+    pub id_kind: config_store::IdKind,
+    pub serial: Option<String>,
+    /// 12 uppercase hexadecimal digits.
+    pub mac: Option<String>,
     pub name: String,
     pub model: String,
     pub is_denon: bool,
@@ -331,10 +340,30 @@ pub struct Identified {
 }
 
 impl Identified {
-    pub fn new(avr: &Avr) -> Option<Self> {
+    /// Fails with the reason if the answers do not prove the receiver type, or if the receiver
+    /// gives no MAC address and is not an old receiver with a serial number.
+    pub fn new(avr: &Avr) -> Result<Self, &'static str> {
         let info = avr.info();
-        Some(Self {
-            id: info.serial_number.clone().filter(|s| !s.is_empty())?,
+        if !info.type_proof.is_proven() {
+            return Err("the answers do not prove the receiver type");
+        }
+        let serial = info.serial_number.clone().filter(|s| !s.is_empty());
+        let mac = mac_address(info);
+        let (id, id_kind) = match (&mac, &serial) {
+            (Some(mac), _) => (mac.clone(), config_store::IdKind::Mac),
+            (None, Some(serial)) if info.receiver_type == ReceiverType::Avr => {
+                (serial.clone(), config_store::IdKind::Serial)
+            }
+            (None, _) if info.receiver_type != ReceiverType::Avr => {
+                return Err("the receiver gave no MAC address");
+            }
+            _ => return Err("the receiver gave no serial number"),
+        };
+        Ok(Self {
+            id,
+            id_kind,
+            serial,
+            mac,
             name: if info.friendly_name.is_empty() {
                 info.model_name.clone().unwrap_or_default()
             } else {
@@ -348,6 +377,12 @@ impl Identified {
             kind: receiver_kind(info),
         })
     }
+}
+
+/// The MAC address as 12 uppercase hexadecimal digits. `None` if the receiver does not give a
+/// valid one.
+pub fn mac_address(info: &denon_marantz::Info) -> Option<String> {
+    info.mac_address.as_deref().and_then(config_store::mac_text)
 }
 
 /// What the configuration keeps of the receiver.

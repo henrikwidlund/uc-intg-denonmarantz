@@ -13,7 +13,7 @@ use crate::entities::sensor::EMPTY;
 use crate::entities::{EntityKind, SelectKind, SensorKind, SwitchKind};
 use crate::test_support::{Fake, FakeTelnet, test_builder};
 use actix::{Actor, Addr, Context, Handler};
-use denon_marantz::{Brand, DiscoveredReceiver, ReceiverType};
+use denon_marantz::{Brand, DiscoveredReceiver, ReceiverType, TypeProof};
 use serde_json::Value;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -34,6 +34,10 @@ impl Handler<DeviceEvent> for Collector {
     }
 }
 
+/// The MAC address and serial number of the fake receiver.
+const FAKE_MAC: &str = "0123456789AB";
+const FAKE_SERIAL: &str = "XXX";
+
 struct Rig {
     actor: Addr<DenonActor>,
     events: Arc<Mutex<Vec<DeviceEvent>>>,
@@ -44,6 +48,10 @@ struct Rig {
 fn cfg() -> DeviceConfig {
     DeviceConfig {
         id: "SERIAL0000001".into(),
+        id_kind: config_store::IdKind::Serial,
+        serial: None,
+        // The MAC address of the fake receiver.
+        mac: Some(FAKE_MAC.into()),
         name: "AVR".into(),
         address: "127.0.0.1".into(),
         support_sound_mode: true,
@@ -416,6 +424,7 @@ async fn a_receiver_with_a_new_address_is_found_by_its_serial_number() {
         friendly_name: None,
         serial_number: Some("SERIAL0000001".into()),
         mac_address: None,
+        type_proof: TypeProof::Read,
     };
     TEST_DISCOVERY.with(|slot| *slot.borrow_mut() = Some(vec![found]));
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -779,4 +788,125 @@ async fn an_error_answer_does_not_make_a_newer_receiver_the_oldest_type() {
         .await
         .expect("identify");
     assert_eq!(ReceiverType::Avr, avr.info().receiver_type);
+}
+
+#[actix::test]
+async fn a_type_that_is_not_proven_is_not_saved() {
+    // A configuration of the Python integration: no type yet. The receiver answers the device
+    // information with an error.
+    let cfg = DeviceConfig {
+        id: FAKE_SERIAL.into(),
+        mac: None,
+        ..cfg()
+    };
+    let http = Fake::start_busy().await;
+    let http_port = http.port();
+    // Both types on the port of the fake: the error answer gives the oldest type there.
+    let setup: TestBuilder = Rc::new(move |_, builder| {
+        test_builder(http_port, 1, builder).probes(&[
+            (ReceiverType::AvrX, http_port),
+            (ReceiverType::Avr, http_port),
+        ])
+    });
+    let (_actor, events, _http) = connect_http_only_to(http, setup, cfg).await;
+    until("the connect", 5, || {
+        status_count(&events, DeviceStatus::Connected) > 0
+    })
+    .await;
+    let events = events.lock().expect("lock");
+    let configs: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            DeviceEvent::Config { cfg, .. } => Some(cfg),
+            _ => None,
+        })
+        .collect();
+    // The serial number is added, the type is not.
+    assert_ne!(0, configs.len());
+    assert!(
+        configs
+            .iter()
+            .all(|cfg| cfg.receiver_type.is_none() && cfg.update_method.is_none())
+    );
+}
+
+/// An actor for this configuration that is connected to a fake receiver whose telnet port does
+/// not answer. The search finds no receiver.
+async fn connect_http_only(
+    cfg: DeviceConfig,
+) -> (Addr<DenonActor>, Arc<Mutex<Vec<DeviceEvent>>>, Fake) {
+    let http = Fake::start(true).await;
+    let http_port = http.port();
+    let setup: TestBuilder = Rc::new(move |_, builder| test_builder(http_port, 1, builder));
+    connect_http_only_to(http, setup, cfg).await
+}
+
+async fn connect_http_only_to(
+    http: Fake,
+    setup: TestBuilder,
+    cfg: DeviceConfig,
+) -> (Addr<DenonActor>, Arc<Mutex<Vec<DeviceEvent>>>, Fake) {
+    TEST_BUILDER.with(|slot| *slot.borrow_mut() = Some(setup));
+    TEST_DISCOVERY.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let collector = Collector(events.clone()).start();
+    let cfg = DeviceConfig {
+        use_telnet: false,
+        ..cfg
+    };
+    let actor = DenonActor::new(cfg.id.as_str().into(), cfg, collector.recipient())
+        .with_retry_delay(Duration::from_secs(60))
+        .start();
+    actor.send(Connect).await.expect("connect");
+    (actor, events, http)
+}
+
+#[actix::test]
+async fn the_connect_adds_the_mac_address_to_a_configuration_with_a_serial_number() {
+    // A configuration of the Python integration: the serial number is the id.
+    let cfg = DeviceConfig {
+        id: FAKE_SERIAL.into(),
+        mac: None,
+        ..cfg()
+    };
+    let (_actor, events, _http) = connect_http_only(cfg).await;
+    let added = || {
+        events.lock().expect("lock").iter().any(|event| {
+            matches!(event, DeviceEvent::Config { cfg, .. }
+                if cfg.id == FAKE_SERIAL
+                    && cfg.id_kind == config_store::IdKind::Serial
+                    && cfg.mac.as_deref() == Some(FAKE_MAC)
+                    && cfg.serial.as_deref() == Some(FAKE_SERIAL))
+        })
+    };
+    until("the MAC address", 5, added).await;
+}
+
+#[actix::test]
+async fn another_receiver_at_the_stored_address_is_not_used() {
+    let cfg = DeviceConfig {
+        mac: Some("AABBCCDDEEFF".into()),
+        ..cfg()
+    };
+    let (_actor, events, _http) = connect_http_only(cfg).await;
+    // The connect ends without a connection.
+    let statuses = || -> Vec<DeviceStatus> {
+        events
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter_map(|event| match event {
+                DeviceEvent::Status { status, .. } => Some(*status),
+                _ => None,
+            })
+            .collect()
+    };
+    until("the failed connect", 5, || {
+        statuses()
+            .iter()
+            .skip_while(|s| **s != DeviceStatus::Connecting)
+            .any(|s| *s != DeviceStatus::Connecting)
+    })
+    .await;
+    assert!(!statuses().contains(&DeviceStatus::Connected));
 }

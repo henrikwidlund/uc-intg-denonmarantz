@@ -432,7 +432,7 @@ impl DenonActor {
         // The list of the receiver can be another one now.
         self.sound_mode = None;
         self.update_address(address, version);
-        self.update_receiver_kind(&avr, version);
+        self.update_receiver_info(&avr, version);
 
         ctx.add_message_stream(
             BroadcastStream::new(changes).map(move |change| Changed(generation, change.ok())),
@@ -468,15 +468,41 @@ impl DenonActor {
     }
 
     /// Take what the configuration keeps of the receiver: the generation, the HTTP read method, the
-    /// HDMI output over HTTP and the number of quick selects. A configuration of the Python
-    /// integration does not have them. The controller saves them.
-    fn update_receiver_kind(&mut self, avr: &Avr, version: u64) {
-        let kind = discovery::receiver_kind(avr.info());
-        if self.cfg_version != version || kind == self.cfg.kind() {
+    /// HDMI output over HTTP, the number of quick selects, and the serial number and MAC address if
+    /// they are not stored yet. A configuration of the Python integration does not have them. The
+    /// controller saves them.
+    ///
+    /// The receiver kind is not taken if the answers do not prove the type: it can be wrong, and
+    /// a new kind removes entities.
+    fn update_receiver_info(&mut self, avr: &Avr, version: u64) {
+        if self.cfg_version != version {
             return;
         }
-        info!("[{}] receiver: {kind:?}", self.cfg.name);
-        self.cfg.set_kind(kind);
+        let info = avr.info();
+        let kind = discovery::receiver_kind(info);
+        let new_kind = info.type_proof.is_proven() && kind != self.cfg.kind();
+        if !info.type_proof.is_proven() {
+            debug!(
+                "[{}] receiver type not proven, kind not saved",
+                self.cfg.name
+            );
+        }
+        let new_ids = self
+            .cfg
+            .add_ids(info.serial_number.as_deref(), info.mac_address.as_deref());
+        if !new_kind && !new_ids {
+            return;
+        }
+        if new_kind {
+            info!("[{}] receiver: {kind:?}", self.cfg.name);
+            self.cfg.set_kind(kind);
+        }
+        if new_ids {
+            info!(
+                "[{}] receiver ids: serial {:?}, MAC {:?}",
+                self.cfg.name, self.cfg.serial, self.cfg.mac
+            );
+        }
         self.controller.do_send(DeviceEvent::Config {
             key: self.key.clone(),
             cfg: self.cfg.clone(),
@@ -724,6 +750,9 @@ impl DenonActor {
 /// Find the receiver and start it. Retries network errors fast, which covers the short Wi-Fi
 /// drop of the Remote after wake-up. `Err(None)` means the receiver is not on the network.
 ///
+/// Another receiver at the stored address is not used: the receiver is then searched by its MAC
+/// address or serial number.
+///
 /// The stall timeout covers only the short identify step. The start is not canceled: a slow
 /// receiver needs more time to read its values.
 async fn connect_avr(cfg: DeviceConfig) -> Result<Connected, Option<AvrError>> {
@@ -735,14 +764,20 @@ async fn connect_avr(cfg: DeviceConfig) -> Result<Connected, Option<AvrError>> {
     // The last good address first.
     if !cfg.address.is_empty() {
         match discovery::identify_retry(&cfg.address, known, deadline).await {
-            Ok(avr) => found = Some(avr),
+            Ok(avr) => match other_receiver(&cfg, &avr) {
+                Some(e) => {
+                    info!("[{}] {e}", cfg.name);
+                    last_error = Some(e);
+                }
+                None => found = Some(avr),
+            },
             Err(e) => {
                 debug!("[{}] last address failed: {e}", cfg.name);
                 last_error = Some(e);
             }
         }
     }
-    // The address can have changed: search for the serial number.
+    // The address can have changed: search for the MAC address or serial number.
     if found.is_none() {
         let receivers = discovery::discover().await.map_err(Some)?;
         let Some(receiver) = discovery::find(&cfg, &receivers) else {
@@ -751,6 +786,9 @@ async fn connect_avr(cfg: DeviceConfig) -> Result<Connected, Option<AvrError>> {
         let avr = discovery::identify_retry(&receiver.host, known, deadline)
             .await
             .map_err(Some)?;
+        if let Some(e) = other_receiver(&cfg, &avr) {
+            return Err(Some(e));
+        }
         address = Some(receiver.host.clone());
         found = Some(avr);
     }
@@ -763,6 +801,19 @@ async fn connect_avr(cfg: DeviceConfig) -> Result<Connected, Option<AvrError>> {
         changes,
         address,
         started,
+    })
+}
+
+/// An error if the receiver is not the one of the configuration. A receiver that gives neither id
+/// is used.
+fn other_receiver(cfg: &DeviceConfig, avr: &Avr) -> Option<AvrError> {
+    let info = avr.info();
+    let same = cfg.same_receiver(info.serial_number.as_deref(), info.mac_address.as_deref());
+    (same == Some(false)).then(|| {
+        AvrError::InvalidRequest(format!(
+            "another receiver answers at {}: serial {:?}, MAC {:?}",
+            info.host, info.serial_number, info.mac_address
+        ))
     })
 }
 
@@ -1182,6 +1233,9 @@ mod tests {
     fn test_cfg() -> DeviceConfig {
         DeviceConfig {
             id: "SERIAL0000001".into(),
+            id_kind: crate::config_store::IdKind::Serial,
+            serial: None,
+            mac: None,
             name: "AVR".into(),
             address: "192.0.2.1".into(),
             support_sound_mode: true,

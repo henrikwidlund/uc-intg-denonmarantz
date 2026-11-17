@@ -53,6 +53,8 @@ pub struct Found {
     name: String,
     model: String,
     serial: Option<String>,
+    /// 12 uppercase hexadecimal digits.
+    mac: Option<String>,
     is_denon: bool,
     is_dirac_supported: bool,
 }
@@ -68,6 +70,10 @@ impl Found {
                 .unwrap_or_else(|| receiver.host.clone()),
             model: receiver.model_name.clone().unwrap_or_default(),
             serial: receiver.serial_number.clone(),
+            mac: receiver
+                .mac_address
+                .as_deref()
+                .and_then(crate::config_store::mac_text),
             is_denon: receiver.brand != denon_marantz::Brand::Marantz,
             is_dirac_supported,
         }
@@ -79,7 +85,8 @@ impl Found {
             host: host.to_owned(),
             name: id.name.clone(),
             model: id.model.clone(),
-            serial: Some(id.id.clone()),
+            serial: id.serial.clone(),
+            mac: id.mac.clone(),
             is_denon: id.is_denon,
             is_dirac_supported: id.is_dirac_supported,
         }
@@ -581,9 +588,8 @@ impl Controller {
                     let found: Vec<Found> = found
                         .into_iter()
                         .filter(|f| {
-                            !f.serial
-                                .as_deref()
-                                .is_some_and(|serial| act.devices.contains_key(serial))
+                            act.find_device(f.serial.as_deref(), f.mac.as_deref())
+                                .is_none()
                         })
                         .collect();
                     if found.is_empty() {
@@ -618,16 +624,20 @@ impl Controller {
                             return;
                         }
                     };
-                    // The serial number is the id, as in the Python integration. An existing
-                    // receiver with it is updated.
+                    // A receiver that is configured already is updated: it keeps its id, which
+                    // can be the serial number of the Python integration.
                     // The fields that the driver does not use keep their values.
-                    let old = act.devices.get(identified.id.as_str()).map(|d| &d.cfg);
+                    let old =
+                        act.find_device(identified.serial.as_deref(), identified.mac.as_deref());
                     let cfg = DeviceConfig {
                         update_audyssey: old.is_some_and(|c| c.update_audyssey),
                         zone2: old.is_some_and(|c| c.zone2),
                         zone3: old.is_some_and(|c| c.zone3),
                         timeout: old.map_or(2000, |c| c.timeout),
-                        id: identified.id,
+                        id: old.map_or(identified.id, |c| c.id.clone()),
+                        id_kind: old.map_or(identified.id_kind, |c| c.id_kind),
+                        serial: identified.serial,
+                        mac: identified.mac,
                         name: identified.name,
                         address: found.host,
                         support_sound_mode: identified.support_sound_mode,
@@ -1177,7 +1187,7 @@ async fn find_receivers(address: Option<String>) -> Result<Vec<Found>, AvrError>
     if let Some(host) = address {
         let avr = discovery::identify(&host, None).await?;
         let id = discovery::Identified::new(&avr)
-            .ok_or_else(|| AvrError::InvalidRequest("the receiver has no serial number".into()))?;
+            .map_err(|reason| AvrError::InvalidRequest(format!("[{host}] not used: {reason}")))?;
         return Ok(vec![Found::from_identified(&host, &id)]);
     }
     let receivers = discovery::discover().await?;
@@ -1211,7 +1221,10 @@ async fn identify_host(host: &str) -> Result<discovery::Identified, IntegrationS
     let avr = discovery::identify(host, None)
         .await
         .map_err(|e| setup_error(&e))?;
-    discovery::Identified::new(&avr).ok_or(IntegrationSetupError::Other)
+    discovery::Identified::new(&avr).map_err(|reason| {
+        warn!("[{host}] not used: {reason}");
+        IntegrationSetupError::Other
+    })
 }
 
 /// Address of a setup page. An empty text is no address.
@@ -1759,6 +1772,109 @@ mod tests {
                 .expect("ok");
             wait_state(&events, "OK").await;
             assert_eq!(0, entity_ids(&controller).await.len());
+        }
+
+        /// The address of the fake receiver in the setup.
+        const FAKE_HOST: &str = "127.0.0.1";
+
+        /// A fake receiver at [`FAKE_HOST`]. Its telnet port does not answer.
+        async fn fake_receiver() -> crate::test_support::Fake {
+            let http = crate::test_support::Fake::start(true).await;
+            let port = http.port();
+            let setup: crate::device::discovery::TestBuilder =
+                std::rc::Rc::new(move |_, builder| {
+                    crate::test_support::test_builder(port, 1, builder)
+                });
+            crate::device::discovery::TEST_BUILDER.with(|slot| *slot.borrow_mut() = Some(setup));
+            http
+        }
+
+        /// Start the setup and give the address of the fake receiver. `reconfigure` keeps the
+        /// configured receivers.
+        async fn setup_fake(
+            controller: &Addr<Controller>,
+            events: &Mutex<Vec<Value>>,
+            reconfigure: bool,
+        ) {
+            controller
+                .send(start_setup("a", reconfigure))
+                .await
+                .expect("send")
+                .expect("setup started");
+            settle().await;
+            let first = if reconfigure {
+                ("action", "add")
+            } else {
+                ("restore_from_backup", "false")
+            };
+            controller
+                .send(values("a", &[first]))
+                .await
+                .expect("send")
+                .expect("ok");
+            settle().await;
+            controller
+                .send(values("a", &[("address", FAKE_HOST)]))
+                .await
+                .expect("send")
+                .expect("ok");
+            let end = std::time::Instant::now() + Duration::from_secs(5);
+            let address_page = |event: &Value| {
+                event["require_user_action"]["input"]["settings"][1]["id"] == "address"
+            };
+            while last(events)["state"] == "SETUP" || address_page(&last(events)) {
+                assert!(std::time::Instant::now() < end, "no answer to the address");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        fn config_file(name: &str) -> Value {
+            let dir = std::env::temp_dir().join(format!(
+                "uc-intg-denonmarantz-{name}-{}",
+                std::process::id()
+            ));
+            let text = std::fs::read_to_string(dir.join("config.json")).expect("config.json");
+            serde_json::from_str(&text).expect("json")
+        }
+
+        #[actix::test]
+        async fn a_new_receiver_gets_its_mac_address_as_id() {
+            let _fake = fake_receiver().await;
+            let controller = controller("mac-id", None);
+            let events = connect(&controller, "a").await;
+            setup_fake(&controller, &events, false).await;
+            controller
+                .send(values(
+                    "a",
+                    &[("choice", FAKE_HOST), ("connection_mode", "use_http")],
+                ))
+                .await
+                .expect("send")
+                .expect("ok");
+            wait_state(&events, "OK").await;
+            let device = &config_file("mac-id")[0];
+            assert_eq!(json!("0123456789AB"), device["id"]);
+            assert_eq!(json!("mac"), device["id_kind"]);
+            assert_eq!(json!("0123456789AB"), device["mac"]);
+            assert_eq!(json!("XXX"), device["serial"]);
+            assert!(
+                entity_ids(&controller)
+                    .await
+                    .iter()
+                    .any(|id| id == "media_player.0123456789AB")
+            );
+        }
+
+        #[actix::test]
+        async fn a_receiver_of_a_python_configuration_is_not_offered_again() {
+            let _fake = fake_receiver().await;
+            // The serial number of the fake receiver is the id.
+            let config = PYTHON_CONFIG.replace("SERIAL0000001", "XXX");
+            let controller = controller("known-serial", Some(&config));
+            let events = connect(&controller, "a").await;
+            setup_fake(&controller, &events, true).await;
+            wait_state(&events, "ERROR").await;
+            assert_eq!(json!("NOT_FOUND"), last(&events)["error"]);
         }
     }
 }

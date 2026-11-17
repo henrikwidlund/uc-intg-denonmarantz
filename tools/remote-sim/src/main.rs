@@ -90,7 +90,7 @@ pub struct Ctx {
     pub driver: Driver,
     /// A second connection to the receiver, for the values that it has.
     pub oracle: Option<oracle::Oracle>,
-    /// Device key: the serial number of the receiver.
+    /// Device key: the MAC address or serial number of the receiver.
     pub key: String,
     /// The receiver was on at the start.
     pub was_on: bool,

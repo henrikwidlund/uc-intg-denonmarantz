@@ -13,6 +13,9 @@ use serde_json::{Map, Value, json};
 fn cfg() -> DeviceConfig {
     DeviceConfig {
         id: "SERIAL0000001".into(),
+        id_kind: crate::config_store::IdKind::Serial,
+        serial: None,
+        mac: None,
         name: "AVR".into(),
         address: "127.0.0.1".into(),
         support_sound_mode: true,

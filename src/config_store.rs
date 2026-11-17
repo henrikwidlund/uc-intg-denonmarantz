@@ -30,8 +30,31 @@ const SETTINGS_FILE: &str = "settings.json";
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeviceConfig {
-    /// Serial number of the receiver. It is also the device key of the entity ids.
+    /// MAC address or serial number of the receiver, see `id_kind`. It is also the device key of
+    /// the entity ids.
     pub id: String,
+    /// What `id` is. Missing in older files: then it is the serial number. It is not written for
+    /// the serial number, so a file of the Python integration stays the same.
+    #[serde(
+        default,
+        skip_serializing_if = "IdKind::is_serial",
+        deserialize_with = "serial_if_unknown"
+    )]
+    pub id_kind: IdKind,
+    /// Serial number of the receiver, if known.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "none_if_empty"
+    )]
+    pub serial: Option<String>,
+    /// MAC address of the receiver as 12 uppercase hexadecimal digits, if known.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "mac_if_valid"
+    )]
+    pub mac: Option<String>,
     pub name: String,
     /// IP address or host name.
     pub address: String,
@@ -108,6 +131,24 @@ pub struct DeviceConfig {
     pub listed_queries: Option<HttpQueries>,
 }
 
+/// What the id of a receiver is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdKind {
+    /// The serial number. Old receivers give only this.
+    #[default]
+    Serial,
+    /// The MAC address.
+    Mac,
+}
+
+impl IdKind {
+    #[allow(clippy::trivially_copy_pass_by_ref)] // The signature that serde needs.
+    const fn is_serial(&self) -> bool {
+        matches!(self, Self::Serial)
+    }
+}
+
 /// The `AppCommand` queries that the receiver lists in `Deviceinfo.xml`.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -153,6 +194,47 @@ impl DeviceConfig {
     /// Key for the entity ids.
     pub fn key(&self) -> &str {
         &self.id
+    }
+
+    /// The serial number: the stored one, or the id if it is the serial number.
+    pub fn serial(&self) -> Option<&str> {
+        match self.id_kind {
+            IdKind::Serial => Some(&self.id),
+            IdKind::Mac => self.serial.as_deref(),
+        }
+    }
+
+    /// The MAC address: the stored one, or the id if it is the MAC address.
+    pub fn mac(&self) -> Option<&str> {
+        match self.id_kind {
+            IdKind::Mac => Some(&self.id),
+            IdKind::Serial => self.mac.as_deref(),
+        }
+    }
+
+    /// Whether a receiver with this serial number and MAC address is this one. The MAC address is
+    /// compared if both are known, else the serial number. `None` if neither can be compared.
+    pub fn same_receiver(&self, serial: Option<&str>, mac: Option<&str>) -> Option<bool> {
+        if let (Some(a), Some(b)) = (self.mac().and_then(parse_mac), mac.and_then(parse_mac)) {
+            return Some(a == b);
+        }
+        if let (Some(a), Some(b)) = (self.serial(), serial) {
+            return Some(a == b);
+        }
+        None
+    }
+
+    /// Store the serial number and the MAC address if they are not stored yet. Returns true if one
+    /// was added.
+    pub fn add_ids(&mut self, serial: Option<&str>, mac: Option<&str>) -> bool {
+        let before = (self.serial.is_some(), self.mac.is_some());
+        if self.serial.is_none() {
+            self.serial = serial.filter(|s| !s.is_empty()).map(str::to_owned);
+        }
+        if self.mac.is_none() {
+            self.mac = mac.and_then(mac_text);
+        }
+        before != (self.serial.is_some(), self.mac.is_some())
     }
 
     pub const fn has_dirac(&self) -> bool {
@@ -247,6 +329,44 @@ fn none_if_unknown<'de, D: Deserializer<'de>, T: DeserializeOwned>(
 ) -> Result<Option<T>, D::Error> {
     let value = Option::<serde_json::Value>::deserialize(d)?;
     Ok(value.and_then(|v| T::deserialize(v).ok()))
+}
+
+/// The 12 hexadecimal digits of a MAC address in uppercase. `:` and `-` between them are removed.
+/// `None` if the text is not a MAC address.
+pub fn parse_mac(text: &str) -> Option<[u8; 12]> {
+    let mut digits = [0; 12];
+    let mut count = 0;
+    for b in text.bytes() {
+        match b {
+            b':' | b'-' => {}
+            _ if b.is_ascii_hexdigit() && count < digits.len() => {
+                digits[count] = b.to_ascii_uppercase();
+                count += 1;
+            }
+            _ => return None,
+        }
+    }
+    (count == digits.len()).then_some(digits)
+}
+
+/// A MAC address in the form of the configuration: 12 uppercase hexadecimal digits.
+pub fn mac_text(text: &str) -> Option<String> {
+    let digits = parse_mac(text)?;
+    std::str::from_utf8(&digits).ok().map(str::to_owned)
+}
+
+/// An unknown id kind reads as the serial number, as in files that do not have it.
+fn serial_if_unknown<'de, D: Deserializer<'de>>(d: D) -> Result<IdKind, D::Error> {
+    Ok(none_if_unknown(d)?.unwrap_or_default())
+}
+
+fn none_if_empty<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.filter(|s| !s.is_empty()))
+}
+
+/// A value that is not a MAC address reads as `None`.
+fn mac_if_valid<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.and_then(|m| mac_text(&m)))
 }
 
 fn timeout_if_null<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
@@ -598,6 +718,9 @@ mod tests {
     fn device() -> DeviceConfig {
         DeviceConfig {
             id: "SERIAL-1".into(),
+            id_kind: IdKind::Serial,
+            serial: None,
+            mac: None,
             name: "Living Room".into(),
             address: "192.0.2.10".into(),
             support_sound_mode: true,
@@ -636,6 +759,72 @@ mod tests {
         let python: serde_json::Value = serde_json::from_str(PYTHON_CONFIG).expect("json");
         let ours: serde_json::Value = serde_json::from_str(&text).expect("json");
         assert_eq!(python, ours);
+    }
+
+    #[test]
+    fn the_ids_are_read_and_written() {
+        let python: Vec<DeviceConfig> = serde_json::from_str(PYTHON_CONFIG).expect("json");
+        let d = &python[0];
+        assert_eq!(IdKind::Serial, d.id_kind);
+        assert_eq!((Some("SERIAL0000001"), None), (d.serial(), d.mac()));
+
+        let text = r#"{"id": "0123456789AB", "id_kind": "mac", "serial": "S1", "mac": "01:23:45:67:89:ab", "name": "N", "address": "a"}"#;
+        let d: DeviceConfig = serde_json::from_str(text).expect("json");
+        assert_eq!(IdKind::Mac, d.id_kind);
+        assert_eq!((Some("S1"), Some("0123456789AB")), (d.serial(), d.mac()));
+        let again: DeviceConfig =
+            serde_json::from_str(&serde_json::to_string(&d).expect("json")).expect("json");
+        assert_eq!(d, again);
+
+        // A kind that this version does not know is the serial number. Empty ids are none.
+        let text = r#"{"id": "S1", "id_kind": "other", "serial": "", "mac": null, "name": "N", "address": "a"}"#;
+        let d: DeviceConfig = serde_json::from_str(text).expect("json");
+        assert_eq!((IdKind::Serial, None, None), (d.id_kind, d.serial, d.mac));
+    }
+
+    #[test]
+    fn mac_addresses_are_read_with_or_without_separators() {
+        let digits = Some(*b"0123456789AB");
+        assert_eq!(digits, parse_mac("0123456789ab"));
+        assert_eq!(digits, parse_mac("01:23:45:67:89:AB"));
+        assert_eq!(digits, parse_mac("01-23-45-67-89-ab"));
+        for bad in [
+            "",
+            "0123456789A",
+            "0123456789ABC",
+            "0123456789AG",
+            "01 23 45 67 89 AB",
+        ] {
+            assert_eq!(None, parse_mac(bad), "{bad}");
+        }
+        assert_eq!(
+            Some("0123456789AB".to_owned()),
+            mac_text("01:23:45:67:89:ab")
+        );
+    }
+
+    #[test]
+    fn the_same_receiver_is_found_by_the_mac_address_first() {
+        let mut d = device();
+        // The id is the serial number, no MAC address is stored.
+        assert_eq!(Some(true), d.same_receiver(Some("SERIAL-1"), None));
+        assert_eq!(
+            Some(false),
+            d.same_receiver(Some("OTHER"), Some("0123456789AB"))
+        );
+        assert_eq!(None, d.same_receiver(None, Some("0123456789AB")));
+
+        assert!(d.add_ids(Some("SERIAL-1"), Some("0123456789ab")));
+        assert!(!d.add_ids(Some("OTHER"), Some("AABBCCDDEEFF")));
+        assert_eq!(Some("0123456789AB"), d.mac());
+        // Both MAC addresses are known: the serial number is not compared.
+        assert_eq!(Some(true), d.same_receiver(None, Some("0123456789ab")));
+        assert_eq!(
+            Some(false),
+            d.same_receiver(Some("SERIAL-1"), Some("AABBCCDDEEFF"))
+        );
+        assert_eq!(Some(true), d.same_receiver(Some("SERIAL-1"), None));
+        assert_eq!(None, d.same_receiver(None, None));
     }
 
     #[test]
