@@ -3,12 +3,14 @@
 
 //! Actor for one receiver: connection, state updates and commands.
 
-use crate::config_store::{self, DeviceConfig};
+use crate::config_store::{CommApiVersion, DeviceConfig};
 use crate::device::commands::{self, Expected};
 use crate::device::{
     Command, Connect, DeviceEvent, DeviceStatus, Disconnect, Stop, UpdateConfig, discovery, heos,
 };
-use crate::entities::{self, EntityKind, SensorKind, View, media_player, remote, select};
+use crate::entities::{
+    self, EntityKind, SelectKind, SensorKind, View, media_player, remote, select,
+};
 use crate::errors::ServiceError;
 use actix::prelude::*;
 use denon_marantz::{
@@ -237,6 +239,9 @@ pub struct DenonActor {
     dirty_full: bool,
     /// The entities that show the changed settings, as bits of `part_bit`.
     dirty_part: u8,
+    /// The network favorite and tuner preset selects must be sent at the next emit. They have up
+    /// to 56 options each, so they are built only when these change.
+    dirty_labels: bool,
     /// A read of the values that depend on the speaker preset and the filter is planned.
     reload_due: bool,
     /// The reasons to read values again, as bits of `RELOAD_QUERIES`.
@@ -305,6 +310,7 @@ impl DenonActor {
             emit_due: false,
             dirty_full: true,
             dirty_part: 0,
+            dirty_labels: true,
             reload_due: false,
             reload_parts: 0,
             paused: false,
@@ -318,9 +324,16 @@ impl DenonActor {
 
     /// Send the attributes of all entities to the controller. It sends only the changed ones on.
     fn emit(&mut self) {
+        self.dirty_labels = true;
+        self.emit_changed();
+    }
+
+    /// Send the attributes of all entities, but the selects with many options only if they changed.
+    fn emit_changed(&mut self) {
         self.dirty_full = false;
         self.dirty_part = 0;
-        self.emit_kinds(|_| true);
+        let labels = std::mem::take(&mut self.dirty_labels);
+        self.emit_kinds(|kind| labels || !has_many_options(kind));
     }
 
     /// Send the attributes of the entities that `keep` takes.
@@ -388,7 +401,7 @@ impl DenonActor {
     /// builds only the entities that show them: this is most of the events.
     fn flush_emit(&mut self) {
         if self.dirty_full || self.dirty_part == 0 {
-            self.emit();
+            self.emit_changed();
             return;
         }
         let part = std::mem::take(&mut self.dirty_part);
@@ -436,6 +449,7 @@ impl DenonActor {
     /// Send all entities soon.
     fn schedule_emit(&mut self, ctx: &mut Context<Self>) {
         self.dirty_full = true;
+        self.dirty_labels = true;
         self.arm_emit(ctx);
     }
 
@@ -444,6 +458,9 @@ impl DenonActor {
         match setting_parts(setting) {
             Some(part) => self.dirty_part |= part,
             None => self.dirty_full = true,
+        }
+        if matches!(setting, Setting::Tuner | Setting::NetworkPresetNames) {
+            self.dirty_labels = true;
         }
         self.arm_emit(ctx);
     }
@@ -593,7 +610,9 @@ impl DenonActor {
                 discovery::after_start(
                     avr.clone(),
                     started,
-                    self.cfg.use_telnet,
+                    self.cfg
+                        .use_telnet
+                        .then(|| discovery::ExtraReads::new(&self.cfg)),
                     self.cfg.name.clone(),
                     self.page_retry_delay,
                     {
@@ -626,13 +645,12 @@ impl DenonActor {
         self.avr = Some(avr);
         self.set_status(DeviceStatus::Connected);
         self.emit();
-        self.connect_heos(version, ctx);
+        self.connect_heos(ctx);
     }
 
-    /// Connect to the HEOS player of the receiver, if it has one or if that is not known yet. The
-    /// oldest receivers are not asked: they came before HEOS. A configuration without the value
-    /// gets it.
-    fn connect_heos(&mut self, version: u64, ctx: &mut Context<Self>) {
+    /// Connect to the HEOS player of the receiver, if it has one (`CommApiVers` 0301 or higher) or
+    /// if that is not known. The oldest receivers are not asked: they came before HEOS.
+    fn connect_heos(&mut self, ctx: &mut Context<Self>) {
         let Some(avr) = &self.avr else { return };
         let host = &avr.info().host;
         if self.heos_host.as_ref().is_some_and(|h| h != host) {
@@ -645,13 +663,16 @@ impl DenonActor {
         }
         let Some(avr) = &self.avr else { return };
         let info = avr.info();
-        let wanted = self
-            .cfg
-            .heos
-            .unwrap_or(info.receiver_type != ReceiverType::Avr);
-        if !wanted {
+        // HEOS is known from `CommApiVers`. Without it, all but the oldest receivers are tried.
+        let heos_known = info
+            .comm_api_version
+            .as_deref()
+            .and_then(CommApiVersion::parse)
+            .and_then(CommApiVersion::heos);
+        if !heos_known.unwrap_or(info.receiver_type != ReceiverType::Avr) {
             return;
         }
+        let known = heos_known.is_some();
         let host = info.host.clone();
         self.heos_host = Some(host.clone());
         let generation = self.heos_generation;
@@ -671,20 +692,13 @@ impl DenonActor {
                     }
                     act.timers.heos = None;
                     match result {
-                        Ok(heos::Connected::Player(link)) => {
-                            act.save_heos(true, version);
-                            act.use_heos(link, ctx);
-                        }
-                        // HEOS answers: the receiver has it.
-                        Ok(heos::Connected::NoPlayer(heos)) => {
-                            act.save_heos(true, version);
-                            act.wait_for_player(heos, ctx);
-                        }
-                        Err(e) if act.cfg.heos.is_none() => {
+                        Ok(heos::Connected::Player(link)) => act.use_heos(link, ctx),
+                        Ok(heos::Connected::NoPlayer(heos)) => act.wait_for_player(heos, ctx),
+                        // Not known if the receiver has HEOS: asked again at the next connect.
+                        Err(e) if !known => {
                             if heos::is_absent(&e) {
-                                act.save_heos(false, version);
+                                debug!("[{}] no HEOS", act.cfg.name);
                             } else {
-                                // Not known: asked again at the next connect to the receiver.
                                 act.warn_heos(&e);
                             }
                         }
@@ -695,7 +709,7 @@ impl DenonActor {
                             act.timers.heos = Some(ctx.run_later(wait, move |act, ctx| {
                                 act.timers.heos = None;
                                 if act.heos_generation == generation {
-                                    act.connect_heos(version, ctx);
+                                    act.connect_heos(ctx);
                                 }
                             }));
                         }
@@ -878,14 +892,15 @@ impl DenonActor {
         ))
     }
 
-    /// Store whether the receiver has HEOS, if the configuration does not have it yet. The
-    /// controller saves it. A new value changes the features of the media player.
-    fn save_heos(&mut self, found: bool, version: u64) {
-        if self.cfg_version != version || self.cfg.heos.is_some() {
+    /// Store the form of the tuner presets when the receiver shows a new one. The controller saves
+    /// it. A new connection does not know the form until the receiver reports a preset.
+    fn save_preset_form(&mut self) {
+        let Some(avr) = &self.avr else { return };
+        let lettered = avr.state().borrow().device().tuner.presets_lettered;
+        if lettered.is_none() || lettered == self.cfg.tuner_presets_lettered {
             return;
         }
-        info!("[{}] HEOS: {found}", self.cfg.name);
-        self.cfg.heos = Some(found);
+        self.cfg.tuner_presets_lettered = lettered;
         self.controller.do_send(DeviceEvent::Config {
             key: self.key.clone(),
             cfg: Box::new(self.cfg.clone()),
@@ -903,10 +918,7 @@ impl DenonActor {
         if self.cfg_version != version {
             return;
         }
-        let kind = config_store::ReceiverKind {
-            heos: self.cfg.heos,
-            ..discovery::receiver_kind(info)
-        };
+        let kind = discovery::receiver_kind(info);
         let new_kind = info.type_proof.is_proven() && kind != self.cfg.kind();
         if !info.type_proof.is_proven() {
             debug!(
@@ -1452,6 +1464,15 @@ const fn part_bit(kind: EntityKind) -> u8 {
     }
 }
 
+/// The selects with many options: they change only with `Setting::Tuner` or
+/// `Setting::NetworkPresetNames`.
+const fn has_many_options(kind: EntityKind) -> bool {
+    matches!(
+        kind,
+        EntityKind::Select(SelectKind::NetworkFavorite | SelectKind::TunerPreset)
+    )
+}
+
 /// The attributes of the entities that `keep` takes.
 fn build_changes(
     view: &View<'_>,
@@ -1551,6 +1572,9 @@ impl Handler<Changed> for DenonActor {
             if change.setting == Setting::SoundModes {
                 self.sound_mode = None;
             }
+            if change.setting == Setting::Tuner {
+                self.save_preset_form();
+            }
             self.schedule_emit_for(change.setting, ctx);
         } else {
             // Changes were lost.
@@ -1614,12 +1638,13 @@ impl Handler<LinkChanged> for DenonActor {
         {
             self.refreshing = true;
             let generation = self.generation;
+            let reads = discovery::ExtraReads::new(&self.cfg);
             ctx.spawn(
                 async move {
                     if let Err(e) = avr.update().await {
                         debug!("read after reconnect failed: {e}");
                     }
-                    discovery::read_extra_values(&avr).await;
+                    discovery::read_extra_values(&avr, reads).await;
                 }
                 .into_actor(self)
                 .map(move |(), act, _| {
@@ -1995,7 +2020,7 @@ mod tests {
     fn test_cfg() -> DeviceConfig {
         DeviceConfig {
             id: "SERIAL0000001".into(),
-            id_kind: config_store::IdKind::Serial,
+            id_kind: crate::config_store::IdKind::Serial,
             serial: None,
             mac: None,
             name: "AVR".into(),
@@ -2016,7 +2041,9 @@ mod tests {
             hdmi_output_over_http: None,
             quick_select_count: None,
             listed_queries: None,
-            heos: None,
+            comm_api_version: None,
+            has_tuner: None,
+            tuner_presets_lettered: None,
             info: None,
         }
     }

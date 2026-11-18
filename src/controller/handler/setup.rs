@@ -7,7 +7,7 @@
 use crate::config_store::{DeviceConfig, DriverSettings, SaveWait, backup_json, parse_backup};
 use crate::controller::handler::AbortDriverSetup;
 use crate::controller::{Controller, operation_mode};
-use crate::device::{UpdateConfig, discovery, heos};
+use crate::device::{UpdateConfig, discovery};
 use crate::entities::EntityKind;
 use crate::errors::ServiceError;
 use crate::logging;
@@ -625,7 +625,9 @@ impl Controller {
                         hdmi_output_over_http: identified.kind.hdmi_output_over_http,
                         quick_select_count: identified.kind.quick_select_count,
                         listed_queries: identified.kind.listed_queries,
-                        heos: identified.kind.heos,
+                        comm_api_version: identified.kind.comm_api_version,
+                        has_tuner: identified.kind.has_tuner,
+                        tuner_presets_lettered: old.and_then(|c| c.tuner_presets_lettered),
                         info: Some(identified.info),
                     };
                     if let Some(device) = act.devices.get_mut(cfg.key()) {
@@ -1190,28 +1192,15 @@ async fn detect_dirac_opt(host: &str) -> Option<bool> {
     Some(avr.info().dirac_live)
 }
 
-/// Longest wait for the HEOS check of the setup.
-const HEOS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// Read the id and the name of the receiver at an address.
 async fn identify_host(host: &str) -> Result<discovery::Identified, IntegrationSetupError> {
     let avr = discovery::identify(host, None)
         .await
         .map_err(|e| setup_error(&e))?;
-    let mut identified = discovery::Identified::new(&avr).map_err(|reason| {
+    discovery::Identified::new(&avr).map_err(|reason| {
         warn!("[{host}] not used: {reason}");
         IntegrationSetupError::Other
-    })?;
-    // A slow HEOS port must not hold up the setup: the first connect checks it again.
-    identified.kind.heos = tokio::time::timeout(
-        HEOS_PROBE_TIMEOUT,
-        heos::probe(host, identified.kind.receiver_type),
-    )
-    .await
-    .ok()
-    .flatten();
-    info!("[{host}] HEOS: {:?}", identified.kind.heos);
-    Ok(identified)
+    })
 }
 
 /// Address of a setup page. An empty text is no address.
@@ -1446,8 +1435,10 @@ mod tests {
             connect(&controller, "a").await;
             let ids = entity_ids(&controller).await;
             // The 42 entities of the Python integration (media player, remote, 11 selects and 29
-            // sensors), and 13 more: 4 selects, 6 switches, 2 numbers and 1 sensor.
-            assert_eq!(55, ids.len());
+            // sensors), and 27 more: 6 selects, 6 switches, 2 numbers and 13 sensors. Before the
+            // first connect `CommApiVers` and the tuner are not known, so the 12 sensors of older
+            // receivers and the network favorite and tuner preset selects are there too.
+            assert_eq!(69, ids.len());
             for id in [
                 "media_player.SERIAL0000001",
                 "remote.SERIAL0000001",
@@ -1589,7 +1580,7 @@ mod tests {
                 .expect("send")
                 .expect("ok");
             wait_state(&events, "OK").await;
-            assert_eq!(55, entity_ids(&controller).await.len());
+            assert_eq!(69, entity_ids(&controller).await.len());
         }
 
         /// The states that a Remote gets when it asks for them.
@@ -1621,7 +1612,7 @@ mod tests {
             let controller = controller("purge", Some(PYTHON_CONFIG));
             let events = connect(&controller, "a").await;
             settle().await;
-            assert_eq!(55, entity_states(&controller).await.len());
+            assert_eq!(69, entity_states(&controller).await.len());
             controller
                 .send(start_setup("a", true))
                 .await

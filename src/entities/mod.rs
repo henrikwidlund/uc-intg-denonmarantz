@@ -74,16 +74,15 @@ pub enum SelectKind {
     QuickSelect,
     TunerBand,
     BluetoothOutput,
+    NetworkFavorite,
+    TunerPreset,
 }
 
 #[cfg(test)]
 impl SelectKind {
     /// The Python integration has this select.
     pub const fn python(self) -> bool {
-        !matches!(
-            self,
-            Self::MultiEq | Self::QuickSelect | Self::TunerBand | Self::BluetoothOutput
-        )
+        (self as u8) < (Self::MultiEq as u8)
     }
 }
 
@@ -151,13 +150,25 @@ pub enum SensorKind {
     DigitalCodec,
     // Not in the Python integration.
     DiracFilter,
+    ProLogicMode,
+    SurroundBackMode,
+    FrontHeight,
+    DynamicCompression,
+    AutoFlagDetect,
+    DialogLevelAdjust,
+    DialogLevel,
+    AudysseyDsx,
+    StageWidth,
+    StageHeight,
+    HeightGain,
+    InstaPrevue,
 }
 
 #[cfg(test)]
 impl SensorKind {
     /// The Python integration has this sensor.
     pub const fn python(self) -> bool {
-        !matches!(self, Self::DiracFilter)
+        (self as u8) < (Self::DiracFilter as u8)
     }
 }
 
@@ -373,7 +384,9 @@ pub(crate) mod tests {
             hdmi_output_over_http: None,
             quick_select_count: None,
             listed_queries: None,
-            heos: None,
+            comm_api_version: None,
+            has_tuner: None,
+            tuner_presets_lettered: None,
             info: None,
         }
     }
@@ -397,6 +410,31 @@ pub(crate) mod tests {
         assert_eq!((11, 29), count(&cfg(true, true)));
         assert_eq!((10, 29), count(&cfg(true, false)));
         assert_eq!((6, 7), count(&cfg(false, true)));
+    }
+
+    #[test]
+    fn sensors_of_older_receivers_follow_the_generation() {
+        use crate::config_store::CommApiVersion;
+        let sensors = |is_denon: bool, use_telnet: bool, version: &str| {
+            let c = DeviceConfig {
+                comm_api_version: CommApiVersion::parse(version),
+                is_denon,
+                ..cfg(use_telnet, true)
+            };
+            EntityKind::all(&c)
+                .filter_map(|k| match k {
+                    EntityKind::Sensor(s) if !s.python() && s != SensorKind::DiracFilter => Some(s),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(Vec::<SensorKind>::new(), sensors(true, true, "0301"));
+        assert_eq!(vec![SensorKind::FrontHeight], sensors(false, true, "0301"));
+        assert_eq!(Vec::<SensorKind>::new(), sensors(true, false, "0300"));
+        let denon_2015 = sensors(true, true, "0300");
+        assert!(denon_2015.contains(&SensorKind::DialogLevel));
+        assert!(!denon_2015.contains(&SensorKind::SurroundBackMode));
+        assert_eq!(12, sensors(true, true, "none").len());
     }
 
     #[test]

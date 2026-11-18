@@ -35,7 +35,9 @@ fn cfg() -> DeviceConfig {
         hdmi_output_over_http: None,
         quick_select_count: None,
         listed_queries: None,
-        heos: None,
+        comm_api_version: None,
+        has_tuner: None,
+        tuner_presets_lettered: None,
         info: None,
     }
 }

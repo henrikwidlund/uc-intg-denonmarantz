@@ -3,11 +3,12 @@
 
 //! Find receivers on the network and connect to them.
 
-use crate::config_store::{self, DeviceConfig};
+use crate::config_store::{self, DeviceConfig, Feature, Generation};
+use denon_marantz::proto::NetworkAudioCommand;
 use denon_marantz::{
-    Ask, Avr, AvrBuilder, Brand, DiscoveredReceiver, DiscoveryConfig, Error, HttpConfig, Info,
-    InfoCheck, PageStatus, Query, QueryGroup, ReceiverType, StartOptions, StartReport, Started,
-    TelnetSync, UpdateMethod, discover_all,
+    Ask, Avr, AvrBuilder, Brand, Command, DiscoveredReceiver, DiscoveryConfig, Error, HttpConfig,
+    Info, InfoCheck, PageStatus, Query, QueryGroup, ReceiverType, StartOptions, StartReport,
+    Started, TelnetSync, TunerInfo, UpdateMethod, Zone, discover_all,
 };
 use log::debug;
 use std::sync::Arc;
@@ -364,11 +365,75 @@ const EXTRA_QUERIES: [Query; 12] = [
     Query::PictureMode,
 ];
 
-/// Queue the extra values. It does not wait for the answers.
-pub async fn read_extra_values(avr: &Avr) {
-    let asks = EXTRA_QUERIES.map(Ask::from);
+/// The values of older receivers, with the feature that they need.
+const OLDER_QUERIES: [(Feature, Query); 10] = [
+    (Feature::ProLogicMode, Query::ProLogicMode),
+    (Feature::SurroundBackMode, Query::SurroundBackMode),
+    (Feature::DynamicCompression, Query::DynamicCompression),
+    (Feature::AutoFlagDetect, Query::AutoFlagDetect),
+    (Feature::DialogLevel, Query::DialogLevel),
+    (Feature::AudysseyDsx, Query::AudysseyDsx),
+    (Feature::AudysseyDsx, Query::StageWidth),
+    (Feature::AudysseyDsx, Query::StageHeight),
+    (Feature::HeightGain, Query::HeightGain),
+    (Feature::InstaPrevue, Query::InstaPrevue),
+];
+
+/// What the receiver of a configuration has of the values of older receivers.
+#[derive(Debug, Clone, Copy)]
+pub struct ExtraReads {
+    older: [bool; OLDER_QUERIES.len()],
+    /// The names of the network favorites.
+    favorites: bool,
+    /// The tuner presets.
+    tuner_presets: bool,
+}
+
+impl ExtraReads {
+    pub const fn new(cfg: &DeviceConfig) -> Self {
+        let mut older = [false; OLDER_QUERIES.len()];
+        let mut i = 0;
+        while i < older.len() {
+            older[i] = cfg.offers(OLDER_QUERIES[i].0);
+            i += 1;
+        }
+        Self {
+            older,
+            favorites: cfg.offers(Feature::NetworkAudio),
+            // `OPTPN` is in no spec. It is not sent to HEOS models until it is tested on one.
+            tuner_presets: !matches!(cfg.has_tuner, Some(false))
+                && !matches!(cfg.generation(), Generation::Current),
+        }
+    }
+}
+
+/// Queue the extra values, the values of older receivers that the receiver may have, and the
+/// names of the network favorites and tuner presets. It does not wait for the answers.
+pub async fn read_extra_values(avr: &Avr, reads: ExtraReads) {
+    let brand = avr.info().brand;
+    let older = OLDER_QUERIES
+        .iter()
+        .zip(reads.older)
+        .filter(|((_, query), wanted)| *wanted && query.text(brand).is_some())
+        .map(|((_, query), _)| *query);
+    let asks: Vec<Ask<'_>> = EXTRA_QUERIES
+        .into_iter()
+        .chain(older)
+        .map(Ask::from)
+        .collect();
     if let Err(e) = avr.telnet_ask(&asks).await {
         debug!("extra values not read: {e}");
+    }
+    if reads.favorites {
+        let names = Command::NetworkAudio(NetworkAudioCommand::PresetNames);
+        if let Err(e) = avr.send(Zone::Main, names).await {
+            debug!("network favorites not read: {e}");
+        }
+    }
+    if reads.tuner_presets
+        && let Err(e) = avr.tuner().request_presets().await
+    {
+        debug!("tuner presets not read: {e}");
     }
 }
 
@@ -393,15 +458,15 @@ fn toggles_missing(avr: &Avr) -> bool {
 pub async fn after_start(
     avr: Arc<Avr>,
     mut started: Started,
-    telnet: bool,
+    telnet: Option<ExtraReads>,
     name: String,
     delay: Duration,
     changed: impl FnOnce(Info),
     synced: impl FnOnce(),
 ) {
     // The extra values are queued before the wait: it covers the queries that wait at the call.
-    if telnet {
-        read_extra_values(&avr).await;
+    if let Some(reads) = telnet {
+        read_extra_values(&avr, reads).await;
     }
     match started.info_check().await {
         InfoCheck::Changed(info) => changed(Info::clone(info)),
@@ -409,7 +474,7 @@ pub async fn after_start(
         _ => {}
     }
     // With HTTP only, a page read could delay a command: the pages are not read again.
-    if !telnet {
+    if telnet.is_none() {
         return;
     }
     let report = started.all_synced().await;
@@ -542,27 +607,48 @@ pub fn mac_address(info: &Info) -> Option<String> {
     info.mac_address.as_deref().and_then(config_store::mac_text)
 }
 
+/// Read the names of the network favorites or tuner presets again after a raw command that saves
+/// one (`NSC01`, `TPANMEM01`). The receiver does not send the new name by itself.
+pub async fn read_names_after_save(avr: &Avr, reads: ExtraReads, text: &str) {
+    let text = text.trim_start();
+    if reads.favorites && text.starts_with("NSC") {
+        let names = Command::NetworkAudio(NetworkAudioCommand::PresetNames);
+        if let Err(e) = avr.send(Zone::Main, names).await {
+            debug!("network favorites not read: {e}");
+        }
+    } else if reads.tuner_presets
+        && text.starts_with("TPANMEM")
+        && let Err(e) = avr.tuner().request_presets().await
+    {
+        debug!("tuner presets not read: {e}");
+    }
+}
+
 /// What the configuration keeps of the receiver.
-pub const fn receiver_kind(info: &Info) -> config_store::ReceiverKind {
+pub fn receiver_kind(info: &Info) -> config_store::ReceiverKind {
     config_store::ReceiverKind {
         receiver_type: receiver_type(info),
         update_method: update_method(info),
         hdmi_output_over_http: Some(info.hdmi_output_over_http),
         quick_select_count: info.quick_select_count,
-        listed_queries: match &info.queries {
-            Some(q) => Some(config_store::HttpQueries {
-                tone_control: q.tone_control,
-                audyssey: q.audyssey,
-                video_info: q.video_info,
-                audio_info: q.audio_info,
-                input_signal: q.input_signal,
-                active_speaker: q.active_speaker,
-                output_settings: q.output_settings,
-            }),
-            None => None,
+        listed_queries: info.queries.as_ref().map(|q| config_store::HttpQueries {
+            tone_control: q.tone_control,
+            audyssey: q.audyssey,
+            video_info: q.video_info,
+            audio_info: q.audio_info,
+            input_signal: q.input_signal,
+            active_speaker: q.active_speaker,
+            output_settings: q.output_settings,
+        }),
+        comm_api_version: info.comm_api_version.as_deref().map_or(
+            Some(config_store::CommApiVersion::MISSING),
+            config_store::CommApiVersion::parse,
+        ),
+        has_tuner: match info.tuner {
+            TunerInfo::Present(_) => Some(true),
+            TunerInfo::Absent => Some(false),
+            _ => None,
         },
-        // HEOS is not in `Info`: `heos::probe` finds it.
-        heos: None,
     }
 }
 

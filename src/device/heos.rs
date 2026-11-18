@@ -4,7 +4,6 @@
 //! HEOS player of a receiver: what plays on network audio, and play, pause, stop, next and
 //! previous for it. Volume and mute are not in HEOS: the zones share its volume.
 
-use crate::config_store::ReceiverGeneration;
 use crate::device::discovery::NETWORK_RETRY_INTERVAL;
 use crate::errors::ServiceError;
 use denon_marantz_heos::{
@@ -166,23 +165,6 @@ pub async fn find(heos: Arc<Heos>) -> Result<Link, Arc<Heos>> {
     Ok(Link { heos, pid, players })
 }
 
-/// Whether the receiver has HEOS. A receiver that answers on the HEOS port has it, also if its
-/// player is not in the HEOS list yet. `None` if it is not known: HEOS did not answer, but did not
-/// refuse either. The oldest receivers are not asked: they came before HEOS.
-pub async fn probe(host: &str, receiver_type: Option<ReceiverGeneration>) -> Option<bool> {
-    if receiver_type == Some(ReceiverGeneration::Avr) {
-        return Some(false);
-    }
-    match connect(host).await {
-        Ok(_) => Some(true),
-        Err(e) if is_absent(&e) => Some(false),
-        Err(e) => {
-            debug!("[{host}] HEOS not checked: {e}");
-            None
-        }
-    }
-}
-
 /// The receiver refuses the HEOS port: it has no HEOS.
 pub fn is_absent(error: &Error) -> bool {
     matches!(error, Error::Network { source, .. } if source.kind() == ErrorKind::ConnectionRefused)
@@ -233,48 +215,6 @@ mod tests {
 
     fn use_fake(fake: &FakeHeos) {
         TEST_HEOS.with(|slot| slot.set(Some(fake.config())));
-    }
-
-    #[tokio::test]
-    async fn the_oldest_receivers_are_not_asked() {
-        let fake = FakeHeos::start("127.0.0.1", HeosItem::song()).await;
-        use_fake(&fake);
-        assert_eq!(
-            Some(false),
-            probe("127.0.0.1", Some(ReceiverGeneration::Avr)).await
-        );
-        assert_eq!(Vec::<String>::new(), fake.received());
-    }
-
-    #[tokio::test]
-    async fn the_probe_finds_the_player_with_the_address_of_the_receiver() {
-        let fake = FakeHeos::start("127.0.0.1", HeosItem::song()).await;
-        use_fake(&fake);
-        assert_eq!(
-            Some(true),
-            probe("127.0.0.1", Some(ReceiverGeneration::AvrX2016)).await
-        );
-    }
-
-    #[tokio::test]
-    async fn heos_without_the_player_of_the_receiver_is_still_heos() {
-        let fake = FakeHeos::start("192.0.2.1", HeosItem::song()).await;
-        use_fake(&fake);
-        assert_eq!(Some(true), probe("127.0.0.1", None).await);
-    }
-
-    #[tokio::test]
-    async fn a_refused_port_is_no_heos() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().expect("address").port();
-        drop(listener);
-        TEST_HEOS.with(|slot| {
-            slot.set(Some(HeosConfig {
-                port,
-                ..HeosConfig::default()
-            }));
-        });
-        assert_eq!(Some(false), probe("127.0.0.1", None).await);
     }
 
     fn use_port(port: u16) {

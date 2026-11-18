@@ -3,7 +3,7 @@
 
 //! Sensor entities. Names, values and units are the ones of the Python integration.
 
-use crate::config_store::DeviceConfig;
+use crate::config_store::{DeviceConfig, Feature};
 use crate::entities::{SelectKind, SensorKind, View, availability, is_off, select};
 use denon_marantz::proto::{InOut, Sleep};
 use denon_marantz::{Volume, Zone};
@@ -36,6 +36,10 @@ pub fn definition(mut entity: AvailableIntgEntity, kind: SensorKind) -> Availabl
         }
         SensorKind::AudioSamplingRate => {
             options.insert("custom_unit".into(), "kHz".into());
+        }
+        SensorKind::DialogLevel | SensorKind::StageWidth | SensorKind::StageHeight => {
+            options.insert("custom_unit".into(), "dB".into());
+            options.insert("decimals".into(), 0.into());
         }
         _ => {}
     }
@@ -75,15 +79,50 @@ pub const fn name(kind: SensorKind) -> &'static str {
         SensorKind::AllZoneStereo => "All Zone Stereo",
         SensorKind::DigitalCodec => "Digital Codec",
         SensorKind::DiracFilter => "Active Dirac Filter",
+        SensorKind::ProLogicMode => "Pro Logic Mode",
+        SensorKind::SurroundBackMode => "Surround Back Mode",
+        SensorKind::FrontHeight => "Front Height",
+        SensorKind::DynamicCompression => "Dynamic Compression",
+        SensorKind::AutoFlagDetect => "Auto Flag Detect",
+        SensorKind::DialogLevelAdjust => "Dialog Level Adjust",
+        SensorKind::DialogLevel => "Dialog Level",
+        SensorKind::AudysseyDsx => "Audyssey DSX",
+        SensorKind::StageWidth => "Stage Width",
+        SensorKind::StageHeight => "Stage Height",
+        SensorKind::HeightGain => "Height Gain",
+        SensorKind::InstaPrevue => "InstaPrevue",
     }
 }
 
-/// The first seven sensors always exist, the others only with a telnet connection. The signal
+/// The feature that a sensor of older receivers shows.
+const fn feature(kind: SensorKind) -> Option<Feature> {
+    Some(match kind {
+        SensorKind::ProLogicMode => Feature::ProLogicMode,
+        SensorKind::SurroundBackMode => Feature::SurroundBackMode,
+        SensorKind::FrontHeight => Feature::FrontHeight,
+        SensorKind::DynamicCompression => Feature::DynamicCompression,
+        SensorKind::AutoFlagDetect => Feature::AutoFlagDetect,
+        SensorKind::DialogLevelAdjust | SensorKind::DialogLevel => Feature::DialogLevel,
+        SensorKind::AudysseyDsx | SensorKind::StageWidth | SensorKind::StageHeight => {
+            Feature::AudysseyDsx
+        }
+        SensorKind::HeightGain => Feature::HeightGain,
+        SensorKind::InstaPrevue => Feature::InstaPrevue,
+        _ => return None,
+    })
+}
+
+/// The first seven sensors always exist, the others only with a telnet connection. The sensors of
+/// older receivers also need the feature. The signal
 /// sensors and the HDMI output that `Avr::update_signal_and_settings` reads also come over HTTP. The
 /// audio signal and the sampling rate need the receiver to list the query.
 pub const fn available(cfg: &DeviceConfig, kind: SensorKind) -> bool {
     if matches!(kind, SensorKind::DiracFilter) {
         return cfg.use_telnet && cfg.has_dirac();
+    }
+    // The values of older receivers come on telnet only.
+    if let Some(feature) = feature(kind) {
+        return cfg.use_telnet && cfg.offers(feature);
     }
     cfg.use_telnet
         || (cfg.reads_hdmi_output() && matches!(kind, SensorKind::MonitorOutput))
@@ -131,6 +170,14 @@ fn text<T: ToString>(v: Option<T>) -> Value {
     json!(v.map_or_else(|| EMPTY.to_owned(), |v| v.to_string()))
 }
 
+fn on_off(v: Option<bool>) -> Value {
+    text(v.map(|on| if on { "ON" } else { "OFF" }))
+}
+
+fn decibels(v: Option<i8>) -> Value {
+    v.map_or_else(|| EMPTY.into(), |db| json!(db))
+}
+
 fn pick<T, R>(io: &InOut<T>, input: bool, f: impl FnOnce(&T) -> R) -> Option<R> {
     let value = if input { &io.input } else { &io.output };
     value.as_ref().map(f)
@@ -141,6 +188,7 @@ fn value(v: &View<'_>, kind: SensorKind) -> (Value, Option<&'static str>) {
     let zone = v.state.zone(Zone::Main);
     let device = v.state.device();
     let signal = &device.signal;
+    let sound = &device.sound_settings;
     if is_off(v) {
         // These keep their value while the receiver is off. All others are empty.
         match kind {
@@ -177,8 +225,7 @@ fn value(v: &View<'_>, kind: SensorKind) -> (Value, Option<&'static str>) {
                 _ => ("Off".into(), Some("")),
             };
         }
-        SensorKind::AudioDelay => device
-            .sound_settings
+        SensorKind::AudioDelay => sound
             .audio_delay
             .map_or_else(|| EMPTY.into(), |ms| json!(ms)),
         SensorKind::AudioSignal => text(signal.audio_signal.as_deref()),
@@ -206,16 +253,27 @@ fn value(v: &View<'_>, kind: SensorKind) -> (Value, Option<&'static str>) {
         SensorKind::ColorspaceOutput => text(signal.video_color().output),
         SensorKind::PictureMode => text(device.picture_settings.mode.map(|x| x.label())),
         SensorKind::TunerFrequency => text(tuner_text(device)),
-        SensorKind::AllZoneStereo => text(
-            device
-                .all_zone_stereo
-                .map(|on| if on { "ON" } else { "OFF" }),
-        ),
+        SensorKind::AllZoneStereo => on_off(device.all_zone_stereo),
         SensorKind::DigitalCodec => text(device.digital_codec.map(|x| x.label())),
         SensorKind::DiracFilter => text(select::choices(v, SelectKind::DiracFilter).current),
+        SensorKind::ProLogicMode => text(sound.pro_logic_mode.map(|x| x.label())),
+        SensorKind::SurroundBackMode => text(sound.surround_back_mode.map(|x| x.label())),
+        SensorKind::FrontHeight => on_off(sound.front_height),
+        SensorKind::DynamicCompression => text(sound.dynamic_compression.map(|x| x.label())),
+        SensorKind::AutoFlagDetect => on_off(sound.auto_flag_detect),
+        SensorKind::DialogLevelAdjust => on_off(sound.dialog_level_adjust),
+        SensorKind::DialogLevel => decibels(sound.dialog_level),
+        SensorKind::AudysseyDsx => text(sound.audyssey_dsx.map(|x| x.label())),
+        SensorKind::StageWidth => decibels(sound.stage_width),
+        SensorKind::StageHeight => decibels(sound.stage_height),
+        SensorKind::HeightGain => text(sound.height_gain.map(|x| x.label())),
+        SensorKind::InstaPrevue => on_off(device.insta_prevue),
     };
     let unit = match kind {
-        SensorKind::VolumeDb => Some("dB"),
+        SensorKind::VolumeDb
+        | SensorKind::DialogLevel
+        | SensorKind::StageWidth
+        | SensorKind::StageHeight => Some("dB"),
         SensorKind::AudioDelay => Some("ms"),
         _ => None,
     };

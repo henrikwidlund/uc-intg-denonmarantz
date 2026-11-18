@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: MPL-2.0
 
 //! Simple commands of the media player and remote entities. The names are the ones of the Python
-//! integration, so activities and macros keep working.
+//! integration, so activities and macros keep working, plus commands of older receivers.
 //!
 //! The table is `resources/commands.tsv`: name, protocol (`all` or `telnet`), brand (`all`,
-//! `denon` or `marantz`) and the text for telnet. A text with a `/` between two words toggles:
+//! `denon` or `marantz`), the text for telnet and, if only some receivers have the command, the
+//! feature (see [`Feature::parse`]). A text with a `/` between two words toggles:
 //! the first word is sent when the second one is the current value. A text of two key codes
 //! (`Denon / Marantz`) has one code for each brand.
 
@@ -13,7 +14,7 @@ mod typed;
 
 pub use typed::{CallFuture, Cx, Run};
 
-use crate::config_store::DeviceConfig;
+use crate::config_store::{DeviceConfig, Feature};
 use denon_marantz::State;
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -35,6 +36,8 @@ pub struct Entry {
     text: &'static str,
     /// The quick select (smart select on Marantz) slot that the command uses.
     quick_select: Option<u8>,
+    /// The feature that only some receivers have.
+    feature: Option<Feature>,
 }
 
 static ENTRIES: LazyLock<Vec<Entry>> = LazyLock::new(|| {
@@ -56,6 +59,7 @@ static ENTRIES: LazyLock<Vec<Entry>> = LazyLock::new(|| {
                 brand,
                 text,
                 quick_select: quick_select_slot(name),
+                feature: parts.next().and_then(Feature::parse),
             })
         })
         .collect()
@@ -88,12 +92,16 @@ impl Entry {
         self.brand != Brand::Denon
     }
 
-    /// The receiver has the command: it has the brand and the quick select slot, and telnet is on
-    /// if the command needs it.
+    /// The receiver has the command: it has the brand, the quick select slot and the feature, and
+    /// telnet is on if the command needs it.
     const fn is_supported(&self, cfg: &DeviceConfig) -> bool {
         (cfg.use_telnet || !self.telnet_only)
             && match self.quick_select {
                 Some(slot) => cfg.has_quick_select(slot),
+                None => true,
+            }
+            && match self.feature {
+                Some(feature) => cfg.offers(feature),
                 None => true,
             }
             && match self.brand {
@@ -141,11 +149,12 @@ pub fn get(name: &str) -> Option<&'static Entry> {
 }
 
 /// Text of a toggle: `PSGEQ ON/OFF` gives `PSGEQ OFF` if the current value is `ON`. Without a
-/// known value it gives the first one.
+/// known value it gives the first one. The values come after the last space or `:`.
 fn toggled(text: &str, current: Option<&str>) -> String {
-    let Some((head, values)) = text.rsplit_once(' ') else {
+    let Some(at) = text.rfind([' ', ':']) else {
         return text.to_owned();
     };
+    let (head, values) = text.split_at(at + 1);
     let Some((first, second)) = values.split_once('/') else {
         return text.to_owned();
     };
@@ -154,7 +163,7 @@ fn toggled(text: &str, current: Option<&str>) -> String {
     } else {
         first
     };
-    format!("{head} {value}")
+    format!("{head}{value}")
 }
 
 /// The current value of what a toggle command changes, in the words of its text.
@@ -193,6 +202,10 @@ fn toggle_current(name: &str, state: &State) -> Option<&'static str> {
         "DYNAMIC_EQ_TOGGLE" => on_off(device.dynamic_eq),
         "AUDYSSEY_LFC_TOGGLE" => on_off(device.lfc),
         "SUBWOOFER_TOGGLE" => on_off(sound.subwoofer),
+        "FRONT_HEIGHT_TOGGLE" => on_off(sound.front_height),
+        "AUTO_FLAG_DETECT_TOGGLE" => on_off(sound.auto_flag_detect),
+        "DIALOG_LEVEL_ADJUST_TOGGLE" => on_off(sound.dialog_level_adjust),
+        "INSTA_PREVUE_TOGGLE" => on_off(device.insta_prevue),
         _ => None,
     }
 }
@@ -225,7 +238,9 @@ mod tests {
             hdmi_output_over_http: None,
             quick_select_count: None,
             listed_queries: None,
-            heos: None,
+            comm_api_version: None,
+            has_tuner: None,
+            tuner_presets_lettered: None,
             info: None,
         }
     }
@@ -246,11 +261,68 @@ mod tests {
     }
 
     #[test]
-    fn the_counts_are_the_ones_of_the_python_integration() {
-        assert_eq!(362, supported(&cfg(true, true)).len());
-        assert_eq!(374, supported(&cfg(true, false)).len());
-        assert_eq!(ENTRIES.len(), 387);
-        assert!(supported(&cfg(false, true)).len() < 362);
+    fn the_counts_are_the_ones_of_the_python_integration_plus_older_receivers() {
+        let python = |c: &DeviceConfig| {
+            supported(c)
+                .into_iter()
+                .filter(|n| get(n).is_some_and(|e| e.feature.is_none()))
+                .count()
+        };
+        assert_eq!(368, python(&cfg(true, true)));
+        assert_eq!(380, python(&cfg(true, false)));
+        // Before the receiver is read, and without `CommApiVers`, the commands of older receivers
+        // are offered too.
+        assert_eq!(423, supported(&cfg(true, true)).len());
+        let missing = |is_denon| DeviceConfig {
+            comm_api_version: Some(crate::config_store::CommApiVersion::MISSING),
+            ..cfg(true, is_denon)
+        };
+        assert_eq!(423, supported(&missing(true)).len());
+        assert_eq!(435, supported(&missing(false)).len());
+        assert_eq!(ENTRIES.len(), 448);
+        assert!(supported(&cfg(false, true)).len() < 423);
+    }
+
+    #[test]
+    fn every_feature_name_of_the_table_is_known() {
+        for line in TABLE.lines() {
+            if let Some(name) = line.split('\t').nth(4) {
+                assert!(Feature::parse(name).is_some(), "{line}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_commands_of_older_receivers_follow_the_generation() {
+        let with = |is_denon: bool, version: &str| DeviceConfig {
+            comm_api_version: crate::config_store::CommApiVersion::parse(version),
+            ..cfg(true, is_denon)
+        };
+        let has = |c: &DeviceConfig, name: &str| supported(c).contains(&name);
+        let denon_2013 = with(true, "0210");
+        assert!(has(&denon_2013, "SURROUND_BACK_MODE_ON"));
+        assert!(has(&denon_2013, "NETWORK_NEXT"));
+        assert!(!has(&denon_2013, "DIALOG_LEVEL_UP"));
+        assert!(!has(&denon_2013, "INPUT_MODE_7_1_IN"));
+        assert!(!has(&denon_2013, "DYNAMIC_COMPRESSION_LOW"));
+        let denon_2015 = with(true, "0300");
+        assert!(has(&denon_2015, "DIALOG_LEVEL_UP"));
+        assert!(has(&denon_2015, "INSTA_PREVUE_ON"));
+        assert!(!has(&denon_2015, "SURROUND_BACK_MODE_ON"));
+        let marantz_2013 = with(false, "0210");
+        assert!(has(&marantz_2013, "DYNAMIC_COMPRESSION_LOW"));
+        assert!(has(&marantz_2013, "SOURCE_MENU_ON"));
+        assert!(!has(&marantz_2013, "DIALOG_LEVEL_UP"));
+        // No Marantz spec of 2014 to 2016: all are offered.
+        assert!(has(&with(false, "0300"), "DIALOG_LEVEL_UP"));
+        let denon_now = with(true, "0301");
+        assert!(!has(&denon_now, "PRO_LOGIC_MODE_CINEMA"));
+        assert!(!has(&denon_now, "FRONT_HEIGHT_ON"));
+        assert!(!has(&denon_now, "NETWORK_NEXT"));
+        assert!(has(&denon_now, "INPUT_MODE_7_1_IN"));
+        assert!(has(&denon_now, "INPUT_MODE_SELECT"));
+        assert!(has(&with(false, "0301"), "FRONT_HEIGHT_ON"));
+        assert!(!has(&with(false, "0301"), "AUTO_FLAG_DETECT_ON"));
     }
 
     #[test]
@@ -302,6 +374,11 @@ mod tests {
         assert_eq!("PSGEQ ON", toggled("PSGEQ ON/OFF", None));
         assert_eq!("SPPR 2", toggled("SPPR 1/2", Some("1")));
         assert_eq!("SSTTR ON", toggled("SSTTR ON/OFF", Some("OFF")));
+        assert_eq!("PSFH:OFF", toggled("PSFH:ON/OFF", Some("ON")));
+        assert_eq!(
+            "PSCINEMA EQ.OFF",
+            toggled("PSCINEMA EQ.ON/EQ.OFF", Some("EQ.ON"))
+        );
         let state = State::new(true);
         assert_eq!(
             "BTTX ON",

@@ -129,14 +129,30 @@ pub struct DeviceConfig {
         deserialize_with = "none_if_unknown"
     )]
     pub listed_queries: Option<HttpQueries>,
-    /// The receiver has a HEOS player for network audio. It is found at the setup, or at the
-    /// first connect if it is missing.
+    /// `CommApiVers` of `Deviceinfo.xml`: the protocol generation. It decides HEOS and the commands
+    /// of older receivers. It is found at the setup and checked at each connect.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "none_if_unknown"
     )]
-    pub heos: Option<bool>,
+    pub comm_api_version: Option<CommApiVersion>,
+    /// The receiver has a tuner. `None` if `Deviceinfo.xml` does not say. It is found at the setup
+    /// and checked at each connect.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "none_if_unknown"
+    )]
+    pub has_tuner: Option<bool>,
+    /// The tuner presets are `A1` to `G8` (`true`) or `01` to `56` (`false`). The receiver shows it
+    /// in its preset answers. `None` until it did.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "none_if_unknown"
+    )]
+    pub tuner_presets_lettered: Option<bool>,
     /// What the library found at the last full connect. With it, the next connect sends no
     /// request. A value from another library version that does not load is `None`.
     #[serde(
@@ -187,7 +203,8 @@ pub struct ReceiverKind {
     pub hdmi_output_over_http: Option<bool>,
     pub quick_select_count: Option<u8>,
     pub listed_queries: Option<HttpQueries>,
-    pub heos: Option<bool>,
+    pub comm_api_version: Option<CommApiVersion>,
+    pub has_tuner: Option<bool>,
 }
 
 /// The receiver generation, as the library reports it.
@@ -205,6 +222,125 @@ pub enum ReceiverGeneration {
 pub enum HttpReadMethod {
     AppCommand,
     StatusPages,
+}
+
+/// `CommApiVers` of `Deviceinfo.xml`, for example `0301`. It is written as these 4 digits, or as
+/// `none` for a receiver that does not report it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CommApiVersion(u16);
+
+impl CommApiVersion {
+    /// The first version with HEOS.
+    pub const HEOS: Self = Self(301);
+    /// The receiver does not report a version. Receivers of about 2012 and older have no
+    /// `Deviceinfo.xml`.
+    pub const MISSING: Self = Self(0);
+
+    /// Reads the 4 digits, or `none`. `None` for other text.
+    pub fn parse(text: &str) -> Option<Self> {
+        let text = text.trim();
+        if text == "none" {
+            return Some(Self::MISSING);
+        }
+        if text.len() != 4 || !text.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        text.parse().ok().map(Self)
+    }
+
+    /// The receiver has HEOS. `None` if the receiver does not report a version.
+    pub const fn heos(self) -> Option<bool> {
+        if self.0 == Self::MISSING.0 {
+            None
+        } else {
+            Some(self.0 >= Self::HEOS.0)
+        }
+    }
+}
+
+/// The protocol specs that a receiver follows, from `CommApiVers` and the brand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Generation {
+    /// Denon 0210: the specs of 2011 to 2013.
+    Denon2013,
+    /// Denon 0250 and 0300: the spec of 2014 and 2015.
+    Denon2015,
+    /// Marantz 0210: the spec of 2013.
+    Marantz2013,
+    /// 0301 and higher: the current specs, with HEOS.
+    Current,
+    /// No spec is known for the value, the receiver does not report one, or the receiver was not
+    /// read yet.
+    Unknown,
+}
+
+/// A group of commands that only some generations have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Feature {
+    /// `PSMODE`: the mode of Dolby `PLII` and DTS Neo.
+    ProLogicMode,
+    /// `PSSB`: the surround back mode.
+    SurroundBackMode,
+    /// `PSFH`: the front height output.
+    FrontHeight,
+    /// `PSDCO`: dynamic compression.
+    DynamicCompression,
+    /// `PSAFD`: auto flag detect.
+    AutoFlagDetect,
+    /// `PSDSX`, `PSSTW` and `PSSTH`: Audyssey DSX with stage width and height.
+    AudysseyDsx,
+    /// `PSPHG`: the height gain of `PLIIz`.
+    HeightGain,
+    /// `PSSP:OFF`: no effect speakers.
+    EffectSpeakersOff,
+    /// `PSDIL`: Dialog Level Adjust.
+    DialogLevel,
+    /// `MNPRV`: `InstaPrevue`.
+    InstaPrevue,
+    /// `MNSRC`: the source menu.
+    SourceMenu,
+    /// `NS` commands of network audio before HEOS.
+    NetworkAudio,
+    /// `SD7.1IN`: the 7.1 channel input.
+    SevenOneIn,
+}
+
+impl Feature {
+    /// The name in `resources/commands.tsv`.
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "pro_logic_mode" => Self::ProLogicMode,
+            "surround_back_mode" => Self::SurroundBackMode,
+            "front_height" => Self::FrontHeight,
+            "dynamic_compression" => Self::DynamicCompression,
+            "auto_flag_detect" => Self::AutoFlagDetect,
+            "audyssey_dsx" => Self::AudysseyDsx,
+            "height_gain" => Self::HeightGain,
+            "effect_speakers_off" => Self::EffectSpeakersOff,
+            "dialog_level" => Self::DialogLevel,
+            "insta_prevue" => Self::InstaPrevue,
+            "source_menu" => Self::SourceMenu,
+            "network_audio" => Self::NetworkAudio,
+            "seven_one_in" => Self::SevenOneIn,
+            _ => return None,
+        })
+    }
+}
+
+impl Serialize for CommApiVersion {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if *self == Self::MISSING {
+            return s.serialize_str("none");
+        }
+        s.collect_str(&format_args!("{:04}", self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for CommApiVersion {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(d)?;
+        Self::parse(&text).ok_or_else(|| serde::de::Error::custom("not 4 digits"))
+    }
 }
 
 impl DeviceConfig {
@@ -302,15 +438,74 @@ impl DeviceConfig {
 
     /// The receiver has a HEOS player.
     pub const fn has_heos(&self) -> bool {
-        matches!(self.heos, Some(true))
+        matches!(self.heos(), Some(true))
     }
 
     /// The receiver has a HEOS player, or it is not known yet. The oldest receivers came before
     /// HEOS.
     pub const fn may_have_heos(&self) -> bool {
-        match self.heos {
+        match self.heos() {
             Some(heos) => heos,
             None => !matches!(self.receiver_type, Some(ReceiverGeneration::Avr)),
+        }
+    }
+
+    /// The receiver has HEOS, from `CommApiVers`. `None` if it is not known.
+    const fn heos(&self) -> Option<bool> {
+        match self.comm_api_version {
+            Some(v) => v.heos(),
+            None => None,
+        }
+    }
+
+    /// The specs that the receiver follows.
+    pub const fn generation(&self) -> Generation {
+        let Some(CommApiVersion(v)) = self.comm_api_version else {
+            return Generation::Unknown;
+        };
+        match v {
+            210 if self.is_denon => Generation::Denon2013,
+            210 => Generation::Marantz2013,
+            250 | 300 if self.is_denon => Generation::Denon2015,
+            _ if v >= CommApiVersion::HEOS.0 => Generation::Current,
+            _ => Generation::Unknown,
+        }
+    }
+
+    /// The receiver may have the feature: a spec of its generation has it, or no spec is known.
+    pub const fn offers(&self, feature: Feature) -> bool {
+        use Generation::{
+            Current, Denon2013 as D13, Denon2015 as D15, Marantz2013 as M13, Unknown,
+        };
+        let generation = self.generation();
+        if matches!(generation, Unknown) {
+            return true;
+        }
+        match feature {
+            Feature::ProLogicMode
+            | Feature::AudysseyDsx
+            | Feature::HeightGain
+            | Feature::NetworkAudio
+            | Feature::InstaPrevue => !matches!(generation, Current),
+            Feature::SurroundBackMode => matches!(generation, D13),
+            Feature::FrontHeight => match generation {
+                Current => !self.is_denon,
+                _ => true,
+            },
+            Feature::DynamicCompression | Feature::SourceMenu => matches!(generation, M13),
+            Feature::AutoFlagDetect => false,
+            Feature::EffectSpeakersOff => matches!(generation, D13 | M13),
+            Feature::DialogLevel => matches!(generation, D15),
+            Feature::SevenOneIn => !matches!(generation, D13),
+        }
+    }
+
+    /// The number of network audio favorites: 36 on Denon 2014 and 2015 receivers, else 56.
+    pub const fn network_favorites(&self) -> u8 {
+        if matches!(self.generation(), Generation::Denon2015) {
+            36
+        } else {
+            56
         }
     }
 
@@ -322,19 +517,24 @@ impl DeviceConfig {
         }
     }
 
-    /// Take what a device actor found on the receiver: the address, the receiver kind, the ids and
-    /// the receiver values. The other fields are settings and keep their values. `None` if nothing
-    /// changed, else whether the receiver kind changed.
+    /// Take what a device actor found on the receiver: the address, the receiver kind, the ids,
+    /// the receiver values and the form of the tuner presets. The other fields are settings and
+    /// keep their values. `None` if nothing changed, else whether the receiver kind changed.
     pub fn take_found(&mut self, found: Self) -> Option<bool> {
         let kind = found.kind();
         let new_kind = kind != self.kind();
         let new_ids = self.add_ids(found.serial.as_deref(), found.mac.as_deref());
         let new_info = found.info.is_some() && self.info != found.info;
-        if self.address == found.address && !new_kind && !new_ids && !new_info {
+        let new_form = found.tuner_presets_lettered.is_some()
+            && self.tuner_presets_lettered != found.tuner_presets_lettered;
+        if self.address == found.address && !new_kind && !new_ids && !new_info && !new_form {
             return None;
         }
         if new_info {
             self.info = found.info;
+        }
+        if new_form {
+            self.tuner_presets_lettered = found.tuner_presets_lettered;
         }
         self.address = found.address;
         self.set_kind(kind);
@@ -348,7 +548,8 @@ impl DeviceConfig {
             hdmi_output_over_http: self.hdmi_output_over_http,
             quick_select_count: self.quick_select_count,
             listed_queries: self.listed_queries,
-            heos: self.heos,
+            comm_api_version: self.comm_api_version,
+            has_tuner: self.has_tuner,
         }
     }
 
@@ -358,7 +559,8 @@ impl DeviceConfig {
         self.hdmi_output_over_http = kind.hdmi_output_over_http;
         self.quick_select_count = kind.quick_select_count;
         self.listed_queries = kind.listed_queries;
-        self.heos = kind.heos;
+        self.comm_api_version = kind.comm_api_version;
+        self.has_tuner = kind.has_tuner;
     }
 }
 
@@ -791,7 +993,9 @@ mod tests {
             hdmi_output_over_http: None,
             quick_select_count: None,
             listed_queries: None,
-            heos: None,
+            comm_api_version: None,
+            has_tuner: None,
+            tuner_presets_lettered: None,
             info: None,
         }
     }
@@ -896,7 +1100,7 @@ mod tests {
                 && !text.contains("hdmi_output_over_http")
                 && !text.contains("quick_select_count")
                 && !text.contains("listed_queries")
-                && !text.contains("heos"),
+                && !text.contains("comm_api_version"),
             "{text}"
         );
 
@@ -909,7 +1113,7 @@ mod tests {
                 audyssey: true,
                 ..HttpQueries::default()
             }),
-            heos: Some(true),
+            comm_api_version: CommApiVersion::parse("0301"),
             ..device()
         };
         let text = serde_json::to_string(&d).expect("json");
@@ -919,16 +1123,39 @@ mod tests {
                 && text.contains(r#""hdmi_output_over_http":true"#)
                 && text.contains(r#""quick_select_count":4"#)
                 && text.contains(r#""audyssey":true"#)
-                && text.contains(r#""heos":true"#),
+                && text.contains(r#""comm_api_version":"0301""#),
             "{text}"
         );
         assert_eq!(d, serde_json::from_str(&text).expect("json"));
     }
 
     #[test]
+    fn the_comm_api_version_is_four_digits_or_none() {
+        let v = |text| CommApiVersion::parse(text);
+        assert_eq!(Some(CommApiVersion(301)), v("0301"));
+        assert_eq!(Some(CommApiVersion::MISSING), v("none"));
+        for text in ["301", "03010", "03.1", "", "x301"] {
+            assert_eq!(None, v(text), "{text}");
+        }
+        for (version, text) in [
+            (CommApiVersion(210), r#""0210""#),
+            (CommApiVersion::MISSING, r#""none""#),
+        ] {
+            assert_eq!(text, serde_json::to_string(&version).expect("json"));
+            assert_eq!(
+                version,
+                serde_json::from_str::<CommApiVersion>(text).expect("json")
+            );
+        }
+        assert_eq!(None, CommApiVersion::MISSING.heos());
+        assert_eq!(Some(false), CommApiVersion(300).heos());
+        assert_eq!(Some(true), CommApiVersion(301).heos());
+    }
+
+    #[test]
     fn an_unknown_receiver_kind_reads_as_none() {
         let d: DeviceConfig = serde_json::from_str(
-            r#"{"id":"A","name":"C","address":"h","receiver_type":"avr_z","update_method":7,"hdmi_output_over_http":"yes","quick_select_count":300,"listed_queries":[1],"heos":"yes"}"#,
+            r#"{"id":"A","name":"C","address":"h","receiver_type":"avr_z","update_method":7,"hdmi_output_over_http":"yes","quick_select_count":300,"listed_queries":[1],"comm_api_version":"301"}"#,
         )
         .expect("json");
         assert_eq!(ReceiverKind::default(), d.kind());
@@ -951,7 +1178,15 @@ mod tests {
             r#"{"id":"A","name":"C","address":"h2","receiver_type":"avr_x","info":{"host":"h2"}}"#;
         // A value that does not load is not taken: `None` keeps the stored one.
         let found: DeviceConfig = serde_json::from_str(info).expect("json");
+        assert_eq!(None, cfg.take_found(found.clone()));
+        // The form of the tuner presets is taken, and `None` keeps it.
+        let lettered = DeviceConfig {
+            tuner_presets_lettered: Some(true),
+            ..found.clone()
+        };
+        assert_eq!(Some(false), cfg.take_found(lettered));
         assert_eq!(None, cfg.take_found(found));
+        assert_eq!(Some(true), cfg.tuner_presets_lettered);
     }
 
     #[test]

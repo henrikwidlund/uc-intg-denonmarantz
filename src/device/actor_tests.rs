@@ -10,7 +10,7 @@ use super::commands;
 use super::discovery::{self, Known, TEST_BUILDER, TEST_DISCOVERY, TestBuilder};
 use super::heos::TEST_HEOS;
 use super::{Command, Connect, DenonActor, DeviceEvent, DeviceStatus, Disconnect, UpdateConfig};
-use crate::config_store::{self, DeviceConfig};
+use crate::config_store::{self, CommApiVersion, DeviceConfig};
 use crate::entities::sensor::EMPTY;
 use crate::entities::{EntityKind, SelectKind, SensorKind, SwitchKind};
 use crate::errors::ServiceError;
@@ -74,7 +74,9 @@ fn cfg() -> DeviceConfig {
         hdmi_output_over_http: None,
         quick_select_count: None,
         listed_queries: None,
-        heos: None,
+        comm_api_version: None,
+        has_tuner: None,
+        tuner_presets_lettered: None,
         info: None,
     }
 }
@@ -94,7 +96,16 @@ async fn rig_with(
     answers: impl Fn(&str) -> Vec<String> + Send + Sync + 'static,
     retry: Duration,
 ) -> Rig {
-    let http = Fake::start(true).await;
+    rig_on(Fake::start(true).await, cfg, answers, retry).await
+}
+
+/// As [`rig_with`], with this fake receiver.
+async fn rig_on(
+    http: Fake,
+    cfg: impl FnOnce(u16) -> DeviceConfig,
+    answers: impl Fn(&str) -> Vec<String> + Send + Sync + 'static,
+    retry: Duration,
+) -> Rig {
     let telnet = FakeTelnet::start(answers).await;
     let (http_port, telnet_port) = (http.port(), telnet.port);
     let setup: TestBuilder =
@@ -206,6 +217,77 @@ async fn the_actor_asks_for_the_groups_that_the_entities_need() {
 /// Waits until the extra values of the start are asked: the picture mode is the last one.
 async fn after_the_extra_values(rig: &Rig) {
     until("the picture mode", 10, || rig.telnet.count("PV?") >= 1).await;
+}
+
+#[actix::test]
+async fn the_values_of_older_receivers_are_read_only_on_older_receivers() {
+    let rig = rig(answers_all, QUICK).await;
+    after_the_extra_values(&rig).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    for line in ["PSDIL ?", "PSMODE: ?", "MNPRV?", "NSH", "OPTPN ?"] {
+        assert_eq!(0, rig.telnet.count(line), "{line}");
+    }
+
+    let http = Fake::start_with_info(
+        b"<Device_Info><CommApiVers>0300</CommApiVers><ModelName>AVR-X2100W</ModelName>\
+        <DeviceZones>2</DeviceZones><MacAddress>0123456789AB</MacAddress></Device_Info>",
+    )
+    .await;
+    let old = rig_on(http, |_| cfg(), answers_all, QUICK).await;
+    for line in [
+        "PSDIL ?",
+        "PSMODE: ?",
+        "PSDSX ?",
+        "MNPRV?",
+        "NSH",
+        "OPTPN ?",
+    ] {
+        until(line, 10, || old.telnet.count(line) >= 1).await;
+    }
+    // Not in the spec of 2014 and 2015.
+    assert_eq!(0, old.telnet.count("PSSB: ?"));
+
+    // A saved favorite has a new name: the names are read again.
+    let names = old.telnet.count("NSH");
+    let save = Command {
+        kind: EntityKind::MediaPlayer,
+        cmd_id: "NSC02".into(),
+        params: None,
+    };
+    old.actor.send(save).await.expect("send").expect("save");
+    until("the names again", 5, || old.telnet.count("NSH") > names).await;
+    let presets = old.telnet.count("OPTPN ?");
+    let save = Command {
+        kind: EntityKind::MediaPlayer,
+        cmd_id: "TPANMEM03".into(),
+        params: None,
+    };
+    old.actor.send(save).await.expect("send").expect("save");
+    until("the presets again", 5, || {
+        old.telnet.count("OPTPN ?") > presets
+    })
+    .await;
+
+    // A new name is sent. Other changes do not send the select with its 56 options again.
+    let favorite = EntityKind::Select(SelectKind::NetworkFavorite);
+    old.telnet.send("NSH02Jazz");
+    until("the new name", 5, || {
+        entity_state(&old.events, favorite, "options")
+            .is_some_and(|o| o.to_string().contains("3 Jazz"))
+    })
+    .await;
+    let before = old.events.lock().expect("lock").len();
+    old.telnet.send("SLP010");
+    let sleep = EntityKind::Sensor(SensorKind::SleepTimer);
+    until("the sleep timer", 5, || {
+        entity_state(&old.events, sleep, "value") == Some(10.into())
+    })
+    .await;
+    let events = old.events.lock().expect("lock");
+    let sent = events[before..].iter().any(|event| {
+        matches!(event, DeviceEvent::Changes { changes, .. } if changes.iter().any(|(k, _)| *k == favorite))
+    });
+    assert!(!sent);
 }
 
 #[actix::test]
@@ -1107,13 +1189,7 @@ async fn repeat_and_shuffle_go_to_heos() {
     let heos = FakeHeos::start("127.0.0.1", HeosItem::song()).await;
     TEST_HEOS.with(|slot| slot.set(Some(heos.config())));
     let rig = rig(answers_all, QUICK).await;
-    let saved =
-        || {
-            rig.events.lock().expect("lock").iter().any(
-                |event| matches!(event, DeviceEvent::Config { cfg, .. } if cfg.heos == Some(true)),
-            )
-        };
-    until("HEOS saved", 5, saved).await;
+    until("HEOS asked", 5, || heos.count("player/get_players") > 0).await;
     rig.telnet.send("PWON");
     rig.telnet.send("SINET");
     let attr = |name| entity_state(&rig.events, EntityKind::MediaPlayer, name);
@@ -1166,13 +1242,7 @@ async fn the_media_player_shows_heos_on_network_audio() {
     let heos = FakeHeos::start("127.0.0.1", HeosItem::song()).await;
     TEST_HEOS.with(|slot| slot.set(Some(heos.config())));
     let rig = rig(answers_all, QUICK).await;
-    let saved =
-        || {
-            rig.events.lock().expect("lock").iter().any(
-                |event| matches!(event, DeviceEvent::Config { cfg, .. } if cfg.heos == Some(true)),
-            )
-        };
-    until("HEOS saved", 5, saved).await;
+    until("HEOS asked", 5, || heos.count("player/get_players") > 0).await;
     rig.telnet.send("PWON");
     rig.telnet.send("SINET");
     let title = || entity_state(&rig.events, EntityKind::MediaPlayer, "media_title");
@@ -1206,30 +1276,56 @@ async fn the_media_player_shows_heos_on_network_audio() {
 }
 
 #[actix::test]
-async fn a_receiver_without_heos_is_saved_as_such() {
-    // No fake HEOS: the port is refused.
-    TEST_HEOS.with(|slot| slot.set(None));
+async fn the_comm_api_version_is_saved() {
     let rig = rig(answers_all, QUICK).await;
     let saved = || {
-        rig.events.lock().expect("lock").iter().any(
-            |event| matches!(event, DeviceEvent::Config { cfg, .. } if cfg.heos == Some(false)),
-        )
+        rig.events.lock().expect("lock").iter().any(|event| {
+            matches!(event, DeviceEvent::Config { cfg, .. }
+                if cfg.comm_api_version == CommApiVersion::parse("0301"))
+        })
     };
-    until("no HEOS saved", 5, saved).await;
+    until("the version saved", 5, saved).await;
 }
 
 #[actix::test]
-async fn heos_without_the_player_is_saved_as_heos_and_used_when_the_player_comes() {
+async fn the_form_of_the_tuner_presets_is_saved() {
+    let rig = rig(answers_all, QUICK).await;
+    after_the_extra_values(&rig).await;
+    rig.telnet.send("TPANA1");
+    let saved = || {
+        rig.events.lock().expect("lock").iter().any(|event| {
+            matches!(event, DeviceEvent::Config { cfg, .. } if cfg.tuner_presets_lettered == Some(true))
+        })
+    };
+    until("the form saved", 5, saved).await;
+}
+
+#[actix::test]
+async fn heos_is_not_asked_below_comm_api_version_0301() {
+    let heos = FakeHeos::start("127.0.0.1", HeosItem::song()).await;
+    TEST_HEOS.with(|slot| slot.set(Some(heos.config())));
+    let http = Fake::start_with_info(
+        b"<Device_Info><CommApiVers>0300</CommApiVers><ModelName>AVR-X2100W</ModelName>\
+        <DeviceZones>2</DeviceZones><MacAddress>0123456789AB</MacAddress></Device_Info>",
+    )
+    .await;
+    let rig = rig_on(http, |_| cfg(), answers_all, QUICK).await;
+    until("connected", 5, || {
+        rig.events.lock().expect("lock").iter().any(|event| {
+            matches!(event, DeviceEvent::Status { status, .. } if *status == DeviceStatus::Connected)
+        })
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(Vec::<String>::new(), heos.received());
+}
+
+#[actix::test]
+async fn heos_without_the_player_is_used_when_the_player_comes() {
     let heos = FakeHeos::start("192.0.2.1", HeosItem::song()).await;
     TEST_HEOS.with(|slot| slot.set(Some(heos.config())));
     let rig = rig(answers_all, QUICK).await;
-    let saved =
-        || {
-            rig.events.lock().expect("lock").iter().any(
-                |event| matches!(event, DeviceEvent::Config { cfg, .. } if cfg.heos == Some(true)),
-            )
-        };
-    until("HEOS saved", 5, saved).await;
+    until("HEOS asked", 5, || heos.count("player/get_players") > 0).await;
     rig.telnet.send("PWON");
     rig.telnet.send("SINET");
     let reads = heos.count("player/get_players");

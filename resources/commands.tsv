@@ -385,3 +385,64 @@ PICTURE_MODE_CUSTOM	all	all	PVCTM / PVCSTM
 PICTURE_MODE_ISF_DAY	all	all	PVDAY
 PICTURE_MODE_ISF_NIGHT	all	all	PVNGT
 PICTURE_MODE_OFF	all	all	PVOFF
+INPUT_MODE_SELECT	all	all	RCKSK0410352 / RCRC51600101
+INPUT_MODE_AUTO	all	all	SDAUTO
+INPUT_MODE_HDMI	all	all	SDHDMI
+INPUT_MODE_DIGITAL	all	all	SDDIGITAL
+INPUT_MODE_ANALOG	all	all	SDANALOG
+INPUT_MODE_7_1_IN	all	all	SD7.1IN	seven_one_in
+DOLBY_ATMOS_TOGGLE	all	all	RCKSK0410348 / RCRC51606425
+PRO_LOGIC_MODE_CINEMA	all	all	PSMODE:CINEMA	pro_logic_mode
+PRO_LOGIC_MODE_MUSIC	all	all	PSMODE:MUSIC	pro_logic_mode
+PRO_LOGIC_MODE_GAME	all	all	PSMODE:GAME	pro_logic_mode
+PRO_LOGIC_MODE_PRO_LOGIC	all	all	PSMODE:PRO LOGIC	pro_logic_mode
+PRO_LOGIC_MODE_HEIGHT	all	all	PSMODE:HEIGHT	pro_logic_mode
+SURROUND_BACK_MODE_OFF	all	all	PSSB:OFF	surround_back_mode
+SURROUND_BACK_MODE_ON	all	all	PSSB:ON	surround_back_mode
+SURROUND_BACK_MODE_MATRIX_ON	all	all	PSSB:MTRX ON	surround_back_mode
+SURROUND_BACK_MODE_PL2X_CINEMA	all	all	PSSB:PL2X CINEMA	surround_back_mode
+SURROUND_BACK_MODE_PL2X_MUSIC	all	all	PSSB:PL2X MUSIC	surround_back_mode
+SURROUND_BACK_MODE_ES_MATRIX	all	all	PSSB:ESMTRX	surround_back_mode
+FRONT_HEIGHT_ON	all	all	PSFH:ON	front_height
+FRONT_HEIGHT_OFF	all	all	PSFH:OFF	front_height
+FRONT_HEIGHT_TOGGLE	telnet	all	PSFH:ON/OFF	front_height
+DYNAMIC_COMPRESSION_OFF	all	all	PSDCO OFF	dynamic_compression
+DYNAMIC_COMPRESSION_LOW	all	all	PSDCO LOW	dynamic_compression
+DYNAMIC_COMPRESSION_MID	all	all	PSDCO MID	dynamic_compression
+DYNAMIC_COMPRESSION_HIGH	all	all	PSDCO HIGH	dynamic_compression
+AUTO_FLAG_DETECT_ON	all	all	PSAFD ON	auto_flag_detect
+AUTO_FLAG_DETECT_OFF	all	all	PSAFD OFF	auto_flag_detect
+AUTO_FLAG_DETECT_TOGGLE	telnet	all	PSAFD ON/OFF	auto_flag_detect
+DIALOG_LEVEL_ADJUST_ON	all	all	PSDIL ON	dialog_level
+DIALOG_LEVEL_ADJUST_OFF	all	all	PSDIL OFF	dialog_level
+DIALOG_LEVEL_ADJUST_TOGGLE	telnet	all	PSDIL ON/OFF	dialog_level
+DIALOG_LEVEL_UP	all	all	PSDIL UP	dialog_level
+DIALOG_LEVEL_DOWN	all	all	PSDIL DOWN	dialog_level
+AUDYSSEY_DSX_OFF	all	all	PSDSX OFF	audyssey_dsx
+AUDYSSEY_DSX_HEIGHT	all	all	PSDSX ONH	audyssey_dsx
+AUDYSSEY_DSX_WIDE	all	all	PSDSX ONW	audyssey_dsx
+AUDYSSEY_DSX_HEIGHT_WIDE	all	all	PSDSX ONHW	audyssey_dsx
+STAGE_WIDTH_UP	all	all	PSSTW UP	audyssey_dsx
+STAGE_WIDTH_DOWN	all	all	PSSTW DOWN	audyssey_dsx
+STAGE_HEIGHT_UP	all	all	PSSTH UP	audyssey_dsx
+STAGE_HEIGHT_DOWN	all	all	PSSTH DOWN	audyssey_dsx
+HEIGHT_GAIN_LOW	all	all	PSPHG LOW	height_gain
+HEIGHT_GAIN_MEDIUM	all	all	PSPHG MID	height_gain
+HEIGHT_GAIN_HIGH	all	all	PSPHG HI	height_gain
+EFFECT_SPEAKER_SELECTION_OFF	all	all	PSSP:OFF	effect_speakers_off
+INSTA_PREVUE_ON	all	all	MNPRV ON	insta_prevue
+INSTA_PREVUE_OFF	all	all	MNPRV OFF	insta_prevue
+INSTA_PREVUE_TOGGLE	telnet	all	MNPRV ON/OFF	insta_prevue
+SOURCE_MENU_ON	all	all	MNSRC ON	source_menu
+SOURCE_MENU_OFF	all	all	MNSRC OFF	source_menu
+NETWORK_REPEAT_ONE	all	all	NS9H	network_audio
+NETWORK_REPEAT_ALL	all	all	NS9I	network_audio
+NETWORK_REPEAT_OFF	all	all	NS9J	network_audio
+NETWORK_REPEAT_TOGGLE	all	all	NSRPT	network_audio
+NETWORK_RANDOM_ON	all	all	NS9K	network_audio
+NETWORK_RANDOM_OFF	all	all	NS9M	network_audio
+NETWORK_RANDOM_TOGGLE	all	all	NSRND	network_audio
+NETWORK_NEXT	all	all	NS9D	network_audio
+NETWORK_PREVIOUS	all	all	NS9E	network_audio
+NETWORK_PAGE_NEXT	all	all	NS9X	network_audio
+NETWORK_PAGE_PREVIOUS	all	all	NS9Y	network_audio

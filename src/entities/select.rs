@@ -3,17 +3,18 @@
 
 //! Select entities.
 
-use crate::config_store::DeviceConfig;
+use crate::config_store::{DeviceConfig, Feature, Generation};
 use crate::entities::sensor::EMPTY;
 use crate::entities::{SelectKind, View, availability, is_off};
 use crate::errors::ServiceError;
+use denon_marantz::proto::NetworkAudioCommand;
 use denon_marantz::proto::source::{display_to_select_code, telnet_to_display_source};
 use denon_marantz::proto::{
     BluetoothOutputMode, DigitalCodec, DimmerMode, DiracFilter, DiracSlot, DynamicVolume, EcoMode,
     HdmiOutput, MultiEq, PictureMode, ReferenceLevelOffset, SoundModeGroup, SpeakerPreset,
     TunerBand,
 };
-use denon_marantz::{Avr, SoundModeEntry, State, Zone};
+use denon_marantz::{Avr, Command, SoundModeEntry, State, Zone};
 use serde_json::{Map, Value};
 
 /// Options of a select: the shown text, and the current one.
@@ -78,6 +79,8 @@ pub const fn name(kind: SelectKind) -> &'static str {
         SelectKind::QuickSelect => "Quick Select",
         SelectKind::TunerBand => "Tuner Band",
         SelectKind::BluetoothOutput => "Bluetooth Output",
+        SelectKind::NetworkFavorite => "Network Favorite",
+        SelectKind::TunerPreset => "Tuner Preset",
     }
 }
 
@@ -89,11 +92,14 @@ const MULTI_EQ_MODES: &[MultiEq] = &[
     MultiEq::Reference,
 ];
 const TUNER_BANDS: &[TunerBand] = &[TunerBand::Am, TunerBand::Fm];
+/// Tuner presets of a receiver.
+const TUNER_PRESETS: u8 = 56;
 /// Quick selects of a receiver: the first five exist on all models.
 const QUICK_SELECTS: usize = 5;
 
-/// Six selects always exist. With a telnet connection there are more, and the Dirac filter if the
-/// receiver supports it. Over HTTP, the `MultEq` select also comes with `AppCommand` if the receiver
+/// Six selects always exist. With a telnet connection there are more, the Dirac filter if the
+/// receiver supports it, the network favorites on receivers before HEOS, and the tuner presets if
+/// the receiver may have a tuner. Over HTTP, the `MultEq` select also comes with `AppCommand` if the receiver
 /// lists the query, and the monitor output if the receiver reads it over HTTP.
 pub const fn available(cfg: &DeviceConfig, kind: SelectKind) -> bool {
     match kind {
@@ -112,6 +118,8 @@ pub const fn available(cfg: &DeviceConfig, kind: SelectKind) -> bool {
         | SelectKind::BluetoothOutput => cfg.use_telnet,
         SelectKind::MultiEq => cfg.use_telnet || cfg.reads_audyssey(),
         SelectKind::DiracFilter => cfg.use_telnet && cfg.has_dirac(),
+        SelectKind::NetworkFavorite => cfg.use_telnet && cfg.offers(Feature::NetworkAudio),
+        SelectKind::TunerPreset => cfg.use_telnet && !matches!(cfg.has_tuner, Some(false)),
     }
 }
 
@@ -266,6 +274,28 @@ pub fn choices(v: &View<'_>, kind: SelectKind) -> Choices {
             device.bluetooth_output,
             BluetoothOutputMode::label,
         ),
+        SelectKind::NetworkFavorite => Choices {
+            options: network_favorite_labels(v).map(|(_, label)| label).collect(),
+            current: None,
+            numeric: false,
+        },
+        SelectKind::TunerPreset => {
+            let current = device.tuner.preset;
+            let mut found = None;
+            let options = tuner_preset_labels(v)
+                .map(|(n, label)| {
+                    if Some(n) == current {
+                        found = Some(label.clone());
+                    }
+                    label
+                })
+                .collect();
+            Choices {
+                options,
+                current: found,
+                numeric: false,
+            }
+        }
         SelectKind::QuickSelect => {
             let labels = quick_select_labels(v);
             let current = zone
@@ -305,6 +335,48 @@ fn quick_select_labels(v: &View<'_>) -> Vec<String> {
                 .map_or_else(|| format!("{kind} Select {}", i + 1), str::to_owned)
         })
         .collect()
+}
+
+/// The network favorites with their number from 1: `n name` for the ones with a name. While no
+/// names are known, `Favorite n` for all of them.
+fn network_favorite_labels(v: &View<'_>) -> impl Iterator<Item = (u8, String)> {
+    let favorites = &v.state.device().network_preset_names;
+    let named = |i: usize| {
+        favorites
+            .get(i)
+            .and_then(Option::as_deref)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    };
+    let count = v.cfg.network_favorites();
+    let any = (0..usize::from(count)).any(|i| named(i).is_some());
+    (1..=count).filter_map(move |n| match named(usize::from(n - 1)) {
+        Some(name) => Some((n, format!("{n} {name}"))),
+        None if !any => Some((n, format!("Favorite {n}"))),
+        None => None,
+    })
+}
+
+/// The tuner presets with their number from 1: `n name`, or `n frequency` for a preset without a
+/// name. While no presets are known, `Preset n` for all 56.
+fn tuner_preset_labels(v: &View<'_>) -> impl Iterator<Item = (u8, String)> {
+    let presets = &v.state.device().tuner.presets;
+    let any = presets
+        .iter()
+        .any(|p| p.name.is_some() || p.frequency.is_some());
+    (1..=TUNER_PRESETS).filter_map(move |n| {
+        let preset = presets.get(usize::from(n - 1));
+        let name = preset
+            .and_then(|p| p.name.as_deref())
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        match (name, preset.and_then(|p| p.frequency)) {
+            (Some(name), _) => Some((n, format!("{n} {name}"))),
+            (None, Some(frequency)) => Some((n, format!("{n} {frequency}"))),
+            (None, None) if !any => Some((n, format!("Preset {n}"))),
+            (None, None) => None,
+        }
+    })
 }
 
 fn enum_choices<T: Copy>(all: &[T], current: Option<T>, label: fn(T) -> &'static str) -> Choices {
@@ -494,6 +566,32 @@ pub async fn select_option(
                 .ok_or_else(invalid)?;
             avr.device().set_bluetooth_output(x).await?;
         }
+        SelectKind::NetworkFavorite => {
+            let (number, _) = network_favorite_labels(v)
+                .find(|(_, label)| label == option)
+                .ok_or_else(invalid)?;
+            let play = NetworkAudioCommand::Preset(number);
+            avr.send(Zone::Main, Command::NetworkAudio(play)).await?;
+        }
+        SelectKind::TunerPreset => {
+            let (number, _) = tuner_preset_labels(v)
+                .find(|(_, label)| label == option)
+                .ok_or_else(invalid)?;
+            // Older receivers use `A1` to `G8`. Until the receiver has shown its form, nothing is
+            // sent: a wrong form selects another preset.
+            // The current specs use `01` to `56` only.
+            let current = matches!(v.cfg.generation(), Generation::Current).then_some(false);
+            let lettered = v.state.device().tuner.presets_lettered;
+            match lettered.or(v.cfg.tuner_presets_lettered).or(current) {
+                Some(true) => avr.tuner().select_lettered_preset(number).await?,
+                Some(false) => avr.tuner().select_preset(number).await?,
+                None => {
+                    return Err(ServiceError::Blocked(
+                        "the receiver has not shown the form of its presets yet".into(),
+                    ));
+                }
+            }
+        }
         SelectKind::QuickSelect => {
             let number =
                 quick_select_number(&quick_select_labels(v), option).ok_or_else(invalid)?;
@@ -511,6 +609,86 @@ mod tests {
         ["Quick Select 1", "Movie night", "Quick Select 3"]
             .map(str::to_owned)
             .to_vec()
+    }
+
+    #[test]
+    fn network_favorites_show_their_names_or_numbers() {
+        use crate::config_store::CommApiVersion;
+        let mut cfg = crate::entities::tests::cfg(true, true);
+        let mut state = State::new(true);
+        let labels = |cfg: &DeviceConfig, state: &State| {
+            let v = View {
+                state,
+                cfg,
+                connected: true,
+                artwork_url: None,
+                paused: false,
+                sound_mode: None,
+                sound_groups: true,
+                heos: None,
+                position: None,
+            };
+            network_favorite_labels(&v).collect::<Vec<_>>()
+        };
+        let all = labels(&cfg, &state);
+        assert_eq!(56, all.len());
+        assert_eq!((1, "Favorite 1".to_owned()), all[0]);
+        cfg.comm_api_version = CommApiVersion::parse("0300");
+        assert_eq!(36, labels(&cfg, &state).len());
+        for line in ["NSH00Radio 1   ", "NSH02  Jazz"] {
+            let message = denon_marantz::proto::telnet::Message::parse(line).expect("message");
+            state.apply_message(&message);
+        }
+        assert_eq!(
+            vec![(1, "1 Radio 1".to_owned()), (3, "3 Jazz".to_owned())],
+            labels(&cfg, &state)
+        );
+    }
+
+    #[test]
+    fn tuner_presets_show_their_names_or_frequencies() {
+        let cfg = crate::entities::tests::cfg(true, true);
+        let mut state = State::new(true);
+        let v = |state: &'_ State| -> Vec<(u8, String)> {
+            let v = View {
+                state,
+                cfg: &cfg,
+                connected: true,
+                artwork_url: None,
+                paused: false,
+                sound_mode: None,
+                sound_groups: true,
+                heos: None,
+                position: None,
+            };
+            tuner_preset_labels(&v).collect()
+        };
+        let all = v(&state);
+        assert_eq!(
+            (56, (1, "Preset 1".to_owned())),
+            (all.len(), all[0].clone())
+        );
+        for line in ["OPTPN03KEXP     009250", "OPTPN05         010110", "TPAN03"] {
+            let message = denon_marantz::proto::telnet::Message::parse(line).expect("message");
+            state.apply_message(&message);
+        }
+        assert_eq!(
+            vec![(3, "3 KEXP".to_owned()), (5, "5 101.10 MHz".to_owned())],
+            v(&state)
+        );
+        let view = View {
+            state: &state,
+            cfg: &cfg,
+            connected: true,
+            artwork_url: None,
+            paused: false,
+            sound_mode: None,
+            sound_groups: true,
+            heos: None,
+            position: None,
+        };
+        let choices = choices(&view, SelectKind::TunerPreset);
+        assert_eq!(Some("3 KEXP".to_owned()), choices.current);
     }
 
     #[test]

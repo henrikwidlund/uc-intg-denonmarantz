@@ -7,7 +7,7 @@
 use super::{
     EntityKind, NumberKind, SelectKind, SensorKind, SwitchKind, View, attributes, definition,
 };
-use crate::config_store::{DeviceConfig, ReceiverGeneration};
+use crate::config_store::{CommApiVersion, DeviceConfig, ReceiverGeneration};
 use denon_marantz::State;
 use denon_marantz::proto::telnet::Message;
 use serde_json::json;
@@ -37,7 +37,9 @@ fn cfg() -> DeviceConfig {
         hdmi_output_over_http: None,
         quick_select_count: None,
         listed_queries: None,
-        heos: None,
+        comm_api_version: None,
+        has_tuner: None,
+        tuner_presets_lettered: None,
         info: None,
     }
 }
@@ -271,7 +273,7 @@ async fn heos_player(item: crate::test_support::HeosItem) -> denon_marantz_heos:
 #[tokio::test]
 async fn heos_shows_a_station_as_radio_with_the_station_as_album() {
     let cfg = DeviceConfig {
-        heos: Some(true),
+        comm_api_version: CommApiVersion::parse("0301"),
         ..cfg()
     };
     let player = heos_player(crate::test_support::HeosItem::station()).await;
@@ -309,7 +311,7 @@ async fn heos_shows_a_station_as_radio_with_the_station_as_album() {
 #[test]
 fn the_media_player_has_the_python_features() {
     let mut c = DeviceConfig {
-        heos: Some(false),
+        comm_api_version: CommApiVersion::parse("0300"),
         ..cfg()
     };
     let features = |c: &DeviceConfig| -> Vec<String> {
@@ -326,13 +328,13 @@ fn the_media_player_has_the_python_features() {
     assert!(!has(&marantz, "select_sound_mode") && !has(&marantz, "stop"));
     assert_eq!(21, marantz.len());
     // HEOS stops on both brands and gives the position.
-    c.heos = Some(true);
+    c.comm_api_version = CommApiVersion::parse("0301");
     let heos = features(&c);
     assert!(has(&heos, "stop") && has(&heos, "media_position") && has(&heos, "media_duration"));
     assert!(has(&heos, "repeat") && has(&heos, "shuffle"));
     assert_eq!(26, heos.len());
     // Not known yet: the position is there, so that the Remote has it once HEOS answers.
-    c.heos = None;
+    c.comm_api_version = None;
     let unknown = features(&c);
     assert!(has(&unknown, "stop") && has(&unknown, "media_position"));
     assert!(has(&unknown, "media_duration"));

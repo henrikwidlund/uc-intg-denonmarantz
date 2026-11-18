@@ -4,7 +4,7 @@
 //! Run entity commands on a receiver.
 
 use crate::config_store::DeviceConfig;
-use crate::device::heos;
+use crate::device::{discovery, heos};
 use crate::entities::media_player::{self, Action};
 use crate::entities::{
     EntityKind, SelectKind, View, is_off, number, remote, select, simple_commands, switch,
@@ -415,7 +415,13 @@ async fn action_run(
                 send(avr, Command::Raw(&text)).await?;
             }
         }
-        Action::Raw(text) => send(avr, Command::Raw(&text)).await?,
+        Action::Raw(text) => {
+            send(avr, Command::Raw(&text)).await?;
+            // The selects with the names need telnet.
+            if cfg.use_telnet {
+                discovery::read_names_after_save(avr, discovery::ExtraReads::new(cfg), &text).await;
+            }
+        }
         Action::SelectSoundMode(name) => {
             let view = command_view(&state, cfg);
             select::select_option(avr, &view, SelectKind::SoundMode, &name).await?;
@@ -462,7 +468,8 @@ mod tests {
     fn only_commands_that_do_not_read_the_state_run_before_the_start_ends() {
         let cfg = |heos: bool| -> DeviceConfig {
             serde_json::from_value(serde_json::json!({
-                "id": "A", "name": "C", "address": "h", "heos": heos
+                "id": "A", "name": "C", "address": "h",
+                "comm_api_version": if heos { "0301" } else { "0300" }
             }))
             .expect("json")
         };

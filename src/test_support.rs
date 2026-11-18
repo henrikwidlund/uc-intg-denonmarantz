@@ -188,6 +188,11 @@ impl Fake {
         Self::start_with(true, description_with_empty_serial(), Some(OLD_INFO)).await
     }
 
+    /// Start a receiver with this device information. The main zone is on.
+    pub async fn start_with_info(device_info: &'static [u8]) -> Self {
+        Self::start_with(true, DESCRIPTION.to_vec(), Some(device_info)).await
+    }
+
     /// Start a busy receiver: it answers the device information with HTTP 500. The main zone is
     /// on.
     pub async fn start_busy() -> Self {
