@@ -5,7 +5,7 @@
 //! family and records the commands that it gets.
 
 use denon_marantz::{Avr, HttpConfig, Pacing, ReceiverType, TelnetConfig};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -118,6 +118,7 @@ pub struct Fake {
     app_commands: Arc<AtomicUsize>,
     /// How often the receiver got an `AppCommand0300` request.
     audyssey_reads: Arc<AtomicUsize>,
+    pages: Arc<Pages>,
     /// The receiver is gone from its address: it closes every connection.
     gone: Arc<AtomicBool>,
     /// The tasks that accept connections. They end when the receiver leaves.
@@ -201,6 +202,8 @@ impl Fake {
         let pages = Arc::new(Pages {
             description,
             device_info,
+            description_reads: AtomicUsize::new(0),
+            read_delay_ms: AtomicU64::new(0),
         });
         let (port, listeners) = bind_loopback("bind the fake receiver").await;
         let commands = Arc::new(Mutex::new(Vec::new()));
@@ -235,6 +238,7 @@ impl Fake {
             commands,
             app_commands,
             audyssey_reads,
+            pages,
             gone,
             accepts,
         }
@@ -256,6 +260,18 @@ impl Fake {
     /// How often the receiver got an `AppCommand` request: the reads of the state.
     pub fn app_commands(&self) -> usize {
         self.app_commands.load(Ordering::SeqCst)
+    }
+
+    /// The receiver waits this long before it answers a read of the state, like a slow start.
+    pub fn set_read_delay(&self, delay: Duration) {
+        let ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+        self.pages.read_delay_ms.store(ms, Ordering::SeqCst);
+    }
+
+    /// How often the receiver was asked for its description: once for each connect that looks the
+    /// receiver up.
+    pub fn description_reads(&self) -> usize {
+        self.pages.description_reads.load(Ordering::SeqCst)
     }
 
     /// How often the receiver got an `AppCommand0300` request: the reads of Audyssey and the
@@ -304,6 +320,10 @@ struct Pages {
     description: Vec<u8>,
     /// `None`: the device information is answered with HTTP 500.
     device_info: Option<&'static [u8]>,
+    /// How often the description was asked for.
+    description_reads: AtomicUsize,
+    /// Wait before the answer to a read of the state, in milliseconds.
+    read_delay_ms: AtomicU64,
 }
 
 async fn serve(
@@ -337,6 +357,7 @@ async fn serve(
         let answer: Option<Vec<u8>> = match (method.as_str(), path.as_str()) {
             ("GET", "/goform/Deviceinfo.xml") => pages.device_info.map(<[u8]>::to_vec),
             ("GET", "/description.xml") if !pages.description.is_empty() => {
+                pages.description_reads.fetch_add(1, Ordering::SeqCst);
                 Some(pages.description.clone())
             }
             ("GET", path) if path.starts_with(COMMAND) => {
@@ -348,6 +369,10 @@ async fn serve(
             }
             ("POST", "/goform/AppCommand.xml") => {
                 app_commands.fetch_add(1, Ordering::SeqCst);
+                let delay = pages.read_delay_ms.load(Ordering::SeqCst);
+                if delay > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
                 Some(answer_for(&body, power_on))
             }
             // Every receiver that is read with `AppCommand` is asked. A receiver with Dirac Live

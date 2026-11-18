@@ -21,10 +21,6 @@ use tokio::time::sleep;
 /// A volume or mute value from a command is used for the next toggle or step until the receiver
 /// reports it.
 const EXPECTED_MAX_AGE: Duration = Duration::from_secs(3);
-/// Volume step of the receiver for volume up and down in dB.
-const NATIVE_STEP: f32 = 0.5;
-const MAX_DB: f32 = 18.0;
-const MIN_DB: f32 = -80.0;
 
 /// Values set by the last commands.
 #[derive(Debug, Default)]
@@ -80,6 +76,56 @@ pub async fn run_steps(
         }
     }
     Ok(())
+}
+
+/// The command does not read the state, so it can run before the start has read it. Next,
+/// previous and stop read it on a receiver that can have HEOS: they go to HEOS while it plays.
+pub fn without_state(
+    cfg: &DeviceConfig,
+    kind: EntityKind,
+    cmd_id: &str,
+    params: Option<&Map<String, Value>>,
+) -> bool {
+    match kind {
+        EntityKind::MediaPlayer => media_player::command(cmd_id, params)
+            .is_ok_and(|action| action_without_state(cfg, &action)),
+        EntityKind::Remote => remote::command(cmd_id, params)
+            .is_ok_and(|run| run.actions.iter().all(|a| action_without_state(cfg, a))),
+        _ => false,
+    }
+}
+
+const fn action_without_state(cfg: &DeviceConfig, action: &Action) -> bool {
+    match action {
+        Action::On
+        | Action::Off
+        | Action::Volume(_)
+        | Action::VolumeUp
+        | Action::VolumeDown
+        | Action::Mute(_)
+        | Action::CursorUp
+        | Action::CursorDown
+        | Action::CursorLeft
+        | Action::CursorRight
+        | Action::CursorEnter
+        | Action::Back
+        | Action::ContextMenu
+        | Action::Info
+        | Action::ChannelUp
+        | Action::ChannelDown
+        | Action::Raw(_) => true,
+        Action::Next | Action::Previous | Action::Stop => !cfg.may_have_heos(),
+        // The typed calls check the state, and toggles send the other value.
+        Action::Simple(_)
+        | Action::Toggle
+        | Action::PlayPause
+        | Action::MuteToggle
+        | Action::Menu
+        | Action::SelectSource(_)
+        | Action::SelectSoundMode(_)
+        | Action::Repeat(_)
+        | Action::Shuffle(_) => false,
+    }
 }
 
 /// Run an entity command.
@@ -208,39 +254,6 @@ async fn send(avr: &Avr, command: Command<'_>) -> Result<(), ServiceError> {
     Ok(())
 }
 
-/// Volume up or down by the configured step. The step of the receiver is used when it is the
-/// same, other steps are set as a new volume.
-async fn volume_step(
-    avr: &Avr,
-    cfg: &DeviceConfig,
-    expected: &Expected,
-    up: bool,
-) -> Result<(), ServiceError> {
-    let zone = avr.zone(Zone::Main)?;
-    if (cfg.volume_step - NATIVE_STEP).abs() < f32::EPSILON {
-        if up {
-            zone.volume_up().await?;
-        } else {
-            zone.volume_down().await?;
-        }
-        return Ok(());
-    }
-    let state = avr.snapshot();
-    let current = state.zone(Zone::Main).volume.map(denon_marantz::Volume::db);
-    let base = fresh(&expected.volume)
-        .or(current)
-        .ok_or_else(|| ServiceError::ServiceUnavailable("The volume is not known yet".into()))?;
-    let step = if up {
-        cfg.volume_step
-    } else {
-        -cfg.volume_step
-    };
-    let db = (base + step).clamp(MIN_DB, MAX_DB);
-    store(&expected.volume, db);
-    zone.set_volume_db(db).await?;
-    Ok(())
-}
-
 /// What the commands read of the state. They do not read the active sound mode or HEOS. A group is
 /// a valid sound mode while the receiver gave no list.
 const fn command_view<'a>(state: &'a State, cfg: &'a DeviceConfig) -> View<'a> {
@@ -356,9 +369,9 @@ async fn action_run(
             store(&expected.volume, db);
             zone.set_volume_db(db).await?;
         }
-        Action::VolumeUp | Action::VolumeDown => {
-            volume_step(avr, cfg, expected, matches!(action, Action::VolumeUp)).await?;
-        }
+        // The receiver steps from its own volume, so the state is not needed.
+        Action::VolumeUp => zone.volume_up().await?,
+        Action::VolumeDown => zone.volume_down().await?,
         Action::MuteToggle => {
             let muted = fresh(&expected.mute).or(main.muted).unwrap_or(false);
             store(&expected.mute, !muted);
@@ -443,6 +456,35 @@ mod tests {
         assert_eq!(Some("a".into()), step(&choices(Some("c")), true, true));
         assert_eq!(None, step(&choices(Some("a")), false, false));
         assert_eq!(Some("c".into()), step(&choices(Some("a")), false, true));
+    }
+
+    #[test]
+    fn only_commands_that_do_not_read_the_state_run_before_the_start_ends() {
+        let cfg = |heos: bool| -> DeviceConfig {
+            serde_json::from_value(serde_json::json!({
+                "id": "A", "name": "C", "address": "h", "heos": heos
+            }))
+            .expect("json")
+        };
+        let media =
+            |cmd: &str, heos: bool| without_state(&cfg(heos), EntityKind::MediaPlayer, cmd, None);
+        for cmd in ["on", "off", "volume_up", "mute", "cursor_up", "MVUP"] {
+            assert!(media(cmd, true), "{cmd}");
+        }
+        for cmd in [
+            "toggle",
+            "play_pause",
+            "mute_toggle",
+            "menu",
+            "DIMMER_BRIGHT",
+        ] {
+            assert!(!media(cmd, false), "{cmd}");
+        }
+        // Next goes to HEOS while it plays: that is in the state.
+        assert!(media("next", false));
+        assert!(!media("next", true));
+        let select = EntityKind::Select(SelectKind::InputSource);
+        assert!(!without_state(&cfg(false), select, "select_option", None));
     }
 
     #[test]

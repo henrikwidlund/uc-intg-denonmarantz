@@ -5,7 +5,7 @@
 //! The tests check what the actor asks for and shows when the receiver answers, does not answer,
 //! sends events or closes the connection.
 
-use super::actor::CurrentAvr;
+use super::actor::{CurrentAvr, read_differently};
 use super::discovery::{self, Known, TEST_BUILDER, TEST_DISCOVERY, TestBuilder};
 use super::heos::TEST_HEOS;
 use super::{Command, Connect, DenonActor, DeviceEvent, DeviceStatus, Disconnect, UpdateConfig};
@@ -15,7 +15,7 @@ use crate::entities::{EntityKind, SelectKind, SensorKind, SwitchKind};
 use crate::errors::ServiceError;
 use crate::test_support::{Fake, FakeHeos, FakeTelnet, HeosItem, test_builder};
 use actix::{Actor, Addr, Context, Handler};
-use denon_marantz::{Brand, DiscoveredReceiver, ReceiverType, TypeProof};
+use denon_marantz::{Brand, DiscoveredReceiver, Info, ReceiverType, TypeProof, UpdateMethod};
 use serde_json::Value;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -73,12 +73,22 @@ fn cfg() -> DeviceConfig {
         quick_select_count: None,
         listed_queries: None,
         heos: None,
+        info: None,
     }
 }
 
 /// An actor that is connected to a fake receiver. `answers` gives the lines of the telnet port for
 /// a line of the actor.
 async fn rig(
+    answers: impl Fn(&str) -> Vec<String> + Send + Sync + 'static,
+    retry: Duration,
+) -> Rig {
+    rig_with(|_| cfg(), answers, retry).await
+}
+
+/// As [`rig`], with the configuration that `cfg` gives for the HTTP port of the fake receiver.
+async fn rig_with(
+    cfg: impl FnOnce(u16) -> DeviceConfig,
     answers: impl Fn(&str) -> Vec<String> + Send + Sync + 'static,
     retry: Duration,
 ) -> Rig {
@@ -90,9 +100,13 @@ async fn rig(
     TEST_BUILDER.with(|slot| *slot.borrow_mut() = Some(setup));
     let events = Arc::new(Mutex::new(Vec::new()));
     let collector = Collector(events.clone()).start();
-    let actor = DenonActor::new("SERIAL0000001".into(), cfg(), collector.recipient())
-        .with_retry_delay(retry)
-        .start();
+    let actor = DenonActor::new(
+        "SERIAL0000001".into(),
+        cfg(http_port),
+        collector.recipient(),
+    )
+    .with_retry_delay(retry)
+    .start();
     actor.send(Connect).await.expect("connect");
     Rig {
         actor,
@@ -1195,4 +1209,265 @@ async fn the_heos_client_is_new_after_a_disconnect() {
         heos.count("player/get_players") > reads
     })
     .await;
+}
+
+/// The receiver values that the actor stored last.
+fn stored_info(events: &Mutex<Vec<DeviceEvent>>) -> Option<Info> {
+    events
+        .lock()
+        .expect("lock")
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            DeviceEvent::Config { cfg, .. } => cfg.info.clone(),
+            _ => None,
+        })
+}
+
+/// The receiver values of the fake receiver, from a connect that looks them up.
+async fn fake_info() -> Info {
+    let rig = rig(answers_all, QUICK).await;
+    until("the stored values", 5, || {
+        stored_info(&rig.events).is_some()
+    })
+    .await;
+    stored_info(&rig.events).expect("info")
+}
+
+#[actix::test]
+async fn a_connect_stores_the_receiver_values_and_the_next_one_uses_them() {
+    let rig = rig(answers_all, QUICK).await;
+    until("the stored values", 5, || {
+        stored_info(&rig.events).is_some()
+    })
+    .await;
+    let reads = rig.http.description_reads();
+    assert!(reads >= 1);
+    let stored = rig
+        .events
+        .lock()
+        .expect("lock")
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            DeviceEvent::Config { cfg, .. } if cfg.info.is_some() => Some(cfg.clone()),
+            _ => None,
+        });
+    let stored = stored.expect("config");
+    let text = serde_json::to_string(&stored).expect("json");
+    assert_eq!(stored, serde_json::from_str(&text).expect("read"));
+    // A failed connect before can have sent this status already.
+    let before = status_count(&rig.events, DeviceStatus::Disconnected);
+    rig.actor.send(Disconnect).await.expect("disconnect");
+    until("the disconnect", 5, || {
+        status_count(&rig.events, DeviceStatus::Disconnected) > before
+    })
+    .await;
+    let connected = status_count(&rig.events, DeviceStatus::Connected);
+    rig.actor.send(Connect).await.expect("connect");
+    until("the new connection", 5, || {
+        status_count(&rig.events, DeviceStatus::Connected) > connected
+    })
+    .await;
+    assert_eq!(reads, rig.http.description_reads());
+}
+
+#[actix::test]
+async fn changed_receiver_values_are_stored_without_a_new_connect() {
+    let mut info = fake_info().await;
+    let name = info.friendly_name.clone();
+    info.friendly_name = "Old name".into();
+    let cfg = |port| DeviceConfig {
+        info: Some(Info { port, ..info }),
+        ..cfg()
+    };
+    let rig = rig_with(cfg, answers_all, QUICK).await;
+    until("the new values", 5, || {
+        stored_info(&rig.events).is_some_and(|i| i.friendly_name == name)
+    })
+    .await;
+    assert_eq!(0, rig.http.description_reads());
+    assert_eq!(1, status_count(&rig.events, DeviceStatus::Connected));
+}
+
+#[actix::test]
+async fn another_receiver_at_the_stored_address_is_looked_up() {
+    const OTHER_MAC: &str = "AABBCCDDEEFF";
+    let mut info = fake_info().await;
+    info.mac_address = Some(OTHER_MAC.into());
+    let cfg = |port| DeviceConfig {
+        mac: Some(OTHER_MAC.into()),
+        info: Some(Info { port, ..info }),
+        ..cfg()
+    };
+    TEST_DISCOVERY.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    let rig = rig_with(cfg, answers_all, QUICK).await;
+    until("the look-up", 5, || rig.http.description_reads() >= 1).await;
+    until("the lost connection", 5, || {
+        status_count(&rig.events, DeviceStatus::Disconnected) >= 1
+    })
+    .await;
+    assert!(
+        stored_info(&rig.events).is_none_or(|i| i.mac_address.as_deref() == Some(OTHER_MAC)),
+        "the values of the other receiver are not stored"
+    );
+}
+
+#[actix::test]
+async fn a_failed_connect_with_the_stored_values_looks_the_receiver_up_at_once() {
+    let mut info = fake_info().await;
+    // A port where nothing answers.
+    info.port = 9;
+    let cfg = |_| DeviceConfig {
+        info: Some(info),
+        ..cfg()
+    };
+    let rig = rig_with(cfg, answers_all, Duration::from_secs(60)).await;
+    until("the connection", 10, || {
+        status_count(&rig.events, DeviceStatus::Connected) == 1
+    })
+    .await;
+    assert!(rig.http.description_reads() >= 1);
+}
+
+/// A media player command without parameters.
+fn media_command(cmd_id: &str) -> Command {
+    Command {
+        kind: EntityKind::MediaPlayer,
+        cmd_id: cmd_id.into(),
+        params: None,
+    }
+}
+
+/// A rig whose receiver values are stored, connected again with a start that reads slowly. Also
+/// gives how often it was connected before.
+async fn slow_start_rig() -> (Rig, usize) {
+    let rig = rig(answers_all, QUICK).await;
+    until("the stored values", 5, || {
+        stored_info(&rig.events).is_some()
+    })
+    .await;
+    // A failed connect before can have sent this status already.
+    let before = status_count(&rig.events, DeviceStatus::Disconnected);
+    rig.actor.send(Disconnect).await.expect("disconnect");
+    until("the disconnect", 5, || {
+        status_count(&rig.events, DeviceStatus::Disconnected) > before
+    })
+    .await;
+    // Below the request timeout of the tests.
+    rig.http.set_read_delay(Duration::from_millis(300));
+    let connected = status_count(&rig.events, DeviceStatus::Connected);
+    rig.actor.send(Connect).await.expect("connect");
+    (rig, connected)
+}
+
+#[actix::test]
+async fn a_command_that_does_not_read_the_state_is_sent_before_the_start_ends() {
+    let (rig, connected) = slow_start_rig().await;
+    rig.actor
+        .send(media_command("volume_up"))
+        .await
+        .expect("send")
+        .expect("volume up");
+    assert_eq!(
+        connected,
+        status_count(&rig.events, DeviceStatus::Connected)
+    );
+    assert!(
+        rig.http.commands().iter().any(|c| c == "MVUP"),
+        "{:?}",
+        rig.http.commands()
+    );
+}
+
+#[actix::test]
+async fn a_command_after_one_that_waits_for_the_state_waits_too() {
+    let (rig, _) = slow_start_rig().await;
+    let toggle = rig.actor.send(media_command("mute_toggle"));
+    let up = rig.actor.send(media_command("volume_up"));
+    toggle.await.expect("send").expect("mute toggle");
+    up.await.expect("send").expect("volume up");
+    let sent = || -> Vec<String> {
+        rig.http
+            .commands()
+            .into_iter()
+            .chain(rig.telnet.received())
+            .filter(|line| line.starts_with("MU") || line == "MVUP")
+            .collect()
+    };
+    // Telnet commands are queued: the receiver gets them a little later.
+    until("both commands", 5, || sent().len() >= 2).await;
+    let sent = sent();
+    let mute = sent.iter().position(|l| l.starts_with("MU"));
+    let up = sent.iter().position(|l| l == "MVUP");
+    assert!(mute.is_some() && up.is_some() && mute < up, "{sent:?}");
+}
+
+#[actix::test]
+async fn another_receiver_is_looked_up_on_each_try_until_it_is_found() {
+    const OTHER_MAC: &str = "AABBCCDDEEFF";
+    let mut info = fake_info().await;
+    info.mac_address = Some(OTHER_MAC.into());
+    let cfg = |port| DeviceConfig {
+        mac: Some(OTHER_MAC.into()),
+        info: Some(Info { port, ..info }),
+        ..cfg()
+    };
+    TEST_DISCOVERY.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    let rig = rig_with(cfg, answers_all, QUICK).await;
+    // The first connect uses the stored values. Each try after it looks the receiver up.
+    until("three look-ups", 15, || rig.http.description_reads() >= 3).await;
+    assert_eq!(1, status_count(&rig.events, DeviceStatus::Connected));
+}
+
+#[actix::test]
+async fn changed_values_update_the_receiver_kind_without_a_new_connect() {
+    let info = fake_info().await;
+    let count = info.quick_select_count;
+    let cfg = |port| DeviceConfig {
+        info: Some(Info {
+            port,
+            quick_select_count: Some(99),
+            ..info
+        }),
+        quick_select_count: Some(99),
+        ..cfg()
+    };
+    let rig = rig_with(cfg, answers_all, QUICK).await;
+    let updated = || {
+        rig.events.lock().expect("lock").iter().any(|event| {
+            matches!(event, DeviceEvent::Config { cfg, .. }
+                if cfg.quick_select_count == count
+                    && cfg.info.as_ref().is_some_and(|i| i.quick_select_count == count))
+        })
+    };
+    until("the new receiver kind", 5, updated).await;
+    assert_eq!(1, status_count(&rig.events, DeviceStatus::Connected));
+}
+
+#[actix::test]
+async fn only_a_new_type_port_or_update_method_connects_again() {
+    let info = fake_info().await;
+    let renamed = Info {
+        friendly_name: "Other name".into(),
+        ..info.clone()
+    };
+    assert!(!read_differently(&info, &renamed));
+    let changed = [
+        Info {
+            port: 1,
+            ..info.clone()
+        },
+        Info {
+            receiver_type: ReceiverType::AvrX2016,
+            ..info.clone()
+        },
+        Info {
+            update_method: UpdateMethod::StatusPages,
+            ..info.clone()
+        },
+    ];
+    for new in &changed {
+        assert!(read_differently(&info, new), "{new:?}");
+    }
 }

@@ -74,7 +74,7 @@ pub struct DeviceConfig {
     /// Not used. Kept for the Python integration.
     #[serde(default, deserialize_with = "false_if_null")]
     pub zone3: bool,
-    /// Volume step in dB for volume up and down.
+    /// Not used: volume up and down use the step of the receiver. Kept for the Python integration.
     #[serde(default = "default_volume_step", deserialize_with = "step_if_null")]
     pub volume_step: f32,
     /// Not used. Kept for the Python integration.
@@ -137,6 +137,14 @@ pub struct DeviceConfig {
         deserialize_with = "none_if_unknown"
     )]
     pub heos: Option<bool>,
+    /// What the library found at the last full connect. With it, the next connect sends no
+    /// request. A value from another library version that does not load is `None`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "none_if_unknown"
+    )]
+    pub info: Option<denon_marantz::Info>,
 }
 
 /// What the id of a receiver is.
@@ -312,6 +320,25 @@ impl DeviceConfig {
             Some(count) => slot <= count,
             None => true,
         }
+    }
+
+    /// Take what a device actor found on the receiver: the address, the receiver kind, the ids and
+    /// the receiver values. The other fields are settings and keep their values. `None` if nothing
+    /// changed, else whether the receiver kind changed.
+    pub fn take_found(&mut self, found: Self) -> Option<bool> {
+        let kind = found.kind();
+        let new_kind = kind != self.kind();
+        let new_ids = self.add_ids(found.serial.as_deref(), found.mac.as_deref());
+        let new_info = found.info.is_some() && self.info != found.info;
+        if self.address == found.address && !new_kind && !new_ids && !new_info {
+            return None;
+        }
+        if new_info {
+            self.info = found.info;
+        }
+        self.address = found.address;
+        self.set_kind(kind);
+        Some(new_kind)
     }
 
     pub const fn kind(&self) -> ReceiverKind {
@@ -765,6 +792,7 @@ mod tests {
             quick_select_count: None,
             listed_queries: None,
             heos: None,
+            info: None,
         }
     }
 
@@ -904,6 +932,34 @@ mod tests {
         )
         .expect("json");
         assert_eq!(ReceiverKind::default(), d.kind());
+    }
+
+    #[test]
+    fn found_values_are_taken_and_settings_are_kept() {
+        let old: DeviceConfig =
+            serde_json::from_str(r#"{"id":"A","name":"C","address":"h","use_telnet":false}"#)
+                .expect("json");
+        let mut cfg = old.clone();
+        assert_eq!(None, cfg.take_found(old.clone()));
+        let mut found = old;
+        found.use_telnet = true;
+        found.address = "h2".into();
+        found.receiver_type = Some(ReceiverGeneration::AvrX);
+        assert_eq!(Some(true), cfg.take_found(found));
+        assert_eq!(("h2", false), (cfg.address.as_str(), cfg.use_telnet));
+        let info =
+            r#"{"id":"A","name":"C","address":"h2","receiver_type":"avr_x","info":{"host":"h2"}}"#;
+        // A value that does not load is not taken: `None` keeps the stored one.
+        let found: DeviceConfig = serde_json::from_str(info).expect("json");
+        assert_eq!(None, cfg.take_found(found));
+    }
+
+    #[test]
+    fn receiver_values_of_another_library_version_read_as_none() {
+        let d: DeviceConfig =
+            serde_json::from_str(r#"{"id":"A","name":"C","address":"h","info":{"host":"h"}}"#)
+                .expect("json");
+        assert_eq!(None, d.info);
     }
 
     #[test]

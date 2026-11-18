@@ -529,19 +529,11 @@ impl Handler<DeviceEvent> for Controller {
                 let Some(device) = self.devices.get_mut(&*key) else {
                     return;
                 };
-                // Only take what the actor found on the receiver: the address, the receiver
-                // kind and the ids. The event can be older than the settings of the controller.
-                let kind = cfg.kind();
-                let new_kind = kind != device.cfg.kind();
-                let new_ids = device
-                    .cfg
-                    .add_ids(cfg.serial.as_deref(), cfg.mac.as_deref());
-                if device.cfg.address == cfg.address && !new_kind && !new_ids {
+                // The event can be older than the settings of the controller.
+                let Some(new_kind) = device.cfg.take_found(*cfg) else {
                     return;
-                }
-                info!("[{}] saving what the receiver reported", cfg.name);
-                device.cfg.address = cfg.address;
-                device.cfg.set_kind(kind);
+                };
+                info!("[{}] saving what the receiver reported", device.cfg.name);
                 if new_kind {
                     // The receiver can have fewer entities now.
                     self.purge_entities();

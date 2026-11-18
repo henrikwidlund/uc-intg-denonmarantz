@@ -611,7 +611,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=e495076#e495076194ea9677f4c6e5f451992133ac7e8ea8"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=75f3e4f#75f3e4f35292a77857d847c520a6c9197727a31e"
 dependencies = [
  "bytes",
  "denon-marantz-discovery",
@@ -621,6 +621,7 @@ dependencies = [
  "hyper-util",
  "if-addrs",
  "mdns-sd 0.21.7",
+ "serde",
  "socket2",
  "thiserror",
  "tokio",
@@ -630,7 +631,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz-discovery"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=e495076#e495076194ea9677f4c6e5f451992133ac7e8ea8"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=75f3e4f#75f3e4f35292a77857d847c520a6c9197727a31e"
 dependencies = [
  "http 1.5.0",
 ]
@@ -638,7 +639,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz-heos"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=e495076#e495076194ea9677f4c6e5f451992133ac7e8ea8"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=75f3e4f#75f3e4f35292a77857d847c520a6c9197727a31e"
 dependencies = [
  "denon-marantz-heos-proto",
  "serde",
@@ -650,7 +651,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz-heos-proto"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=e495076#e495076194ea9677f4c6e5f451992133ac7e8ea8"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=75f3e4f#75f3e4f35292a77857d847c520a6c9197727a31e"
 dependencies = [
  "serde",
  "serde_json",
@@ -660,9 +661,10 @@ dependencies = [
 [[package]]
 name = "denon-marantz-proto"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=e495076#e495076194ea9677f4c6e5f451992133ac7e8ea8"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=75f3e4f#75f3e4f35292a77857d847c520a6c9197727a31e"
 dependencies = [
  "quick-xml",
+ "serde",
  "thiserror",
 ]
 

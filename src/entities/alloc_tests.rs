@@ -36,6 +36,7 @@ fn cfg() -> DeviceConfig {
         quick_select_count: None,
         listed_queries: None,
         heos: None,
+        info: None,
     }
 }
 

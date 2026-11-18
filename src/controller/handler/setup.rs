@@ -23,9 +23,6 @@ use uc_api::ws::{EventCategory, WsMessage};
 
 /// Delay so that the request is acknowledged before the next setup event.
 const ACK_DELAY: Duration = Duration::from_millis(100);
-/// Lowest and highest volume step in dB.
-const MIN_VOLUME_STEP: f32 = 0.1;
-const MAX_VOLUME_STEP: f32 = 10.0;
 /// Highest time between signal reads in seconds.
 const MAX_SIGNAL_POLL_SECS: u16 = 3600;
 
@@ -100,7 +97,6 @@ struct Options {
     show_all_inputs: bool,
     is_denon: bool,
     use_telnet: bool,
-    volume_step: f32,
     is_dirac_supported: bool,
     signal_poll_secs: u16,
 }
@@ -111,7 +107,6 @@ impl Options {
             show_all_inputs: cfg.show_all_inputs,
             is_denon: cfg.is_denon,
             use_telnet: cfg.use_telnet,
-            volume_step: cfg.volume_step,
             is_dirac_supported: cfg.has_dirac(),
             signal_poll_secs: cfg.signal_poll_secs,
         }
@@ -122,7 +117,6 @@ impl Options {
             show_all_inputs: false,
             is_denon: found.is_denon,
             use_telnet: true,
-            volume_step: 1.0,
             is_dirac_supported: found.is_dirac_supported,
             signal_poll_secs: 0,
         }
@@ -136,19 +130,6 @@ impl Options {
         }
         if let Some(mode) = values.get("connection_mode") {
             self.use_telnet = mode == "use_telnet";
-        }
-        if let Some(step) = values.get("volume_step") {
-            let step: f32 = step
-                .trim()
-                .replace(',', ".")
-                .parse()
-                .map_err(|_| format!("Invalid volume step: {step}"))?;
-            if !(MIN_VOLUME_STEP..=MAX_VOLUME_STEP).contains(&step) {
-                return Err(format!(
-                    "The volume step must be from {MIN_VOLUME_STEP} to {MAX_VOLUME_STEP}"
-                ));
-            }
-            self.volume_step = step;
         }
         if let Some(v) = values.get("is_dirac_supported") {
             self.is_dirac_supported = v.eq_ignore_ascii_case("true");
@@ -170,7 +151,7 @@ impl Options {
     }
 
     /// The fields of the page, with the labels of the Python integration.
-    fn fields(&self) -> Vec<Value> {
+    fn fields(self) -> Vec<Value> {
         vec![
             json!({
                 "id": "show_all_inputs",
@@ -197,14 +178,6 @@ impl Options {
                         { "id": "use_telnet", "label": { "en": "Use Telnet connection" } },
                         { "id": "use_http", "label": { "en": "Use HTTP connection" } }
                     ]
-                } }
-            }),
-            json!({
-                "id": "volume_step",
-                "label": { "en": "Volume step" },
-                "field": { "number": {
-                    "value": self.volume_step, "min": 0.5, "max": 10, "steps": 1,
-                    "decimals": 1, "unit": { "en": "dB" }
                 } }
             }),
             json!({
@@ -643,7 +616,7 @@ impl Controller {
                         support_sound_mode: identified.support_sound_mode,
                         show_all_inputs: options.show_all_inputs,
                         use_telnet: options.use_telnet,
-                        volume_step: options.volume_step,
+                        volume_step: old.map_or(0.5, |c| c.volume_step),
                         is_denon: options.is_denon,
                         is_dirac_supported: Some(identified.is_dirac_supported),
                         signal_poll_secs: options.signal_poll_secs,
@@ -653,6 +626,7 @@ impl Controller {
                         quick_select_count: identified.kind.quick_select_count,
                         listed_queries: identified.kind.listed_queries,
                         heos: identified.kind.heos,
+                        info: Some(identified.info),
                     };
                     if let Some(device) = act.devices.get_mut(cfg.key()) {
                         device.cfg = cfg.clone();
@@ -903,7 +877,6 @@ impl Controller {
         cfg.show_all_inputs = options.show_all_inputs;
         cfg.is_denon = options.is_denon;
         cfg.use_telnet = options.use_telnet;
-        cfg.volume_step = options.volume_step;
         cfg.is_dirac_supported = Some(options.is_dirac_supported);
         cfg.signal_poll_secs = options.signal_poll_secs;
         if let Some(address) = address {
@@ -1288,7 +1261,6 @@ mod tests {
             show_all_inputs: false,
             is_denon: true,
             use_telnet: true,
-            volume_step: 0.5,
             is_dirac_supported: false,
             signal_poll_secs: 0,
         }
@@ -1308,13 +1280,11 @@ mod tests {
                 ("manufacturer", "marantz"),
                 ("show_all_inputs", "true"),
                 ("connection_mode", "use_http"),
-                ("volume_step", "1,5"),
                 ("is_dirac_supported", "True"),
                 ("signal_poll_secs", "10"),
             ]))
             .expect("ok");
         assert!(!o.is_denon && o.show_all_inputs && !o.use_telnet && o.is_dirac_supported);
-        assert!((o.volume_step - 1.5).abs() < f32::EPSILON);
         assert_eq!(10, o.signal_poll_secs);
         // Missing fields keep the values.
         assert_eq!(options(), options().read(&HashMap::new()).expect("ok"));
@@ -1322,13 +1292,7 @@ mod tests {
 
     #[test]
     fn invalid_options_are_rejected() {
-        for (key, value) in [
-            ("volume_step", "0"),
-            ("volume_step", "11"),
-            ("volume_step", "abc"),
-            ("signal_poll_secs", "-1"),
-            ("signal_poll_secs", "99999"),
-        ] {
+        for (key, value) in [("signal_poll_secs", "-1"), ("signal_poll_secs", "99999")] {
             assert!(
                 options().read(&values(&[(key, value)])).is_err(),
                 "{key}={value}"

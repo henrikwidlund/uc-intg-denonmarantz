@@ -5,8 +5,9 @@
 
 use crate::config_store::{self, DeviceConfig};
 use denon_marantz::{
-    Ask, Avr, AvrBuilder, Brand, DiscoveredReceiver, DiscoveryConfig, Error, PageStatus, Query,
-    QueryGroup, ReceiverType, StartOptions, StartReport, Started, UpdateMethod, discover_all,
+    Ask, Avr, AvrBuilder, Brand, DiscoveredReceiver, DiscoveryConfig, Error, Info, InfoCheck,
+    PageStatus, Query, QueryGroup, ReceiverType, StartOptions, StartReport, Started, TelnetStart,
+    UpdateMethod, discover_all,
 };
 use log::debug;
 use std::sync::Arc;
@@ -149,6 +150,12 @@ async fn identify_with(host: &str, known: Option<Known>) -> Result<Avr, Error> {
     result
 }
 
+/// Connect with the values of an earlier connect. It sends no request: the start checks the
+/// values, see [`StartReport::info_check`].
+pub async fn connect_known(host: &str, info: Info) -> Result<Avr, Error> {
+    builder(host, None).known(info).connect().await
+}
+
 /// The builder of a connection. A test can change it, so that the library talks to a fake
 /// receiver.
 fn builder(host: &str, known: Option<Known>) -> AvrBuilder {
@@ -187,10 +194,29 @@ pub async fn identify_retry(
     known: Option<Known>,
     deadline: Instant,
 ) -> Result<Avr, Error> {
+    retry_network(host, deadline, || identify(host, known)).await
+}
+
+/// Start the receiver as [`start`] does and retry network errors fast until `deadline`. A
+/// connect with known values sends its first request here.
+pub async fn start_retry(
+    avr: &Arc<Avr>,
+    telnet: bool,
+    deadline: Instant,
+) -> Result<Started, Error> {
+    retry_network(&avr.info().host, deadline, || start(avr, telnet)).await
+}
+
+/// Run `step` again after a network error, with a short growing delay, until `deadline`.
+async fn retry_network<T, F: Future<Output = Result<T, Error>>>(
+    host: &str,
+    deadline: Instant,
+    mut step: impl FnMut() -> F,
+) -> Result<T, Error> {
     let mut delay = NETWORK_RETRY_INTERVAL;
     let mut first = true;
     loop {
-        match identify(host, known).await {
+        match step().await {
             Err(e) if e.is_unreachable() && Instant::now() + delay < deadline => {
                 // One line for the first failure only: wake-up can need many tries.
                 if first {
@@ -294,22 +320,54 @@ fn toggles_missing(avr: &Avr) -> bool {
         || device.triggers.iter().any(Option::is_none)
 }
 
+/// Wait for the end of the start and pass the check of the stored values to `checked`. With
+/// telnet, it then runs [`read_missing_pages`]. Runs in the background: commands do not wait for
+/// it.
+pub async fn after_start(
+    avr: Arc<Avr>,
+    started: Started,
+    telnet: bool,
+    name: String,
+    delay: Duration,
+    checked: impl FnOnce(InfoCheck),
+    synced: impl FnOnce(),
+) {
+    // The extra values are queued before the wait: it covers the queries that wait at the call.
+    if telnet {
+        read_extra_values(&avr).await;
+    }
+    let mut report = started.basic_synced().await;
+    checked(std::mem::replace(
+        &mut report.info_check,
+        InfoCheck::NotNeeded,
+    ));
+    // With HTTP only, a page read could delay a command: the pages are not read again.
+    if telnet {
+        read_missing_pages(avr, report, name, delay, synced).await;
+    }
+}
+
 /// The receiver sometimes answers a web page with an error (HTTP status 500) and does not answer
 /// every telnet query when it is busy. The library asks once more at once. This reads the pages
 /// and the toggles again after a pause, so that their values do not stay empty until the next
-/// connect. It starts when the answers of the start are in, after it calls `synced`. Runs in the
-/// background: commands do not wait for it.
+/// connect. It starts when the answers of the start are in, after it calls `synced`.
 pub async fn read_missing_pages(
     avr: Arc<Avr>,
-    started: Started,
+    report: StartReport,
     name: String,
     delay: Duration,
     synced: impl FnOnce(),
 ) {
-    // The extra values are queued before the wait: it covers the queries that wait at the call.
-    read_extra_values(&avr).await;
-    // The answers of the telnet queries of the start are in the state after this.
-    let mut missing = Missing::of(&started.all_synced().await);
+    // The answers of the telnet queries of the start are in the state after this, as with
+    // `Started::all_synced`.
+    if matches!(
+        report.telnet,
+        TelnetStart::Open | TelnetStart::AlreadyRunning
+    ) && timeout(TELNET_WAIT, avr.telnet_sync()).await.is_err()
+    {
+        debug!("[{name}] no answer to the telnet queries of the start");
+    }
+    let mut missing = Missing::of(&report);
     synced();
     for attempt in 1..=PAGE_RETRIES {
         if !missing.any() {
@@ -362,6 +420,8 @@ pub struct Identified {
     pub is_dirac_supported: bool,
     pub support_sound_mode: bool,
     pub kind: config_store::ReceiverKind,
+    /// For the next connect, see [`DeviceConfig::info`].
+    pub info: Info,
 }
 
 impl Identified {
@@ -406,18 +466,19 @@ impl Identified {
             // Receivers that are not AVR-X have no sound mode list.
             support_sound_mode: info.receiver_type != ReceiverType::Avr,
             kind: receiver_kind(info),
+            info: info.clone(),
         })
     }
 }
 
 /// The MAC address as 12 uppercase hexadecimal digits. `None` if the receiver does not give a
 /// valid one.
-pub fn mac_address(info: &denon_marantz::Info) -> Option<String> {
+pub fn mac_address(info: &Info) -> Option<String> {
     info.mac_address.as_deref().and_then(config_store::mac_text)
 }
 
 /// What the configuration keeps of the receiver.
-pub const fn receiver_kind(info: &denon_marantz::Info) -> config_store::ReceiverKind {
+pub const fn receiver_kind(info: &Info) -> config_store::ReceiverKind {
     config_store::ReceiverKind {
         receiver_type: receiver_type(info),
         update_method: update_method(info),
@@ -442,7 +503,7 @@ pub const fn receiver_kind(info: &denon_marantz::Info) -> config_store::Receiver
 
 /// The receiver generation for the configuration. `None` for a generation that this version does
 /// not know.
-const fn receiver_type(info: &denon_marantz::Info) -> Option<config_store::ReceiverGeneration> {
+const fn receiver_type(info: &Info) -> Option<config_store::ReceiverGeneration> {
     match info.receiver_type {
         ReceiverType::Avr => Some(config_store::ReceiverGeneration::Avr),
         ReceiverType::AvrX => Some(config_store::ReceiverGeneration::AvrX),
@@ -453,7 +514,7 @@ const fn receiver_type(info: &denon_marantz::Info) -> Option<config_store::Recei
 
 /// How the receiver is read over HTTP, for the configuration. `None` for a method that this
 /// version does not know.
-const fn update_method(info: &denon_marantz::Info) -> Option<config_store::HttpReadMethod> {
+const fn update_method(info: &Info) -> Option<config_store::HttpReadMethod> {
     match info.update_method {
         UpdateMethod::AppCommand => Some(config_store::HttpReadMethod::AppCommand),
         UpdateMethod::StatusPages => Some(config_store::HttpReadMethod::StatusPages),
@@ -465,10 +526,11 @@ const fn update_method(info: &denon_marantz::Info) -> Option<config_store::HttpR
 mod page_tests {
     use super::*;
     use denon_marantz::proto::SettingsGroup;
-    use denon_marantz::{PageResults, StartPages, TelnetStart, TelnetSync};
+    use denon_marantz::{PageResults, StartPages, TelnetSync};
 
     fn report(availability: PageStatus, video: PageStatus, channels: PageStatus) -> StartReport {
         StartReport {
+            info_check: InfoCheck::NotNeeded,
             telnet: TelnetStart::Unknown,
             signal: PageStatus::Read,
             telnet_sync: TelnetSync::NotWaited,
@@ -515,6 +577,7 @@ mod page_tests {
     #[test]
     fn all_pages_are_read_again_if_the_web_interface_failed() {
         let report = StartReport {
+            info_check: InfoCheck::NotNeeded,
             telnet: TelnetStart::Unknown,
             signal: PageStatus::NoAnswer,
             telnet_sync: TelnetSync::NotWaited,
@@ -549,7 +612,8 @@ mod page_tests {
         let (web, avr, started) = started_with_web_status(500).await;
         // The actor holds the receiver while it runs: the reads stop if nobody else holds it.
         let held = avr.clone();
-        read_missing_pages(avr, started, "AVR".into(), Duration::from_millis(10), || ()).await;
+        let report = started.basic_synced().await;
+        read_missing_pages(avr, report, "AVR".into(), Duration::from_millis(10), || ()).await;
         drop(held);
         // Two requests at the start and two for each of the three tries: the library asks twice.
         assert_eq!(2 + 3 * 2, web.requests(AUDIO_PAGE));
@@ -558,7 +622,8 @@ mod page_tests {
     #[tokio::test]
     async fn the_reads_stop_when_nobody_holds_the_receiver() {
         let (web, avr, started) = started_with_web_status(500).await;
-        read_missing_pages(avr, started, "AVR".into(), Duration::from_millis(10), || ()).await;
+        let report = started.basic_synced().await;
+        read_missing_pages(avr, report, "AVR".into(), Duration::from_millis(10), || ()).await;
         assert_eq!(2, web.requests(AUDIO_PAGE));
     }
 
@@ -566,7 +631,8 @@ mod page_tests {
     async fn a_missing_page_is_not_asked_for_again() {
         let (web, avr, started) = started_with_web_status(404).await;
         let held = avr.clone();
-        read_missing_pages(avr, started, "AVR".into(), Duration::from_millis(10), || ()).await;
+        let report = started.basic_synced().await;
+        read_missing_pages(avr, report, "AVR".into(), Duration::from_millis(10), || ()).await;
         drop(held);
         assert_eq!(1, web.requests(AUDIO_PAGE));
     }

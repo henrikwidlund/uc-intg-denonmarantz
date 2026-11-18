@@ -44,7 +44,7 @@ pub enum DeviceEvent {
     /// The configuration changed and must be saved.
     Config {
         key: Arc<str>,
-        cfg: DeviceConfig,
+        cfg: Box<DeviceConfig>,
     },
     Status {
         key: Arc<str>,

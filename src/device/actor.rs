@@ -12,7 +12,8 @@ use crate::entities::{self, EntityKind, SensorKind, View, media_player, remote, 
 use crate::errors::ServiceError;
 use actix::prelude::*;
 use denon_marantz::{
-    Ask, Avr, Change, Error as AvrError, Query, ReceiverType, Setting, Started, State, TelnetStatus,
+    Ask, Avr, Change, Error as AvrError, Info, InfoCheck, Query, ReceiverType, Setting, Started,
+    State, TelnetStatus,
 };
 use denon_marantz_heos::{Change as HeosChange, Heos, PlayState, PlayerState};
 use futures::StreamExt;
@@ -74,6 +75,18 @@ struct LinkChanged(u64, bool);
 #[derive(Message)]
 #[rtype(result = "()")]
 struct StartSynced(u64);
+
+/// A running connect has a receiver that takes commands, before its start ends. It has the
+/// attempt of the connect.
+#[derive(Message)]
+#[rtype(result = "()")]
+struct Early(u64, Arc<Avr>);
+
+/// The check of the stored receiver values at the start. It has the generation of the connection
+/// and the configuration version of the connect.
+#[derive(Message)]
+#[rtype(result = "()")]
+struct InfoChecked(u64, u64, InfoCheck);
 
 /// The HEOS player or the HEOS connection changed. The generation tells which HEOS client sent it.
 /// The flag is set if only the position changed.
@@ -182,6 +195,9 @@ pub struct DenonActor {
     status: DeviceStatus,
     /// Sends each status change. Commands wait on it while a connect runs.
     status_tx: watch::Sender<DeviceStatus>,
+    /// The receiver of a running connect, before its start ends. Commands that do not read the
+    /// state use it and wait on it.
+    early_tx: watch::Sender<Option<Arc<Avr>>>,
     /// The controller wants a connection.
     want: bool,
     /// The receiver answers: telnet is connected, or the last HTTP read worked.
@@ -199,6 +215,8 @@ pub struct DenonActor {
     /// The connection was closed on request: the entities keep their state.
     keep_state: bool,
     attempts: u32,
+    /// The connects look the receiver up and do not use the stored values, until one succeeds.
+    look_up: bool,
     /// Incremented on each connect attempt and on close. Results of older attempts are ignored.
     attempt: u64,
     /// Incremented on each connect and disconnect. Results of older connections are ignored.
@@ -260,6 +278,7 @@ impl DenonActor {
             sound_groups: true,
             status: DeviceStatus::Disconnected,
             status_tx: watch::Sender::new(DeviceStatus::Disconnected),
+            early_tx: watch::Sender::new(None),
             want: false,
             telnet_up: false,
             http_ok: false,
@@ -269,6 +288,7 @@ impl DenonActor {
             refreshing: false,
             keep_state: false,
             attempts: 0,
+            look_up: false,
             attempt: 0,
             generation: 0,
             connected_at: None,
@@ -468,11 +488,18 @@ impl DenonActor {
         self.set_status(DeviceStatus::Connecting);
         self.attempt += 1;
         let attempt = self.attempt;
+        // Values from before the connect are not valid anymore. Commands can run before the start
+        // ends, so they are cleared now.
+        self.expected.clear();
         let cfg = self.cfg.clone();
         let version = self.cfg_version;
         let start = Instant::now();
+        let known = (!self.look_up && !self.cfg.address.is_empty())
+            .then(|| self.cfg.info.clone())
+            .flatten();
 
-        let fut = connect_avr(cfg);
+        let addr = ctx.address();
+        let fut = connect_avr(cfg, known, move |avr| addr.do_send(Early(attempt, avr)));
         let handle = ctx.spawn(fut.into_actor(self).map(move |result, act, ctx| {
             act.timers.connect = None;
             if act.attempt != attempt {
@@ -529,39 +556,41 @@ impl DenonActor {
             start.elapsed().as_millis()
         );
         self.connected_at = Some(Instant::now());
+        self.look_up = false;
         self.keep_state = false;
         self.http_ok = true;
         self.telnet_up =
             self.cfg.use_telnet && *avr.telnet_status().borrow() == TelnetStatus::Connected;
-        // Values from before the connect are not valid anymore.
-        self.expected.clear();
+        self.early_tx.send_replace(None);
         self.paused = false;
         // The list of the receiver can be another one now. With telnet, the list can still come.
         self.sound_mode = None;
         self.sound_groups = !self.cfg.use_telnet;
         self.update_address(address, version);
-        self.update_receiver_info(&avr, version);
+        self.update_receiver_info(avr.info(), version);
 
         ctx.add_message_stream(
             BroadcastStream::new(changes).map(move |change| Changed(generation, change.ok())),
         );
+        let addr = ctx.address();
+        self.timers.pages = Some(
+            ctx.spawn(
+                discovery::after_start(
+                    avr.clone(),
+                    started,
+                    self.cfg.use_telnet,
+                    self.cfg.name.clone(),
+                    self.page_retry_delay,
+                    {
+                        let addr = addr.clone();
+                        move |check| addr.do_send(InfoChecked(generation, version, check))
+                    },
+                    move || addr.do_send(StartSynced(generation)),
+                )
+                .into_actor(self),
+            ),
+        );
         if self.cfg.use_telnet {
-            // With HTTP only, a page read could delay a command: the pages are not read again.
-            self.timers.pages = Some(
-                ctx.spawn(
-                    discovery::read_missing_pages(
-                        avr.clone(),
-                        started,
-                        self.cfg.name.clone(),
-                        self.page_retry_delay,
-                        {
-                            let addr = ctx.address();
-                            move || addr.do_send(StartSynced(generation))
-                        },
-                    )
-                    .into_actor(self),
-                ),
-            );
             let status = WatchStream::from_changes(avr.telnet_status())
                 .map(move |s| LinkChanged(generation, s == TelnetStatus::Connected));
             ctx.add_message_stream(status);
@@ -832,22 +861,21 @@ impl DenonActor {
         self.cfg.heos = Some(found);
         self.controller.do_send(DeviceEvent::Config {
             key: self.key.clone(),
-            cfg: self.cfg.clone(),
+            cfg: Box::new(self.cfg.clone()),
         });
     }
 
     /// Take what the configuration keeps of the receiver: the generation, the HTTP read method, the
-    /// HDMI output over HTTP, the number of quick selects, and the serial number and MAC address if
-    /// they are not stored yet. A configuration of the Python integration does not have them. The
-    /// controller saves them.
+    /// HDMI output over HTTP, the number of quick selects, the receiver values for the next connect,
+    /// and the serial number and MAC address if they are not stored yet. A configuration of the
+    /// Python integration does not have them. The controller saves them.
     ///
     /// The receiver kind is not taken if the answers do not prove the type: it can be wrong, and
     /// a new kind removes entities.
-    fn update_receiver_info(&mut self, avr: &Avr, version: u64) {
+    fn update_receiver_info(&mut self, info: &Info, version: u64) {
         if self.cfg_version != version {
             return;
         }
-        let info = avr.info();
         let kind = config_store::ReceiverKind {
             heos: self.cfg.heos,
             ..discovery::receiver_kind(info)
@@ -862,7 +890,12 @@ impl DenonActor {
         let new_ids = self
             .cfg
             .add_ids(info.serial_number.as_deref(), info.mac_address.as_deref());
-        if !new_kind && !new_ids {
+        // Values with a type that is not proven are not stored: the next connect would keep them.
+        let new_info = info.type_proof.is_proven() && self.cfg.info.as_ref() != Some(info);
+        if new_info {
+            self.cfg.info = Some(info.clone());
+        }
+        if !new_kind && !new_ids && !new_info {
             return;
         }
         if new_kind {
@@ -877,8 +910,38 @@ impl DenonActor {
         }
         self.controller.do_send(DeviceEvent::Config {
             key: self.key.clone(),
-            cfg: self.cfg.clone(),
+            cfg: Box::new(self.cfg.clone()),
         });
+    }
+
+    /// The receiver gave other values than the stored ones. Another receiver at the address is
+    /// not used: the receiver is looked up until it is found. Otherwise the values and the receiver
+    /// kind are stored. A new type, port or update method changes how the receiver is read: it is
+    /// connected again with them.
+    fn info_changed(&mut self, info: Info, version: u64, ctx: &mut Context<Self>) {
+        if let Some(e) = other_receiver(&self.cfg, &info) {
+            info!("[{}] {e}", self.cfg.name);
+            self.look_up = true;
+            self.lost_connection(ctx);
+            self.connect(ctx);
+            return;
+        }
+        let reconnect = self
+            .avr
+            .as_ref()
+            .is_some_and(|avr| read_differently(avr.info(), &info));
+        info!(
+            "[{}] receiver values changed: {} on port {}, {:?}",
+            self.cfg.name,
+            info.receiver_type.name(),
+            info.port,
+            info.update_method
+        );
+        self.update_receiver_info(&info, version);
+        if reconnect {
+            self.lost_connection(ctx);
+            self.connect(ctx);
+        }
     }
 
     /// Take the address that was found by the search. The controller saves it.
@@ -894,7 +957,7 @@ impl DenonActor {
         self.cfg.address = address;
         self.controller.do_send(DeviceEvent::Config {
             key: self.key.clone(),
-            cfg: self.cfg.clone(),
+            cfg: Box::new(self.cfg.clone()),
         });
     }
 
@@ -1023,6 +1086,7 @@ impl DenonActor {
         {
             ctx.cancel_future(handle);
         }
+        self.early_tx.send_replace(None);
         if let Some(avr) = self.avr.take() {
             // Keep the last state for the entities.
             self.last = avr.snapshot();
@@ -1113,7 +1177,7 @@ impl DenonActor {
                         );
                         return;
                     };
-                    log_sending(&name, &msg, received);
+                    log_sending(&name, &msg, received, false);
                     match commands::run_steps(&avr, heos.as_ref(), &cfg, &expected, &run, &lock)
                         .await
                     {
@@ -1148,21 +1212,74 @@ impl DenonActor {
 /// Find the receiver and start it. Retries network errors fast, which covers the short Wi-Fi
 /// drop of the Remote after wake-up. `Err(None)` means the receiver is not on the network.
 ///
-/// Another receiver at the stored address is not used: the receiver is then searched by its MAC
-/// address or serial number.
+/// With `known`, the stored values and address are used and nothing is looked up. The start
+/// checks them, also that it is the same receiver. If that start fails, the receiver is looked up
+/// at once.
 ///
 /// The stall timeout covers only the short identify step. The start is not canceled: a slow
 /// receiver needs more time to read its values.
-async fn connect_avr(cfg: DeviceConfig) -> Result<Connected, Option<AvrError>> {
+///
+/// `early` gets the receiver before its start: commands that do not read the state can use it.
+async fn connect_avr(
+    cfg: DeviceConfig,
+    known: Option<Info>,
+    early: impl Fn(Arc<Avr>),
+) -> Result<Connected, Option<AvrError>> {
     let deadline = Instant::now() + discovery::NETWORK_RETRY_TIMEOUT;
+    if let Some(info) = known {
+        let avr = discovery::connect_known(&cfg.address, info)
+            .await
+            .map_err(Some)?;
+        match start_avr(avr, None, cfg.use_telnet, deadline, &early).await {
+            Ok(connected) => return Ok(connected),
+            // The address or the values can be old.
+            Err(e) => debug!("[{}] connect with the stored values failed: {e}", cfg.name),
+        }
+    }
+    let (avr, address) = look_up(&cfg, deadline).await?;
+    start_avr(avr, address, cfg.use_telnet, deadline, &early)
+        .await
+        .map_err(Some)
+}
+
+/// Start the receiver and subscribe to its changes. `early` gets the receiver before the start.
+async fn start_avr(
+    avr: Avr,
+    address: Option<String>,
+    telnet: bool,
+    deadline: Instant,
+    early: impl Fn(Arc<Avr>),
+) -> Result<Connected, AvrError> {
+    let avr = Arc::new(avr);
+    // Subscribe before the start, so that no change is missed.
+    let changes = avr.changes();
+    early(avr.clone());
+    let started = discovery::start_retry(&avr, telnet, deadline).await?;
+    Ok(Connected {
+        avr,
+        changes,
+        address,
+        started,
+    })
+}
+
+/// Identify the receiver at the stored address, else search for it. Also gives the address if it
+/// is not the one of the configuration.
+///
+/// Another receiver at the stored address is not used: the receiver is then searched by its MAC
+/// address or serial number.
+async fn look_up(
+    cfg: &DeviceConfig,
+    deadline: Instant,
+) -> Result<(Avr, Option<String>), Option<AvrError>> {
     let mut address = None;
     let mut found = None;
     let mut last_error = None;
-    let known = Some(discovery::Known::of(&cfg));
+    let known = Some(discovery::Known::of(cfg));
     // The last good address first.
     if !cfg.address.is_empty() {
         match discovery::identify_retry(&cfg.address, known, deadline).await {
-            Ok(avr) => match other_receiver(&cfg, &avr) {
+            Ok(avr) => match other_receiver(cfg, avr.info()) {
                 Some(e) => {
                     info!("[{}] {e}", cfg.name);
                     last_error = Some(e);
@@ -1178,34 +1295,31 @@ async fn connect_avr(cfg: DeviceConfig) -> Result<Connected, Option<AvrError>> {
     // The address can have changed: search for the MAC address or serial number.
     if found.is_none() {
         let receivers = discovery::discover().await.map_err(Some)?;
-        let Some(receiver) = discovery::find(&cfg, &receivers) else {
+        let Some(receiver) = discovery::find(cfg, &receivers) else {
             return Err(last_error);
         };
         let avr = discovery::identify_retry(&receiver.host, known, deadline)
             .await
             .map_err(Some)?;
-        if let Some(e) = other_receiver(&cfg, &avr) {
+        if let Some(e) = other_receiver(cfg, avr.info()) {
             return Err(Some(e));
         }
         address = Some(receiver.host.clone());
         found = Some(avr);
     }
-    let avr = Arc::new(found.ok_or(last_error)?);
-    // Subscribe before the start, so that no change is missed.
-    let changes = avr.changes();
-    let started = discovery::start(&avr, cfg.use_telnet).await.map_err(Some)?;
-    Ok(Connected {
-        avr,
-        changes,
-        address,
-        started,
-    })
+    Ok((found.ok_or(last_error)?, address))
+}
+
+/// The new values change how the receiver is read: the type, the port or the update method.
+pub(super) fn read_differently(old: &Info, new: &Info) -> bool {
+    old.receiver_type != new.receiver_type
+        || old.port != new.port
+        || old.update_method != new.update_method
 }
 
 /// An error if the receiver is not the one of the configuration. A receiver that gives neither id
 /// is used.
-fn other_receiver(cfg: &DeviceConfig, avr: &Avr) -> Option<AvrError> {
-    let info = avr.info();
+fn other_receiver(cfg: &DeviceConfig, info: &Info) -> Option<AvrError> {
     let same = cfg.same_receiver(info.serial_number.as_deref(), info.mac_address.as_deref());
     (same == Some(false)).then(|| {
         AvrError::InvalidRequest(format!(
@@ -1213,6 +1327,48 @@ fn other_receiver(cfg: &DeviceConfig, avr: &Avr) -> Option<AvrError> {
             info.host, info.serial_number, info.mac_address
         ))
     })
+}
+
+/// Wait until a command can be sent. Nothing is sent while it waits: it can answer with a timeout
+/// and be tried again.
+///
+/// The commands keep their order: one that waits for the connect holds the lock, so the ones after
+/// it wait too. One that does not read the state waits only for the receiver.
+async fn wait_turn(
+    lock: Arc<tokio::sync::Mutex<()>>,
+    connecting: Option<watch::Receiver<DeviceStatus>>,
+    early: watch::Receiver<Option<Arc<Avr>>>,
+    without_state: bool,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, ServiceError> {
+    timeout(SEND_WAIT_LIMIT, async {
+        let guard = lock.lock_owned().await;
+        if without_state {
+            connect_usable(connecting, early).await;
+        } else {
+            connect_ended(connecting).await;
+        }
+        guard
+    })
+    .await
+    .map_err(|_| ServiceError::Timeout)
+}
+
+/// Wait until a running connect has a receiver that takes commands, or has ended, at most
+/// [`CONNECT_WAIT`].
+async fn connect_usable(
+    status: Option<watch::Receiver<DeviceStatus>>,
+    mut early: watch::Receiver<Option<Arc<Avr>>>,
+) {
+    let Some(mut status) = status else { return };
+    let ended = status.wait_for(|s| *s != DeviceStatus::Connecting);
+    let usable = early.wait_for(Option::is_some);
+    let _ = timeout(CONNECT_WAIT, async {
+        tokio::select! {
+            _ = ended => {}
+            _ = usable => {}
+        }
+    })
+    .await;
 }
 
 /// Wait until a running connect has ended, at most [`CONNECT_WAIT`].
@@ -1383,6 +1539,37 @@ impl Handler<StartSynced> for DenonActor {
     }
 }
 
+impl Handler<Early> for DenonActor {
+    type Result = ();
+
+    fn handle(&mut self, msg: Early, _: &mut Self::Context) {
+        if msg.0 == self.attempt && self.want && self.status == DeviceStatus::Connecting {
+            self.early_tx.send_replace(Some(msg.1));
+        }
+    }
+}
+
+impl Handler<InfoChecked> for DenonActor {
+    type Result = ();
+
+    fn handle(&mut self, msg: InfoChecked, ctx: &mut Self::Context) {
+        let InfoChecked(generation, version, check) = msg;
+        if generation != self.generation {
+            return;
+        }
+        match check {
+            InfoCheck::Changed(info) => self.info_changed(*info, version, ctx),
+            InfoCheck::Failed(e) => {
+                debug!(
+                    "[{}] stored receiver values not checked: {e}",
+                    self.cfg.name
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
 impl Handler<LinkChanged> for DenonActor {
     type Result = ();
 
@@ -1541,9 +1728,13 @@ fn command_name(msg: &Command) -> &str {
 }
 
 /// Log how long a command waited before it goes to the receiver.
-fn log_sending(name: &str, msg: &Command, received: Instant) {
+fn log_sending(name: &str, msg: &Command, received: Instant, early: bool) {
     let waited = received.elapsed().as_millis();
-    debug!("[{name}] sending {} after {waited} ms", command_name(msg));
+    let when = if early { " before the start ended" } else { "" };
+    debug!(
+        "[{name}] sending {} after {waited} ms{when}",
+        command_name(msg)
+    );
 }
 
 impl Handler<Command> for DenonActor {
@@ -1581,6 +1772,10 @@ impl Handler<Command> for DenonActor {
         let cfg = self.cfg.clone();
         let expected = self.expected.clone();
         let received = Instant::now();
+        // Only a command during a connect can run before the start ends.
+        let without_state = self.avr.is_none()
+            && commands::without_state(&cfg, msg.kind, &msg.cmd_id, msg.params.as_ref());
+        let early = self.early_tx.subscribe();
         // Network audio plays now: a pause command pauses it.
         let was_playing = self.net_audio_playing();
         // The remote entity passes the media player commands on, as in the Python integration.
@@ -1595,69 +1790,66 @@ impl Handler<Command> for DenonActor {
             _ => None,
         };
         Box::pin(
-            async move {
-                // Nothing is sent while it waits: it can answer with a timeout and be tried again.
-                timeout(SEND_WAIT_LIMIT, async {
-                    connect_ended(connecting).await;
-                    lock.lock_owned().await
-                })
-                .await
-                .map_err(|_| ServiceError::Timeout)
-            }
-            .into_actor(self)
-            .then(move |guard, act, _| {
-                let avr = act.avr.clone();
-                let heos = act.heos.clone();
-                let name = act.cfg.name.clone();
-                async move {
-                    let _guard = guard?;
-                    let Some(avr) = avr else {
-                        return Err(ServiceError::NotConnected);
+            async move { wait_turn(lock, connecting, early, without_state).await }
+                .into_actor(self)
+                .then(move |guard, act, _| {
+                    let early = act.avr.is_none() && without_state;
+                    let avr = if early {
+                        act.early_tx.borrow().clone()
+                    } else {
+                        act.avr.clone()
                     };
-                    log_sending(&name, &msg, received);
-                    let result = commands::run(
-                        &avr,
-                        heos.as_ref(),
-                        &cfg,
-                        &expected,
-                        msg.kind,
-                        &msg.cmd_id,
-                        msg.params.as_ref(),
-                    )
-                    .await;
-                    match result {
-                        // The state of the receiver does not allow it. The Remote shows an error
-                        // banner for any other answer than OK that the user must close, and the
-                        // Python integration did nothing here: the answer is OK, and the log says
-                        // why nothing happened.
-                        Err(ServiceError::Blocked(reason)) => {
-                            info!("[{name}] {} ignored: {reason}", msg.cmd_id);
-                            Ok(())
+                    let heos = act.heos.clone();
+                    let name = act.cfg.name.clone();
+                    async move {
+                        let _guard = guard?;
+                        let Some(avr) = avr else {
+                            return Err(ServiceError::NotConnected);
+                        };
+                        log_sending(&name, &msg, received, early);
+                        let result = commands::run(
+                            &avr,
+                            heos.as_ref(),
+                            &cfg,
+                            &expected,
+                            msg.kind,
+                            &msg.cmd_id,
+                            msg.params.as_ref(),
+                        )
+                        .await;
+                        match result {
+                            // The state of the receiver does not allow it. The Remote shows an error
+                            // banner for any other answer than OK that the user must close, and the
+                            // Python integration did nothing here: the answer is OK, and the log says
+                            // why nothing happened.
+                            Err(ServiceError::Blocked(reason)) => {
+                                info!("[{name}] {} ignored: {reason}", msg.cmd_id);
+                                Ok(())
+                            }
+                            Err(e) => {
+                                warn!("[{name}] {} failed: {e}", msg.cmd_id);
+                                Err(e)
+                            }
+                            Ok(()) => Ok(()),
                         }
-                        Err(e) => {
-                            warn!("[{name}] {} failed: {e}", msg.cmd_id);
-                            Err(e)
+                    }
+                    .into_actor(act)
+                })
+                .map(move |result, act, ctx| {
+                    // The receiver does not tell a pause from a stop: the pause is remembered here, as
+                    // the Python integration does.
+                    if result.is_ok()
+                        && let Some(cmd) = media_command.as_deref()
+                    {
+                        match cmd {
+                            "play_pause" => act.paused = !act.paused && was_playing,
+                            "stop" | "next" | "previous" | "off" | "toggle" => act.paused = false,
+                            _ => {}
                         }
-                        Ok(()) => Ok(()),
+                        act.schedule_emit(ctx);
                     }
-                }
-                .into_actor(act)
-            })
-            .map(move |result, act, ctx| {
-                // The receiver does not tell a pause from a stop: the pause is remembered here, as
-                // the Python integration does.
-                if result.is_ok()
-                    && let Some(cmd) = media_command.as_deref()
-                {
-                    match cmd {
-                        "play_pause" => act.paused = !act.paused && was_playing,
-                        "stop" | "next" | "previous" | "off" | "toggle" => act.paused = false,
-                        _ => {}
-                    }
-                    act.schedule_emit(ctx);
-                }
-                result
-            }),
+                    result
+                }),
         )
     }
 }
@@ -1750,6 +1942,7 @@ mod tests {
             quick_select_count: None,
             listed_queries: None,
             heos: None,
+            info: None,
         }
     }
 

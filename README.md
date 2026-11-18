@@ -8,7 +8,8 @@ driver id (`denonavr_rs`), because the Python integration cannot be stopped or u
 the entity names and the command names are the same, so receivers that are set up with the Python integration
 work without a new setup. The driver adds what it finds on the receiver to `config.json`: the serial number,
 the MAC address, the receiver type, the HTTP read method, if the HDMI output can be read over HTTP, the number of quick selects, the values
-that the receiver lists for HTTP, and if the receiver has HEOS. The Python integration ignores them.
+that the receiver lists for HTTP, if the receiver has HEOS, and what the last full connect found (`info`). The
+Python integration ignores them.
 
 The device id in the entity ids is the MAC address of the receiver. Receivers from about 2011 and older do not
 give it: they use the serial number. Receivers that are set up with the Python integration keep the serial
@@ -28,7 +29,8 @@ Bluetooth or with zone 2. Please report problems as
   and HD radio. On receivers with HEOS, network audio shows what HEOS plays, with position, length, repeat
   and shuffle, and play, pause, stop, next, previous, repeat and shuffle go to HEOS. Volume and mute stay on
   the receiver: HEOS shares one volume for all zones. The Remote must be able to reach the receiver on TCP
-  port 1255 (HEOS) and 8015 (covers from AirPlay and USB, seen on an AVC-A10H).
+  port 1255 (HEOS) and 8015 (covers from AirPlay and USB, seen on an AVC-A10H). Volume up and down use the
+  step of the receiver (0.5 dB). The volume step of a Python integration configuration is not used.
 - **Remote**: the simple commands of the Python integration (about 370), 15 UI pages, button mapping,
   repeat and button sequences. Text of up to 28 characters is sent to the receiver as it is.
 - **Selects**: sound mode, input source, reference level, dynamic volume, dimmer, eco mode. With telnet also
@@ -62,13 +64,19 @@ to the log that says why.
 
 ## Network and wake-up
 
-- The driver connects to the last address first. If another receiver or none answers there, the driver
-  searches the network for its MAC address or serial number and saves the new address.
+- The driver connects with the address and the values (`info`) of the last full connect. This sends no request:
+  the start checks them. If the values changed, the driver saves them; if the type, the port or the read method
+  changed, it connects again. If the start fails, or another receiver answers, the driver looks the receiver up:
+  the last address first, then it searches the network for its MAC address or serial number and saves the new
+  address.
 - After the Remote wakes up, the network of the Remote can be down for a short time. The driver tries again
   with a growing delay for up to 3 seconds. A connect step without an answer in 0.5 seconds is started again
   once.
-- A command that comes while the first connect runs waits for it, at most 6 seconds. If the receiver is not
-  reachable, a command fails at once.
+- A command that comes while the first connect runs waits for it, at most 6 seconds. Commands that do not need the
+  state of the receiver (power, volume, mute, cursor keys, back, info, channel up and down, raw text, and next,
+  previous and stop on receivers without HEOS) are sent when the receiver is known, before the start ends.
+  Commands keep their order: a command after one that waits also waits. If the receiver is not reachable, a
+  command fails at once.
 
 ## Requirements
 
