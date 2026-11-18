@@ -12,8 +12,8 @@ use crate::entities::{self, EntityKind, SensorKind, View, media_player, remote, 
 use crate::errors::ServiceError;
 use actix::prelude::*;
 use denon_marantz::{
-    Ask, Avr, Change, Error as AvrError, Info, InfoCheck, Query, ReceiverType, Setting, Started,
-    State, TelnetStatus,
+    Ask, Avr, Change, Error as AvrError, Info, Query, ReceiverType, Setting, Started, State,
+    TelnetStatus,
 };
 use denon_marantz_heos::{Change as HeosChange, Heos, PlayState, PlayerState};
 use futures::StreamExt;
@@ -82,11 +82,11 @@ struct StartSynced(u64);
 #[rtype(result = "()")]
 struct Early(u64, Arc<Avr>);
 
-/// The check of the stored receiver values at the start. It has the generation of the connection
-/// and the configuration version of the connect.
+/// The start found other receiver values than the stored ones. It has the generation of the
+/// connection and the configuration version of the connect.
 #[derive(Message)]
 #[rtype(result = "()")]
-struct InfoChecked(u64, u64, InfoCheck);
+struct InfoChanged(u64, u64, Info);
 
 /// The HEOS player or the HEOS connection changed. The generation tells which HEOS client sent it.
 /// The flag is set if only the position changed.
@@ -583,7 +583,7 @@ impl DenonActor {
                     self.page_retry_delay,
                     {
                         let addr = addr.clone();
-                        move |check| addr.do_send(InfoChecked(generation, version, check))
+                        move |info| addr.do_send(InfoChanged(generation, version, info))
                     },
                     move || addr.do_send(StartSynced(generation)),
                 )
@@ -1549,23 +1549,13 @@ impl Handler<Early> for DenonActor {
     }
 }
 
-impl Handler<InfoChecked> for DenonActor {
+impl Handler<InfoChanged> for DenonActor {
     type Result = ();
 
-    fn handle(&mut self, msg: InfoChecked, ctx: &mut Self::Context) {
-        let InfoChecked(generation, version, check) = msg;
-        if generation != self.generation {
-            return;
-        }
-        match check {
-            InfoCheck::Changed(info) => self.info_changed(*info, version, ctx),
-            InfoCheck::Failed(e) => {
-                debug!(
-                    "[{}] stored receiver values not checked: {e}",
-                    self.cfg.name
-                );
-            }
-            _ => {}
+    fn handle(&mut self, msg: InfoChanged, ctx: &mut Self::Context) {
+        let InfoChanged(generation, version, info) = msg;
+        if generation == self.generation {
+            self.info_changed(info, version, ctx);
         }
     }
 }

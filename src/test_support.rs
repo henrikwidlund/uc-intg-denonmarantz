@@ -204,6 +204,7 @@ impl Fake {
             device_info,
             description_reads: AtomicUsize::new(0),
             read_delay_ms: AtomicU64::new(0),
+            audyssey_answers: AtomicUsize::new(0),
         });
         let (port, listeners) = bind_loopback("bind the fake receiver").await;
         let commands = Arc::new(Mutex::new(Vec::new()));
@@ -280,6 +281,12 @@ impl Fake {
         self.audyssey_reads.load(Ordering::SeqCst)
     }
 
+    /// How often an `AppCommand0300` request was answered. The answer comes 400 ms after the
+    /// request.
+    pub fn audyssey_answers(&self) -> usize {
+        self.pages.audyssey_answers.load(Ordering::SeqCst)
+    }
+
     /// The commands that the receiver got, as they are in the path: a space is `%20`.
     pub fn commands(&self) -> Vec<String> {
         self.commands.lock().expect("lock").clone()
@@ -324,6 +331,8 @@ struct Pages {
     description_reads: AtomicUsize,
     /// Wait before the answer to a read of the state, in milliseconds.
     read_delay_ms: AtomicU64,
+    /// How often an `AppCommand0300` request was answered.
+    audyssey_answers: AtomicUsize,
 }
 
 async fn serve(
@@ -381,6 +390,7 @@ async fn serve(
             ("POST", "/goform/AppCommand0300.xml") => {
                 audyssey_reads.fetch_add(1, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(400)).await;
+                pages.audyssey_answers.fetch_add(1, Ordering::SeqCst);
                 Some(APPCOMMAND0300.to_vec())
             }
             _ => None,

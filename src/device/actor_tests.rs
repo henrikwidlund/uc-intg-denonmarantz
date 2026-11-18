@@ -1291,6 +1291,24 @@ async fn changed_receiver_values_are_stored_without_a_new_connect() {
 }
 
 #[actix::test]
+async fn changed_receiver_values_are_stored_before_the_start_ends() {
+    let mut info = fake_info().await;
+    let name = info.friendly_name.clone();
+    info.friendly_name = "Old name".into();
+    let cfg = |port| DeviceConfig {
+        info: Some(Info { port, ..info }),
+        ..cfg()
+    };
+    let rig = rig_with(cfg, answers_all, QUICK).await;
+    until("the new values", 5, || {
+        stored_info(&rig.events).is_some_and(|i| i.friendly_name == name)
+    })
+    .await;
+    // The start reads the signal after the check. The fake answers that read late.
+    assert_eq!(0, rig.http.audyssey_answers());
+}
+
+#[actix::test]
 async fn another_receiver_at_the_stored_address_is_looked_up() {
     const OTHER_MAC: &str = "AABBCCDDEEFF";
     let mut info = fake_info().await;
