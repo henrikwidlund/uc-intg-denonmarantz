@@ -506,7 +506,7 @@ impl Fake {
 }
 
 /// Short timeouts and no pacing, so that the tests are quick.
-fn quick_http() -> HttpConfig {
+pub fn quick_http() -> HttpConfig {
     HttpConfig {
         connect_timeout: Duration::from_millis(500),
         request_timeout: Duration::from_millis(500),

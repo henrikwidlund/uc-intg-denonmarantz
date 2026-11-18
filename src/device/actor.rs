@@ -146,6 +146,8 @@ struct Connected {
     address: Option<String>,
     /// The start, which reads the web pages in the background.
     started: Started,
+    /// Time of the try of the start that worked.
+    took: Duration,
 }
 
 #[derive(Default)]
@@ -222,6 +224,9 @@ pub struct DenonActor {
     /// Incremented on each connect attempt and on close. Results of older attempts are ignored, and
     /// commands of an older attempt are not sent again.
     attempt: watch::Sender<u64>,
+    /// Time of the start of the last connect. It sets the time limit of the connect tries, see
+    /// [`discovery::Stall`].
+    last_connect: Option<Duration>,
     /// Incremented on each connect and disconnect. Results of older connections are ignored.
     generation: u64,
     connected_at: Option<Instant>,
@@ -293,6 +298,7 @@ impl DenonActor {
             attempts: 0,
             look_up: false,
             attempt: watch::Sender::new(0),
+            last_connect: None,
             generation: 0,
             connected_at: None,
             emit_due: false,
@@ -502,7 +508,10 @@ impl DenonActor {
             .flatten();
 
         let addr = ctx.address();
-        let fut = connect_avr(cfg, known, move |avr| addr.do_send(Early(attempt, avr)));
+        let last = self.last_connect;
+        let fut = connect_avr(cfg, known, last, move |avr| {
+            addr.do_send(Early(attempt, avr));
+        });
         let handle = ctx.spawn(fut.into_actor(self).map(move |result, act, ctx| {
             act.timers.connect = None;
             if *act.attempt.borrow() != attempt {
@@ -552,7 +561,9 @@ impl DenonActor {
             changes,
             address,
             started,
+            took,
         } = connected;
+        self.last_connect = Some(took);
         info!(
             "[{}] connected in {} ms",
             self.cfg.name,
@@ -1219,28 +1230,30 @@ impl DenonActor {
 /// checks them, also that it is the same receiver. If that start fails, the receiver is looked up
 /// at once.
 ///
-/// The stall timeout covers only the short identify step. The start is not canceled: a slow
-/// receiver needs more time to read its values.
+/// The tries of the identify and the start have a time limit from `last`, the time of the last
+/// start, see [`discovery::Stall`]. The search on the network has none.
 ///
 /// `early` gets the receiver before its start: commands that do not read the state can use it.
 async fn connect_avr(
     cfg: DeviceConfig,
     known: Option<Info>,
+    last: Option<Duration>,
     early: impl Fn(Arc<Avr>),
 ) -> Result<Connected, Option<AvrError>> {
     let deadline = Instant::now() + discovery::NETWORK_RETRY_TIMEOUT;
+    let mut stall = discovery::Stall::new(last);
     if let Some(info) = known {
         let avr = discovery::connect_known(&cfg.address, info)
             .await
             .map_err(Some)?;
-        match start_avr(avr, None, cfg.use_telnet, deadline, &early).await {
+        match start_avr(avr, None, cfg.use_telnet, deadline, &mut stall, &early).await {
             Ok(connected) => return Ok(connected),
             // The address or the values can be old.
             Err(e) => debug!("[{}] connect with the stored values failed: {e}", cfg.name),
         }
     }
-    let (avr, address) = look_up(&cfg, deadline).await?;
-    start_avr(avr, address, cfg.use_telnet, deadline, &early)
+    let (avr, address) = look_up(&cfg, deadline, &mut stall).await?;
+    start_avr(avr, address, cfg.use_telnet, deadline, &mut stall, &early)
         .await
         .map_err(Some)
 }
@@ -1251,18 +1264,20 @@ async fn start_avr(
     address: Option<String>,
     telnet: bool,
     deadline: Instant,
+    stall: &mut discovery::Stall,
     early: impl Fn(Arc<Avr>),
 ) -> Result<Connected, AvrError> {
     let avr = Arc::new(avr);
     // Subscribe before the start, so that no change is missed.
     let changes = avr.changes();
     early(avr.clone());
-    let started = discovery::start_retry(&avr, telnet, deadline).await?;
+    let (started, took) = discovery::start_retry(&avr, telnet, deadline, stall).await?;
     Ok(Connected {
         avr,
         changes,
         address,
         started,
+        took,
     })
 }
 
@@ -1274,6 +1289,7 @@ async fn start_avr(
 async fn look_up(
     cfg: &DeviceConfig,
     deadline: Instant,
+    stall: &mut discovery::Stall,
 ) -> Result<(Avr, Option<String>), Option<AvrError>> {
     let mut address = None;
     let mut found = None;
@@ -1281,7 +1297,7 @@ async fn look_up(
     let known = Some(discovery::Known::of(cfg));
     // The last good address first.
     if !cfg.address.is_empty() {
-        match discovery::identify_retry(&cfg.address, known, deadline).await {
+        match discovery::identify_retry(&cfg.address, known, deadline, stall).await {
             Ok(avr) => match other_receiver(cfg, avr.info()) {
                 Some(e) => {
                     info!("[{}] {e}", cfg.name);
@@ -1301,7 +1317,7 @@ async fn look_up(
         let Some(receiver) = discovery::find(cfg, &receivers) else {
             return Err(last_error);
         };
-        let avr = discovery::identify_retry(&receiver.host, known, deadline)
+        let avr = discovery::identify_retry(&receiver.host, known, deadline, stall)
             .await
             .map_err(Some)?;
         if let Some(e) = other_receiver(cfg, avr.info()) {

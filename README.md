@@ -70,9 +70,10 @@ to the log that says why.
   the last address first, then it searches the network for its MAC address or serial number and saves the new
   address.
 - After the Remote wakes up, the network of the Remote can be down for a short time. The driver tries again
-  every 0.05 seconds for up to 3 seconds. A connection to the receiver that does not open in 0.25 seconds is
-  tried again. When a lookup of the receiver has no answer in 0.25 seconds, a second one starts and the first
-  answer is used.
+  for up to 3 seconds. A connection to the receiver that does not open in 0.25 seconds is tried again. A start or
+  lookup of the receiver that takes more than 3 times as long as the last start (at least 0.5 seconds) is started
+  again, at most 2 times. There is no such limit for the first connect, or if the last start took more than about
+  0.7 seconds.
 - A command that comes while the first connect runs waits for it, at most 3 seconds. Commands that do not need the
   state of the receiver (power, volume, mute, cursor keys, back, info, channel up and down, raw text, and next,
   previous and stop on receivers without HEOS) are sent when the receiver is known, before the start ends.

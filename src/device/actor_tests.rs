@@ -14,11 +14,12 @@ use crate::config_store::{self, DeviceConfig};
 use crate::entities::sensor::EMPTY;
 use crate::entities::{EntityKind, SelectKind, SensorKind, SwitchKind};
 use crate::errors::ServiceError;
-use crate::test_support::{Fake, FakeHeos, FakeTelnet, HeosItem, test_builder};
+use crate::test_support::{Fake, FakeHeos, FakeTelnet, HeosItem, quick_http, test_builder};
 use actix::{Actor, Addr, Context, Handler};
 use denon_marantz::{Brand, DiscoveredReceiver, Info, ReceiverType, TypeProof, UpdateMethod};
 use serde_json::Value;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -721,21 +722,30 @@ async fn the_http_poll_reads_audyssey_and_the_signal() {
 
 /// A port that holds the first connection without an answer and passes the others to `target`.
 async fn hang_first(target: u16) -> u16 {
+    hang_first_n(target, 1).await.0
+}
+
+/// A port that holds the first `n` connections without an answer and passes the others to
+/// `target`. Also gives the number of connections so far.
+async fn hang_first_n(target: u16, n: usize) -> (u16, Arc<AtomicUsize>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
     let port = listener.local_addr().expect("address").port();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let counted = connections.clone();
     tokio::spawn(async move {
-        let mut held = None;
+        let mut held = Vec::with_capacity(n.min(8));
         while let Ok((socket, _)) = listener.accept().await {
-            if held.is_none() {
-                held = Some(socket);
+            counted.fetch_add(1, Ordering::Relaxed);
+            if held.len() < n {
+                held.push(socket);
                 continue;
             }
             tokio::spawn(forward(socket, target));
         }
     });
-    port
+    (port, connections)
 }
 
 /// Pass a connection on to the port `target`.
@@ -745,18 +755,80 @@ async fn forward(mut socket: tokio::net::TcpStream, target: u16) {
     }
 }
 
+/// Builders for the HTTP port `port`. A request waits longer than [`discovery::STALL_MIN`], so that
+/// the time limit of the connect ends it first.
+fn stalling_builder(port: u16) {
+    let setup: TestBuilder = Rc::new(move |_, builder| {
+        test_builder(port, 1, builder).http_config(denon_marantz::HttpConfig {
+            request_timeout: Duration::from_secs(5),
+            ..quick_http()
+        })
+    });
+    TEST_BUILDER.with(|slot| *slot.borrow_mut() = Some(setup));
+}
+
 #[actix::test]
-async fn a_stalled_connect_gets_a_second_one() {
+async fn a_stalled_connect_is_started_again() {
     let http = Fake::start(true).await;
     let port = hang_first(http.port()).await;
-    let setup: TestBuilder = Rc::new(move |_, builder| test_builder(port, 1, builder));
-    TEST_BUILDER.with(|slot| *slot.borrow_mut() = Some(setup));
+    stalling_builder(port);
+    let mut stall = discovery::Stall::new(Some(Duration::from_millis(10)));
     let start = Instant::now();
-    let avr = discovery::identify("127.0.0.1", None)
+    let deadline = start + discovery::NETWORK_RETRY_TIMEOUT;
+    let avr = discovery::identify_retry("127.0.0.1", None, deadline, &mut stall)
         .await
         .expect("identify");
-    assert!(start.elapsed() >= discovery::STALL_TIMEOUT);
+    assert!(start.elapsed() >= discovery::STALL_MIN);
+    assert!(start.elapsed() < Duration::from_secs(2));
     assert_eq!(ReceiverType::AvrX, avr.info().receiver_type);
+}
+
+#[actix::test]
+async fn a_stalled_start_is_started_again() {
+    let http = Fake::start(true).await;
+    let port = hang_first(http.port()).await;
+    let avr = Arc::new(avr_on(&http, port, Duration::ZERO).await);
+    let mut stall = discovery::Stall::new(Some(Duration::from_millis(10)));
+    let start = Instant::now();
+    let deadline = start + discovery::NETWORK_RETRY_TIMEOUT;
+    let (_started, took) = discovery::start_retry(&avr, false, deadline, &mut stall)
+        .await
+        .expect("start");
+    assert!(start.elapsed() >= discovery::STALL_MIN);
+    assert!(start.elapsed() < Duration::from_secs(2));
+    assert!(took < discovery::STALL_MIN, "{took:?}");
+}
+
+#[actix::test]
+async fn a_connect_without_a_short_last_time_has_no_limit() {
+    let http = Fake::start(true).await;
+    for last in [None, Some(Duration::from_millis(700))] {
+        let (port, connections) = hang_first_n(http.port(), usize::MAX).await;
+        stalling_builder(port);
+        let mut stall = discovery::Stall::new(last);
+        let deadline = Instant::now() + discovery::NETWORK_RETRY_TIMEOUT;
+        let identify = discovery::identify_retry("127.0.0.1", None, deadline, &mut stall);
+        // The first connection gets no answer: without a limit, the identify waits.
+        let waited = tokio::time::timeout(Duration::from_secs(1), identify).await;
+        assert!(waited.is_err(), "{last:?}");
+        // Not started again.
+        assert_eq!(1, connections.load(Ordering::Relaxed), "{last:?}");
+    }
+}
+
+#[actix::test]
+async fn a_stalled_connect_is_started_again_twice_at_most() {
+    let http = Fake::start(true).await;
+    let (port, connections) = hang_first_n(http.port(), 3).await;
+    stalling_builder(port);
+    let mut stall = discovery::Stall::new(Some(Duration::from_millis(10)));
+    let deadline = Instant::now() + discovery::NETWORK_RETRY_TIMEOUT;
+    let identify = discovery::identify_retry("127.0.0.1", None, deadline, &mut stall);
+    // Two restarts after 0.5 s each, then the third try has no limit and waits.
+    let waited = tokio::time::timeout(Duration::from_secs(2), identify).await;
+    assert!(waited.is_err());
+    // The first try and two restarts.
+    assert_eq!(3, connections.load(Ordering::Relaxed));
 }
 
 #[actix::test]

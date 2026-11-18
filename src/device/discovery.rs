@@ -14,12 +14,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::{sleep, timeout};
 
-/// A connect without answer in this time gets a second connect next to it. The first one keeps
-/// running, and the one that answers first is used.
-///
-/// After wake-up, the Wi-Fi link of the Remote can go down for a short time. Lost packets then
-/// wait for the TCP resend (1 s or more). A connect step takes much less.
-pub(crate) const STALL_TIMEOUT: Duration = Duration::from_millis(250);
+/// Shortest time limit of one connect try, see [`Stall`].
+pub(crate) const STALL_MIN: Duration = Duration::from_millis(500);
+/// The time limit of a connect try is this many times the last connect.
+const STALL_FACTOR: u32 = 3;
+/// A longer time limit is not used: the receiver is slow, and its tries are not started again.
+const STALL_MAX: Duration = Duration::from_secs(2);
+/// How often a stalled try is started again in one connect.
+const STALL_RESTARTS: u8 = 2;
 /// Time allowed to open an HTTP connection to the receiver. On the local network it takes a few
 /// milliseconds. After wake-up, a lost connect packet is sent again only after 1 s: a new try after
 /// this time is faster.
@@ -83,8 +85,8 @@ impl Known {
     }
 }
 
-/// Identify a receiver and read its description: a few short HTTP requests. If they stall, a
-/// second connect runs next to the first. With a known type, only the port of that type is asked.
+/// Identify a receiver and read its description: a few short HTTP requests. With a known type, only
+/// the port of that type is asked.
 ///
 /// If the receiver then reports another type, it is identified again without the known type.
 ///
@@ -130,31 +132,7 @@ pub async fn identify(host: &str, known: Option<Known>) -> Result<Avr, Error> {
 }
 
 async fn identify_with(host: &str, known: Option<Known>) -> Result<Avr, Error> {
-    let start = Instant::now();
-    let first = builder(host, known).connect();
-    tokio::pin!(first);
-    if let Ok(result) = timeout(STALL_TIMEOUT, &mut first).await {
-        return result;
-    }
-    debug!("[{host}] connect stalled, starting a second one");
-    let second = builder(host, known).connect();
-    tokio::pin!(second);
-    // The first answer wins. After an error, the other connect can still answer.
-    let (result, winner) = tokio::select! {
-        result = &mut first => match result {
-            Ok(avr) => (Ok(avr), "first"),
-            Err(_) => (second.await, "second"),
-        },
-        result = &mut second => match result {
-            Ok(avr) => (Ok(avr), "second"),
-            Err(_) => (first.await, "first"),
-        },
-    };
-    if result.is_ok() {
-        let took = start.elapsed().as_millis();
-        debug!("[{host}] {winner} connect won after {took} ms");
-    }
-    result
+    builder(host, known).connect().await
 }
 
 /// Connect with the values of an earlier connect. It sends no request: the start checks the
@@ -199,54 +177,93 @@ thread_local! {
     };
 }
 
-/// Identify a receiver and retry network errors fast until `deadline`.
+/// The time limit of the tries of one connect.
+///
+/// After wake-up, the Wi-Fi link of the Remote can go down for a short time. A lost packet then
+/// waits for the TCP resend (1 s or more). A new try is faster.
+#[derive(Debug)]
+pub struct Stall {
+    /// `None`: the tries have no time limit.
+    limit: Option<Duration>,
+    /// How often a stalled try can still be started again.
+    restarts: u8,
+}
+
+impl Stall {
+    /// The limit is [`STALL_FACTOR`] times `last`, the time of the last connect, and at least
+    /// [`STALL_MIN`]. Without `last`, or if the limit is over [`STALL_MAX`], there is no limit.
+    pub fn new(last: Option<Duration>) -> Self {
+        let limit = last
+            .map(|last| last.saturating_mul(STALL_FACTOR).max(STALL_MIN))
+            .filter(|limit| *limit <= STALL_MAX);
+        Self {
+            limit,
+            restarts: STALL_RESTARTS,
+        }
+    }
+}
+
+/// Identify a receiver, see [`retry`].
 pub async fn identify_retry(
     host: &str,
     known: Option<Known>,
     deadline: Instant,
+    stall: &mut Stall,
 ) -> Result<Avr, Error> {
-    retry_network(host, deadline, || identify(host, known)).await
+    let (avr, _) = retry(host, deadline, stall, || identify(host, known)).await?;
+    Ok(avr)
 }
 
-/// Start the receiver as [`start`] does and retry network errors fast until `deadline`. A
-/// connect with known values sends its first request here.
+/// Start the receiver as [`start`] does, see [`retry`]. A connect with known values sends its
+/// first request here. Also gives the time of the try that worked.
 pub async fn start_retry(
     avr: &Arc<Avr>,
     telnet: bool,
     deadline: Instant,
-) -> Result<Started, Error> {
-    retry_network(&avr.info().host, deadline, || start(avr, telnet)).await
+    stall: &mut Stall,
+) -> Result<(Started, Duration), Error> {
+    retry(&avr.info().host, deadline, stall, || start(avr, telnet)).await
 }
 
-/// Run `step` again after a network error, with a short delay, until `deadline`.
-async fn retry_network<T, F: Future<Output = Result<T, Error>>>(
+/// Run `step` until it works. A try that takes longer than the limit of `stall` is started again.
+/// After a network error, `step` runs again after a short delay, until `deadline`. Also gives the
+/// time of the try that worked.
+async fn retry<T, F: Future<Output = Result<T, Error>>>(
     host: &str,
     deadline: Instant,
-    step: impl FnMut() -> F,
-) -> Result<T, Error> {
-    retry_while(host, deadline, step, Error::is_unreachable).await
-}
-
-/// Run `step` again while `retry` is true for its error, with a short delay, until
-/// `deadline`. `name` is for the log.
-async fn retry_while<T, E: std::fmt::Display, F: Future<Output = Result<T, E>>>(
-    name: &str,
-    deadline: Instant,
+    stall: &mut Stall,
     mut step: impl FnMut() -> F,
-    retry: impl Fn(&E) -> bool,
-) -> Result<T, E> {
+) -> Result<(T, Duration), Error> {
     let mut first = true;
     loop {
-        match step().await {
-            Err(e) if retry(&e) && Instant::now() + NETWORK_RETRY_INTERVAL < deadline => {
+        let started = Instant::now();
+        let result = match stall.limit.filter(|_| stall.restarts > 0) {
+            None => step().await,
+            Some(limit) => {
+                let Ok(result) = timeout(limit, step()).await else {
+                    stall.restarts -= 1;
+                    debug!(
+                        "[{host}] connect stalled after {} ms, starting again",
+                        limit.as_millis()
+                    );
+                    continue;
+                };
+                result
+            }
+        };
+        match result {
+            Ok(value) => return Ok((value, started.elapsed())),
+            // The library tries again while the connection cannot be built. A connection that
+            // closed before the answer is tried again here.
+            Err(e) if e.is_network() && Instant::now() + NETWORK_RETRY_INTERVAL < deadline => {
                 // One line for the first failure only: wake-up can need many tries.
                 if first {
-                    debug!("[{name}] network not ready: {e}");
+                    debug!("[{host}] network not ready: {e}");
                     first = false;
                 }
                 sleep(NETWORK_RETRY_INTERVAL).await;
             }
-            result => return result,
+            Err(e) => return Err(e),
         }
     }
 }
