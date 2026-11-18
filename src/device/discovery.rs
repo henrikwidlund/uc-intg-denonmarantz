@@ -122,6 +122,7 @@ pub async fn identify(host: &str, known: Option<Known>) -> Result<Avr, Error> {
 }
 
 async fn identify_with(host: &str, known: Option<Known>) -> Result<Avr, Error> {
+    let start = Instant::now();
     let first = builder(host, known).connect();
     tokio::pin!(first);
     if let Ok(result) = timeout(STALL_TIMEOUT, &mut first).await {
@@ -131,16 +132,21 @@ async fn identify_with(host: &str, known: Option<Known>) -> Result<Avr, Error> {
     let second = builder(host, known).connect();
     tokio::pin!(second);
     // The first answer wins. After an error, the other connect can still answer.
-    tokio::select! {
+    let (result, winner) = tokio::select! {
         result = &mut first => match result {
-            Ok(avr) => Ok(avr),
-            Err(_) => second.await,
+            Ok(avr) => (Ok(avr), "first"),
+            Err(_) => (second.await, "second"),
         },
         result = &mut second => match result {
-            Ok(avr) => Ok(avr),
-            Err(_) => first.await,
+            Ok(avr) => (Ok(avr), "second"),
+            Err(_) => (first.await, "first"),
         },
+    };
+    if result.is_ok() {
+        let took = start.elapsed().as_millis();
+        debug!("[{host}] {winner} connect won after {took} ms");
     }
+    result
 }
 
 /// The builder of a connection. A test can change it, so that the library talks to a fake
