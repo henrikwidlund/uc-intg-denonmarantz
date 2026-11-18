@@ -297,6 +297,15 @@ impl DeviceConfig {
         matches!(self.heos, Some(true))
     }
 
+    /// The receiver has a HEOS player, or it is not known yet. The oldest receivers came before
+    /// HEOS.
+    pub const fn may_have_heos(&self) -> bool {
+        match self.heos {
+            Some(heos) => heos,
+            None => !matches!(self.receiver_type, Some(ReceiverGeneration::Avr)),
+        }
+    }
+
     /// The receiver has this quick select slot, counted from 1. Without a count, all slots.
     pub const fn has_quick_select(&self, slot: u8) -> bool {
         match self.quick_select_count {

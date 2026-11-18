@@ -13,11 +13,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::{sleep, timeout};
 
-/// A connect step without answer in this time is started again once.
+/// A connect without answer in this time gets a second connect next to it. The first one keeps
+/// running, and the one that answers first is used.
 ///
 /// After wake-up, the Wi-Fi link of the Remote can go down for a short time. Lost packets then
 /// wait for the TCP resend (1 s or more). A connect step takes much less.
-const STALL_TIMEOUT: Duration = Duration::from_millis(500);
+pub(crate) const STALL_TIMEOUT: Duration = Duration::from_millis(250);
 /// Time between connects while the network is not ready, for example right after wake-up. It
 /// grows, so that a receiver that is off does not get a connect attempt every 50 ms.
 const NETWORK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
@@ -74,8 +75,8 @@ impl Known {
     }
 }
 
-/// Identify a receiver and read its description: a few short HTTP requests. They are started
-/// again once if they stall. With a known type, only the port of that type is asked.
+/// Identify a receiver and read its description: a few short HTTP requests. If they stall, a
+/// second connect runs next to the first. With a known type, only the port of that type is asked.
 ///
 /// If the receiver then reports another type, it is identified again without the known type.
 ///
@@ -121,14 +122,25 @@ pub async fn identify(host: &str, known: Option<Known>) -> Result<Avr, Error> {
 }
 
 async fn identify_with(host: &str, known: Option<Known>) -> Result<Avr, Error> {
-    for attempt in 0..2 {
-        match timeout(STALL_TIMEOUT, builder(host, known).connect()).await {
-            Ok(result) => return result,
-            Err(_) if attempt == 0 => debug!("[{host}] connect step stalled, starting again"),
-            Err(_) => {}
-        }
+    let first = builder(host, known).connect();
+    tokio::pin!(first);
+    if let Ok(result) = timeout(STALL_TIMEOUT, &mut first).await {
+        return result;
     }
-    builder(host, known).connect().await
+    debug!("[{host}] connect stalled, starting a second one");
+    let second = builder(host, known).connect();
+    tokio::pin!(second);
+    // The first answer wins. After an error, the other connect can still answer.
+    tokio::select! {
+        result = &mut first => match result {
+            Ok(avr) => Ok(avr),
+            Err(_) => second.await,
+        },
+        result = &mut second => match result {
+            Ok(avr) => Ok(avr),
+            Err(_) => first.await,
+        },
+    }
 }
 
 /// The builder of a connection. A test can change it, so that the library talks to a fake

@@ -25,10 +25,10 @@ Bluetooth or with zone 2. Please report problems as
 
 - **Media player**: power, volume and mute, input source, sound mode, navigation, menu, options, info,
   channel up and down, play and pause, next and previous. Title, artist, album and cover for network audio
-  and HD radio. On receivers with HEOS, network audio shows what HEOS plays, with position and length, and
-  play, pause, stop, next and previous go to HEOS. Volume and mute stay on the receiver: HEOS shares one
-  volume for all zones. Covers from AirPlay and USB come from the receiver on TCP port 8015 (seen on an
-  AVC-A10H): the Remote must be able to reach this port.
+  and HD radio. On receivers with HEOS, network audio shows what HEOS plays, with position, length, repeat
+  and shuffle, and play, pause, stop, next, previous, repeat and shuffle go to HEOS. Volume and mute stay on
+  the receiver: HEOS shares one volume for all zones. The Remote must be able to reach the receiver on TCP
+  port 1255 (HEOS) and 8015 (covers from AirPlay and USB, seen on an AVC-A10H).
 - **Remote**: the simple commands of the Python integration (about 370), 15 UI pages, button mapping,
   repeat and button sequences. Text of up to 28 characters is sent to the receiver as it is.
 - **Selects**: sound mode, input source, reference level, dynamic volume, dimmer, eco mode. With telnet also
@@ -102,8 +102,8 @@ configurator of the Remote.
 3. To keep the old setup, copy the `config.json` of the Python integration to the configuration folder of
    the driver. Otherwise start the setup. Leave the address empty to search the network. If the setup fails,
    run it again. The receiver must send its description.
-   With a copied `config.json`, the driver checks for HEOS at the first connect. If the receiver has HEOS,
-   add the media player entity again after that connect to get the position and length.
+   With a copied `config.json`, the driver checks for HEOS at the first connect. If the media player entity
+   was added with the Python integration, add it again to get the position, length, repeat and shuffle.
 
 Run the setup again to add, remove or configure a receiver, make a backup, or restore one.
 

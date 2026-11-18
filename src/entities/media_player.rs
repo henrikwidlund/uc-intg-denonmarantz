@@ -11,13 +11,13 @@ use denon_marantz::proto::PlayingKind;
 use denon_marantz::proto::Power;
 use denon_marantz::proto::source::{is_playing_source, playing_kind};
 use denon_marantz::{State, Zone};
-use denon_marantz_heos::{MediaType, NowPlaying, PlayState, PlayerState};
+use denon_marantz_heos::{MediaType, NowPlaying, PlayState, PlayerState, RepeatMode};
 use serde_json::{Map, Value, json};
 use std::str::FromStr;
 use uc_api::intg::AvailableIntgEntity;
 use uc_api::{
     MediaContentType, MediaPlayerAttribute as Attr, MediaPlayerCommand as Cmd,
-    MediaPlayerDeviceClass, MediaPlayerFeature as F,
+    MediaPlayerDeviceClass, MediaPlayerFeature as F, MediaPlayerRepeatMode,
 };
 
 /// Highest volume that the Remote can set: the volume in dB plus 80.
@@ -83,12 +83,16 @@ pub fn definition(mut entity: AvailableIntgEntity, cfg: &DeviceConfig) -> Availa
         features.push(F::SelectSoundMode.as_ref().to_string());
     }
     // HEOS stops on both brands.
-    if cfg.is_denon || cfg.has_heos() {
+    if cfg.is_denon || cfg.may_have_heos() {
         features.push(F::Stop.as_ref().to_string());
     }
-    if cfg.has_heos() {
+    // The Remote keeps the features of an entity: a receiver that may have HEOS gets them before
+    // HEOS answers.
+    if cfg.may_have_heos() {
         features.push(F::MediaPosition.as_ref().to_string());
         features.push(F::MediaDuration.as_ref().to_string());
+        features.push(F::Repeat.as_ref().to_string());
+        features.push(F::Shuffle.as_ref().to_string());
     }
     entity.features = Some(features);
     let mut options = Map::new();
@@ -175,6 +179,14 @@ pub fn attributes(v: &View<'_>, out: &mut Map<String, Value>) {
         // The controller sets the time only if it sends a new position or state, see
         // [`position_timestamp`].
         set(out, Attr::MediaPositionUpdatedAt, Value::Null);
+        let mode = if off {
+            None
+        } else {
+            heos_player(v).and_then(PlayerState::play_mode)
+        };
+        let repeat = mode.map_or(MediaPlayerRepeatMode::Off, |m| remote_repeat(m.repeat));
+        set(out, Attr::Repeat, repeat.as_ref().into());
+        set(out, Attr::Shuffle, mode.is_some_and(|m| m.shuffle).into());
     }
     if let Some(media) = heos {
         let station = media.station.as_deref().filter(|t| !is_blank(t));
@@ -219,6 +231,15 @@ pub fn attributes(v: &View<'_>, out: &mut Map<String, Value>) {
         Attr::MediaType,
         if off { "" } else { media_type(v) }.into(),
     );
+}
+
+/// The repeat mode of HEOS as the Remote names it.
+const fn remote_repeat(mode: RepeatMode) -> MediaPlayerRepeatMode {
+    match mode {
+        RepeatMode::Off => MediaPlayerRepeatMode::Off,
+        RepeatMode::OnAll => MediaPlayerRepeatMode::All,
+        RepeatMode::OnOne => MediaPlayerRepeatMode::One,
+    }
 }
 
 /// Position in what plays on HEOS, in seconds.
@@ -310,6 +331,10 @@ pub enum Action {
     ChannelDown,
     SelectSource(String),
     SelectSoundMode(String),
+    /// Repeat mode of HEOS.
+    Repeat(RepeatMode),
+    /// Shuffle of HEOS on or off.
+    Shuffle(bool),
     /// A command of the table.
     Simple(&'static simple_commands::Entry),
     /// Text for the receiver, as the Python integration sends unknown commands.
@@ -360,6 +385,21 @@ pub fn command(cmd_id: &str, params: Option<&Map<String, Value>>) -> Result<Acti
         Cmd::ChannelDown => Action::ChannelDown,
         Cmd::SelectSource => Action::SelectSource(param_str(params, "source")?.into()),
         Cmd::SelectSoundMode => Action::SelectSoundMode(param_str(params, "mode")?.into()),
+        Cmd::Repeat => {
+            let mode = MediaPlayerRepeatMode::from_str(param_str(params, "repeat")?)
+                .map_err(|_| ServiceError::BadRequest("Invalid parameter: repeat".into()))?;
+            Action::Repeat(match mode {
+                MediaPlayerRepeatMode::Off => RepeatMode::Off,
+                MediaPlayerRepeatMode::All => RepeatMode::OnAll,
+                MediaPlayerRepeatMode::One => RepeatMode::OnOne,
+            })
+        }
+        Cmd::Shuffle => Action::Shuffle(
+            params
+                .and_then(|p| p.get("shuffle"))
+                .and_then(Value::as_bool)
+                .ok_or_else(|| ServiceError::BadRequest("Missing parameter: shuffle".into()))?,
+        ),
         _ => return other_command(cmd_id),
     };
     Ok(action)
@@ -438,5 +478,28 @@ mod tests {
         assert!(matches!(command("PWON", None), Ok(Action::Raw(_))));
         assert!(command(&"X".repeat(29), None).is_err());
         assert!(command("caf\u{e9}", None).is_err());
+    }
+
+    #[test]
+    fn repeat_and_shuffle_take_their_parameter() {
+        let repeat = |mode: &str| command("repeat", json!({ "repeat": mode }).as_object());
+        assert!(matches!(
+            repeat("ALL"),
+            Ok(Action::Repeat(RepeatMode::OnAll))
+        ));
+        assert!(matches!(
+            repeat("ONE"),
+            Ok(Action::Repeat(RepeatMode::OnOne))
+        ));
+        assert!(matches!(repeat("OFF"), Ok(Action::Repeat(RepeatMode::Off))));
+        assert!(repeat("all").is_err());
+        assert!(command("repeat", None).is_err());
+        let shuffle = json!({ "shuffle": true });
+        assert!(matches!(
+            command("shuffle", shuffle.as_object()),
+            Ok(Action::Shuffle(true))
+        ));
+        let text = json!({ "shuffle": "true" });
+        assert!(command("shuffle", text.as_object()).is_err());
     }
 }

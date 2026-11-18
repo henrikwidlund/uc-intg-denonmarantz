@@ -2086,7 +2086,7 @@ const HEOS_POSITION_SLACK: i64 = 4;
 /// HEOS connection. HEOS must play on the main zone at the start, else the check is skipped. The
 /// volume is not changed.
 pub async fn heos(ctx: &mut Ctx) -> Check {
-    use denon_marantz_heos::{Heos, PlayState};
+    use denon_marantz_heos::{Heos, PlayState, RepeatMode};
     let mp = ctx.mp();
     let entities = entity_list(ctx).await?;
     let features = entities
@@ -2097,9 +2097,11 @@ pub async fn heos(ctx: &mut Ctx) -> Check {
     let heos = match Heos::connect(ctx.opt.address.as_str()).await {
         Ok(heos) => heos,
         Err(e) => {
+            // While HEOS is not known, the driver offers the HEOS features already.
+            let config = read_config(ctx).await?;
             ensure!(
-                !features.iter().any(|f| f == "media_position"),
-                "the media player has HEOS features, but HEOS does not answer: {e}"
+                config_device(ctx, &config)?["heos"] != json!(true),
+                "the driver saved that the receiver has HEOS, but HEOS does not answer: {e}"
             );
             return Err(Fail::skip(format!("no HEOS: {e}")));
         }
@@ -2150,6 +2152,24 @@ pub async fn heos(ctx: &mut Ctx) -> Check {
         "album {:?}, HEOS has {album:?}",
         ctx.client.text(&mp, "media_album")
     );
+    if let Some(mode) = player.play_mode() {
+        let repeat = match mode.repeat {
+            RepeatMode::OnAll => "ALL",
+            RepeatMode::OnOne => "ONE",
+            _ => "OFF",
+        };
+        ensure!(
+            ctx.client.text(&mp, "repeat") == repeat,
+            "repeat {:?}, HEOS has {repeat}",
+            ctx.client.text(&mp, "repeat")
+        );
+        let shuffle = ctx.client.attr(&mp, "shuffle").and_then(Value::as_bool);
+        ensure!(
+            shuffle == Some(mode.shuffle),
+            "shuffle {shuffle:?}, HEOS has {}",
+            mode.shuffle
+        );
+    }
     ensure!(
         ctx.client.text(&mp, "media_image_url") == media.image_url.as_ref(),
         "image {:?}, HEOS has {:?}",

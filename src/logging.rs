@@ -13,10 +13,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Log filter without the debug log.
 const DEFAULT_FILTER: &str = "info";
-/// Log filter of the debug log. A filter matches whole module names, so each library crate is
-/// listed.
+/// Log filter of the debug log. A name matches each module that starts with it, so
+/// `denon_marantz` also covers the other library crates. They are listed so that they are easy
+/// to see.
 const DEBUG_FILTER: &str = "info,uc_intg_denonmarantz=debug,denon_marantz=debug,\
-    denon_marantz_proto=debug,denon_marantz_discovery=debug";
+    denon_marantz_proto=debug,denon_marantz_discovery=debug,denon_marantz_heos=debug";
 
 static LOGGER: OnceLock<SwitchLogger> = OnceLock::new();
 

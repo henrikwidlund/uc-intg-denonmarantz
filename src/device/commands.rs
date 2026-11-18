@@ -261,27 +261,36 @@ const fn command_view<'a>(state: &'a State, cfg: &'a DeviceConfig) -> View<'a> {
 /// command can wait behind a slow one. A command that is still waiting then is not sent.
 const HEOS_COMMAND_LIMIT: Duration = Duration::from_secs(5);
 
-/// Play, pause, stop, next and previous: the actions that go to HEOS while it is used.
-pub const fn is_transport(action: &Action) -> bool {
+/// Play, pause, stop, next, previous, repeat and shuffle: the actions that go to HEOS while it
+/// is used.
+pub const fn is_heos_action(action: &Action) -> bool {
     matches!(
         action,
-        Action::PlayPause | Action::Stop | Action::Next | Action::Previous
+        Action::PlayPause
+            | Action::Stop
+            | Action::Next
+            | Action::Previous
+            | Action::Repeat(_)
+            | Action::Shuffle(_)
     )
 }
 
-/// The media player shows HEOS: transport actions go to HEOS.
+/// The media player shows HEOS: the actions of [`is_heos_action`] go to HEOS.
 pub fn heos_in_use(heos: &heos::Link, state: &State) -> bool {
     heos.with_player(|p| p.is_some_and(|p| media_player::uses_heos(state, p)))
 }
 
-/// Run a transport action on HEOS, for at most [`HEOS_COMMAND_LIMIT`].
+/// Run an action of [`is_heos_action`] on HEOS, for at most [`HEOS_COMMAND_LIMIT`].
 pub async fn heos_run(heos: &heos::Link, action: &Action) -> Result<(), ServiceError> {
     let run = async {
         match action {
             Action::PlayPause => heos.play_pause().await,
             Action::Stop => heos.set_play_state(PlayState::Stop).await,
             Action::Next => heos.next().await,
-            _ => heos.previous().await,
+            Action::Previous => heos.previous().await,
+            Action::Repeat(repeat) => heos.set_play_mode(Some(*repeat), None).await,
+            Action::Shuffle(shuffle) => heos.set_play_mode(None, Some(*shuffle)).await,
+            _ => Err(ServiceError::NotSupported("not a HEOS action".into())),
         }
     };
     tokio::time::timeout(HEOS_COMMAND_LIMIT, run)
@@ -289,14 +298,14 @@ pub async fn heos_run(heos: &heos::Link, action: &Action) -> Result<(), ServiceE
         .map_err(|_| ServiceError::Timeout)?
 }
 
-/// Play, pause, stop, next and previous go to HEOS while the media player shows HEOS. `None` for
-/// the other actions, and when HEOS is not used.
+/// The actions of [`is_heos_action`] go to HEOS while the media player shows HEOS. `None` for the
+/// other actions, and when HEOS is not used.
 async fn heos_transport(
     heos: Option<&heos::Link>,
     state: &State,
     action: &Action,
 ) -> Option<Result<(), ServiceError>> {
-    if !is_transport(action) {
+    if !is_heos_action(action) {
         return None;
     }
     let heos = heos.filter(|link| heos_in_use(link, state))?;
@@ -397,6 +406,11 @@ async fn action_run(
         Action::SelectSoundMode(name) => {
             let view = command_view(&state, cfg);
             select::select_option(avr, &view, SelectKind::SoundMode, &name).await?;
+        }
+        Action::Repeat(_) | Action::Shuffle(_) => {
+            return Err(ServiceError::Blocked(
+                "repeat and shuffle work only while HEOS plays".into(),
+            ));
         }
     }
     Ok(())

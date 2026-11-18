@@ -8,7 +8,7 @@
 use super::actor::CurrentAvr;
 use super::discovery::{self, Known, TEST_BUILDER, TEST_DISCOVERY, TestBuilder};
 use super::heos::TEST_HEOS;
-use super::{Command, Connect, DenonActor, DeviceEvent, DeviceStatus, Disconnect};
+use super::{Command, Connect, DenonActor, DeviceEvent, DeviceStatus, Disconnect, UpdateConfig};
 use crate::config_store::{self, DeviceConfig};
 use crate::entities::sensor::EMPTY;
 use crate::entities::{EntityKind, SelectKind, SensorKind, SwitchKind};
@@ -704,6 +704,43 @@ async fn the_http_poll_reads_audyssey_and_the_signal() {
     .await;
 }
 
+/// A port that holds the first connection without an answer and passes the others to `target`.
+async fn hang_first(target: u16) -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("address").port();
+    tokio::spawn(async move {
+        let mut held = None;
+        while let Ok((mut socket, _)) = listener.accept().await {
+            if held.is_none() {
+                held = Some(socket);
+                continue;
+            }
+            tokio::spawn(async move {
+                if let Ok(mut fake) = tokio::net::TcpStream::connect(("127.0.0.1", target)).await {
+                    let _ = tokio::io::copy_bidirectional(&mut socket, &mut fake).await;
+                }
+            });
+        }
+    });
+    port
+}
+
+#[actix::test]
+async fn a_stalled_connect_gets_a_second_one() {
+    let http = Fake::start(true).await;
+    let port = hang_first(http.port()).await;
+    let setup: TestBuilder = Rc::new(move |_, builder| test_builder(port, 1, builder));
+    TEST_BUILDER.with(|slot| *slot.borrow_mut() = Some(setup));
+    let start = Instant::now();
+    let avr = discovery::identify("127.0.0.1", None)
+        .await
+        .expect("identify");
+    assert!(start.elapsed() >= discovery::STALL_TIMEOUT);
+    assert_eq!(ReceiverType::AvrX, avr.info().receiver_type);
+}
+
 #[actix::test]
 async fn the_stored_brand_is_used_if_the_description_names_none() {
     let http = Fake::start_without_brand().await;
@@ -928,6 +965,65 @@ async fn another_receiver_at_the_stored_address_is_not_used() {
 }
 
 #[actix::test]
+async fn repeat_and_shuffle_go_to_heos() {
+    let heos = FakeHeos::start("127.0.0.1", HeosItem::song()).await;
+    TEST_HEOS.with(|slot| slot.set(Some(heos.config())));
+    let rig = rig(answers_all, QUICK).await;
+    let saved =
+        || {
+            rig.events.lock().expect("lock").iter().any(
+                |event| matches!(event, DeviceEvent::Config { cfg, .. } if cfg.heos == Some(true)),
+            )
+        };
+    until("HEOS saved", 5, saved).await;
+    rig.telnet.send("PWON");
+    rig.telnet.send("SINET");
+    let attr = |name| entity_state(&rig.events, EntityKind::MediaPlayer, name);
+    until("the HEOS title", 5, || {
+        attr("media_title") == Some("A Song".into())
+    })
+    .await;
+    assert_eq!(Some(Value::from("OFF")), attr("repeat"));
+    assert_eq!(Some(Value::from(false)), attr("shuffle"));
+
+    let send = |cmd_id: &str, params: Value| Command {
+        kind: EntityKind::MediaPlayer,
+        cmd_id: cmd_id.into(),
+        params: params.as_object().cloned(),
+    };
+    let repeat = send("repeat", serde_json::json!({"repeat": "ALL"}));
+    rig.actor.send(repeat).await.expect("send").expect("repeat");
+    until("repeat all", 5, || attr("repeat") == Some("ALL".into())).await;
+    // Shuffle keeps the repeat mode.
+    let shuffle = send("shuffle", serde_json::json!({"shuffle": true}));
+    rig.actor
+        .send(shuffle)
+        .await
+        .expect("send")
+        .expect("shuffle");
+    until("shuffle on", 5, || attr("shuffle") == Some(true.into())).await;
+    let modes: Vec<String> = heos
+        .received()
+        .into_iter()
+        .filter(|l| l.starts_with("player/set_play_mode"))
+        .collect();
+    assert_eq!(
+        vec![
+            "player/set_play_mode?pid=7&repeat=on_all&shuffle=off",
+            "player/set_play_mode?pid=7&repeat=on_all&shuffle=on",
+        ],
+        modes
+    );
+
+    // Without HEOS in use, the command does nothing and the answer is OK.
+    rig.telnet.send("SIDVD");
+    until("DVD", 5, || attr("media_title") == Some("DVD".into())).await;
+    let off = send("repeat", serde_json::json!({"repeat": "OFF"}));
+    rig.actor.send(off).await.expect("send").expect("ignored");
+    assert_eq!(2, heos.count("player/set_play_mode"));
+}
+
+#[actix::test]
 async fn the_media_player_shows_heos_on_network_audio() {
     let heos = FakeHeos::start("127.0.0.1", HeosItem::song()).await;
     TEST_HEOS.with(|slot| slot.set(Some(heos.config())));
@@ -1058,6 +1154,31 @@ async fn the_heos_client_is_kept_while_the_receiver_connects_again() {
     })
     .await;
     let reads = heos.count("player/get_players");
+    let connected = status_count(&rig.events, DeviceStatus::Connected);
+    // A new poll setting connects to the receiver again, as after a lost connection.
+    let cfg = DeviceConfig {
+        signal_poll_secs: 5,
+        ..cfg()
+    };
+    rig.actor.send(UpdateConfig(cfg)).await.expect("update");
+    until("connected again", 5, || {
+        status_count(&rig.events, DeviceStatus::Connected) > connected
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(reads, heos.count("player/get_players"));
+}
+
+#[actix::test]
+async fn the_heos_client_is_new_after_a_disconnect() {
+    let heos = FakeHeos::start("127.0.0.1", HeosItem::song()).await;
+    TEST_HEOS.with(|slot| slot.set(Some(heos.config())));
+    let rig = rig(answers_all, QUICK).await;
+    until("HEOS connected", 5, || {
+        heos.count("player/get_players") >= 1
+    })
+    .await;
+    let reads = heos.count("player/get_players");
     rig.actor.send(Disconnect).await.expect("disconnect");
     until("disconnected", 5, || {
         status_count(&rig.events, DeviceStatus::Disconnected) >= 1
@@ -1069,6 +1190,9 @@ async fn the_heos_client_is_kept_while_the_receiver_connects_again() {
         status_count(&rig.events, DeviceStatus::Connected) > connected
     })
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(reads, heos.count("player/get_players"));
+    // At standby, the HEOS connections can break without notice: new ones are opened.
+    until("HEOS connected again", 5, || {
+        heos.count("player/get_players") > reads
+    })
+    .await;
 }

@@ -7,7 +7,7 @@
 use super::{
     EntityKind, NumberKind, SelectKind, SensorKind, SwitchKind, View, attributes, definition,
 };
-use crate::config_store::DeviceConfig;
+use crate::config_store::{DeviceConfig, ReceiverGeneration};
 use denon_marantz::State;
 use denon_marantz::proto::telnet::Message;
 use serde_json::json;
@@ -295,6 +295,8 @@ async fn heos_shows_a_station_as_radio_with_the_station_as_album() {
     assert_eq!(json!(65), player_attrs["media_position"]);
     assert_eq!(json!(0), player_attrs["media_duration"]);
     assert_eq!(Value::Null, player_attrs["media_position_updated_at"]);
+    assert_eq!(json!("OFF"), player_attrs["repeat"]);
+    assert_eq!(json!(false), player_attrs["shuffle"]);
 
     // Another source: no HEOS, no position.
     let other = shown(&self::state(&["PWON", "SIDVD"]));
@@ -305,7 +307,10 @@ async fn heos_shows_a_station_as_radio_with_the_station_as_album() {
 
 #[test]
 fn the_media_player_has_the_python_features() {
-    let mut c = cfg();
+    let mut c = DeviceConfig {
+        heos: Some(false),
+        ..cfg()
+    };
     let features = |c: &DeviceConfig| -> Vec<String> {
         let entity = definition(c, EntityKind::MediaPlayer);
         entity.features.expect("features")
@@ -323,7 +328,15 @@ fn the_media_player_has_the_python_features() {
     c.heos = Some(true);
     let heos = features(&c);
     assert!(has(&heos, "stop") && has(&heos, "media_position") && has(&heos, "media_duration"));
-    assert_eq!(24, heos.len());
+    assert!(has(&heos, "repeat") && has(&heos, "shuffle"));
+    assert_eq!(26, heos.len());
+    // Not known yet: the position is there, so that the Remote has it once HEOS answers.
+    c.heos = None;
+    let unknown = features(&c);
+    assert!(has(&unknown, "stop") && has(&unknown, "media_position"));
+    assert!(has(&unknown, "media_duration"));
+    c.receiver_type = Some(ReceiverGeneration::Avr);
+    assert_eq!(marantz, features(&c));
 }
 
 #[test]

@@ -6,7 +6,9 @@
 
 use crate::config_store::ReceiverGeneration;
 use crate::errors::ServiceError;
-use denon_marantz_heos::{Error, Heos, HeosConfig, PlayState, PlayerId, PlayerState};
+use denon_marantz_heos::{
+    Error, Heos, HeosConfig, PlayMode, PlayState, PlayerId, PlayerState, RepeatMode,
+};
 use log::{debug, info};
 use std::io::ErrorKind;
 use std::net::IpAddr;
@@ -59,6 +61,25 @@ impl Link {
         Ok(self.heos.set_play_state(self.pid, state).await?)
     }
 
+    /// Set the repeat mode, the shuffle mode, or both. The part that is `None` stays as it is.
+    pub async fn set_play_mode(
+        &self,
+        repeat: Option<RepeatMode>,
+        shuffle: Option<bool>,
+    ) -> Result<(), ServiceError> {
+        let now = self
+            .with_player(|p| p.and_then(PlayerState::play_mode))
+            .unwrap_or(PlayMode {
+                repeat: RepeatMode::Off,
+                shuffle: false,
+            });
+        let mode = PlayMode {
+            repeat: repeat.unwrap_or(now.repeat),
+            shuffle: shuffle.unwrap_or(now.shuffle),
+        };
+        Ok(self.heos.set_play_mode(self.pid, mode).await?)
+    }
+
     pub async fn next(&self) -> Result<(), ServiceError> {
         if !self.with_player(|p| p.is_none_or(|p| p.controls().next)) {
             return Err(ServiceError::Blocked(
@@ -83,7 +104,10 @@ pub fn concerns(pid: PlayerId, change: &denon_marantz_heos::Change) -> bool {
     use denon_marantz_heos::Change;
     match change {
         Change::Players | Change::PlayersNotRead => true,
-        Change::PlayState(p) | Change::NowPlaying(p) | Change::Progress(p) => *p == pid,
+        Change::PlayState(p)
+        | Change::NowPlaying(p)
+        | Change::Progress(p)
+        | Change::PlayMode(p) => *p == pid,
         _ => false,
     }
 }

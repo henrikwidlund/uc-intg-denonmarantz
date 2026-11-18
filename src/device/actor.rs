@@ -629,12 +629,12 @@ impl DenonActor {
                                 act.save_heos(false, version);
                             } else {
                                 // Not known: asked again at the next connect to the receiver.
-                                debug!("[{}] HEOS not checked: {e}", act.cfg.name);
+                                act.warn_heos(&e);
                             }
                         }
                         // The receiver has HEOS, but it does not answer now.
                         Err(e) => {
-                            debug!("[{}] HEOS connect failed: {e}", act.cfg.name);
+                            act.warn_heos(&e);
                             let wait = act.next_heos_wait();
                             act.timers.heos = Some(ctx.run_later(wait, move |act, ctx| {
                                 act.timers.heos = None;
@@ -647,6 +647,17 @@ impl DenonActor {
                 }),
         );
         self.timers.heos = Some(handle);
+    }
+
+    /// Log a failed HEOS connect: a warning for the first failure after a connect to the receiver,
+    /// as cover art and the play buttons then do not use HEOS. Retries log at debug level.
+    fn warn_heos(&self, e: &denon_marantz_heos::Error) {
+        let name = &self.cfg.name;
+        if self.heos_attempt == 0 {
+            warn!("[{name}] HEOS not reachable, cover art and HEOS controls may not work: {e}");
+        } else {
+            debug!("[{name}] HEOS connect failed: {e}");
+        }
     }
 
     /// The wait before HEOS is asked again. Each call gives the next, longer wait.
@@ -784,7 +795,8 @@ impl DenonActor {
             }
             _ => return None,
         };
-        if !commands::is_transport(&action) || !commands::heos_in_use(&link, &avr.state().borrow())
+        if !commands::is_heos_action(&action)
+            || !commands::heos_in_use(&link, &avr.state().borrow())
         {
             return None;
         }
@@ -1016,6 +1028,13 @@ impl DenonActor {
             self.last = avr.snapshot();
             actix::spawn(async move { avr.telnet_disconnect().await });
         }
+    }
+
+    /// Close the receiver and the HEOS connection, for example at standby. After a suspend of the
+    /// Remote, the HEOS connections can be broken without notice: the next connect opens new ones.
+    fn close_all(&mut self, ctx: &mut Context<Self>) {
+        self.close(ctx);
+        self.drop_heos(ctx);
     }
 
     /// Cancel the timers of the receiver connection. The HEOS connect runs on.
@@ -1447,7 +1466,7 @@ impl Handler<Disconnect> for DenonActor {
         // connection makes them unavailable.
         self.keep_state = true;
         if self.avr.is_none() {
-            self.close(ctx);
+            self.close_all(ctx);
             self.set_status(DeviceStatus::Disconnected);
             return;
         }
@@ -1466,7 +1485,7 @@ impl Handler<Disconnect> for DenonActor {
                             act.schedule_emit(ctx);
                         }
                     } else {
-                        act.close(ctx);
+                        act.close_all(ctx);
                         act.set_status(DeviceStatus::Disconnected);
                     }
                 }),
