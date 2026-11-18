@@ -206,7 +206,7 @@ impl Fake {
             read_delay_ms: AtomicU64::new(0),
             audyssey_answers: AtomicUsize::new(0),
         });
-        let (port, listeners) = bind_loopback("bind the fake receiver").await;
+        let (port, listeners) = bind_loopback(0, "bind the fake receiver").await;
         let commands = Arc::new(Mutex::new(Vec::new()));
         let app_commands = Arc::new(AtomicUsize::new(0));
         let audyssey_reads = Arc::new(AtomicUsize::new(0));
@@ -311,8 +311,8 @@ impl Fake {
 /// Listeners on the IPv4 loopback address and, if the system has it, on the IPv6 one, with the same
 /// port. A connect to `localhost` then works at once on every system: Windows tries `::1` first and
 /// waits about 2 seconds when nothing listens there.
-async fn bind_loopback(what: &str) -> (u16, Vec<TcpListener>) {
-    let v4 = TcpListener::bind("127.0.0.1:0").await.expect(what);
+async fn bind_loopback(port: u16, what: &str) -> (u16, Vec<TcpListener>) {
+    let v4 = TcpListener::bind(("127.0.0.1", port)).await.expect(what);
     let port = v4.local_addr().expect("address").port();
     let mut listeners = vec![v4];
     if let Ok(v6) = TcpListener::bind(("::1", port)).await {
@@ -542,7 +542,15 @@ pub struct FakeTelnet {
 impl FakeTelnet {
     /// Start the port. `answers` gives the lines for a line of the client.
     pub async fn start(answers: impl Fn(&str) -> Vec<String> + Send + Sync + 'static) -> Self {
-        let (port, listeners) = bind_loopback("bind the fake telnet port").await;
+        Self::start_at(0, answers).await
+    }
+
+    /// As [`FakeTelnet::start`], on `port`. 0 picks a free port.
+    pub async fn start_at(
+        port: u16,
+        answers: impl Fn(&str) -> Vec<String> + Send + Sync + 'static,
+    ) -> Self {
+        let (port, listeners) = bind_loopback(port, "bind the fake telnet port").await;
         let received = Arc::new(Mutex::new(Vec::new()));
         let control = Arc::new(Mutex::new(None));
         let connections = Arc::new(AtomicUsize::new(0));

@@ -629,6 +629,54 @@ async fn audyssey_values_stay_known_after_a_blank_http_answer() {
     );
 }
 
+/// An actor that is connected to a fake receiver whose telnet port refuses connects. Gives the
+/// actor, the fake receiver and the telnet port. Start the fake telnet port on it later.
+async fn connected_without_telnet() -> (Addr<DenonActor>, Fake, u16) {
+    let http = Fake::start(true).await;
+    // A free port that refuses connects until the fake telnet port starts on it.
+    let telnet_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("free port")
+        .port();
+    let http_port = http.port();
+    let setup: TestBuilder =
+        Rc::new(move |_, builder| test_builder(http_port, telnet_port, builder));
+    TEST_BUILDER.with(|slot| *slot.borrow_mut() = Some(setup));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let collector = Collector(events.clone()).start();
+    let actor = DenonActor::new("SERIAL0000001".into(), cfg(), collector.recipient())
+        .with_retry_delay(Duration::from_secs(60))
+        .start();
+    actor.send(Connect).await.expect("connect");
+    until("connected", 5, || {
+        status_count(&events, DeviceStatus::Connected) == 1
+    })
+    .await;
+    (actor, http, telnet_port)
+}
+
+// The library does not try again when the start cannot open telnet, for example while the network
+// of the Remote is not ready after wake-up.
+#[actix::test]
+async fn telnet_opens_when_the_port_answers_after_the_start() {
+    let (_actor, _http, telnet_port) = connected_without_telnet().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let telnet = FakeTelnet::start_at(telnet_port, answers_all).await;
+    // The fast tries run every 50 ms.
+    until("telnet", 1, || telnet.connections() >= 1).await;
+    until("the extra values", 5, || telnet.count("PV?") >= 1).await;
+}
+
+#[actix::test]
+async fn standby_stops_the_telnet_tries() {
+    let (actor, _http, telnet_port) = connected_without_telnet().await;
+    actor.send(Disconnect).await.expect("disconnect");
+    let telnet = FakeTelnet::start_at(telnet_port, answers_all).await;
+    // The fast tries would connect within 50 ms.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(0, telnet.connections());
+}
+
 #[actix::test]
 async fn the_connect_adds_the_receiver_kind_to_the_configuration() {
     let rig = rig(answers_all, QUICK).await;
@@ -824,7 +872,7 @@ async fn a_stalled_connect_is_started_again_twice_at_most() {
     let mut stall = discovery::Stall::new(Some(Duration::from_millis(10)));
     let deadline = Instant::now() + discovery::NETWORK_RETRY_TIMEOUT;
     let identify = discovery::identify_retry("127.0.0.1", None, deadline, &mut stall);
-    // Two restarts after 0.5 s each, then the third try has no limit and waits.
+    // Two restarts after 0.2 s each, then the third try has no limit and waits.
     let waited = tokio::time::timeout(Duration::from_secs(2), identify).await;
     assert!(waited.is_err());
     // The first try and two restarts.

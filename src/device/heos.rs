@@ -5,6 +5,7 @@
 //! previous for it. Volume and mute are not in HEOS: the zones share its volume.
 
 use crate::config_store::ReceiverGeneration;
+use crate::device::discovery::NETWORK_RETRY_INTERVAL;
 use crate::errors::ServiceError;
 use denon_marantz_heos::{
     Error, Heos, HeosConfig, PlayMode, PlayState, PlayerId, PlayerState, RepeatMode,
@@ -13,7 +14,9 @@ use log::{debug, info};
 use std::io::ErrorKind;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::watch;
+use tokio::time::sleep;
 
 /// The HEOS player of a receiver.
 #[derive(Debug, Clone)]
@@ -134,6 +137,24 @@ pub async fn connect(host: &str) -> Result<Connected, Error> {
     })
 }
 
+/// [`connect`], tried again every [`NETWORK_RETRY_INTERVAL`] until `fast_until` while the network
+/// is not ready, for example right after wake-up. A refused port is not tried again.
+pub async fn connect_soon(host: &str, fast_until: Instant) -> Result<Connected, Error> {
+    loop {
+        match connect(host).await {
+            Err(e) if not_ready(&e) && Instant::now() + NETWORK_RETRY_INTERVAL < fast_until => {
+                sleep(NETWORK_RETRY_INTERVAL).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+/// The connection could not be built, and the port did not refuse it.
+fn not_ready(error: &Error) -> bool {
+    matches!(error, Error::Network { .. }) && !is_absent(error)
+}
+
 /// The player with the address of the receiver in the HEOS list. Gives `heos` back if it is not
 /// in the list.
 pub async fn find(heos: Arc<Heos>) -> Result<Link, Arc<Heos>> {
@@ -208,6 +229,7 @@ thread_local! {
 mod tests {
     use super::*;
     use crate::test_support::{FakeHeos, HeosItem};
+    use std::time::Duration;
 
     fn use_fake(fake: &FakeHeos) {
         TEST_HEOS.with(|slot| slot.set(Some(fake.config())));
@@ -253,6 +275,43 @@ mod tests {
             }));
         });
         assert_eq!(Some(false), probe("127.0.0.1", None).await);
+    }
+
+    fn use_port(port: u16) {
+        TEST_HEOS.with(|slot| {
+            slot.set(Some(HeosConfig {
+                port,
+                ..HeosConfig::default()
+            }));
+        });
+    }
+
+    #[tokio::test]
+    async fn a_refused_port_is_not_tried_again() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("address").port();
+        drop(listener);
+        use_port(port);
+        let start = Instant::now();
+        let result = connect_soon("127.0.0.1", start + Duration::from_secs(3)).await;
+        assert!(result.is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn only_a_network_error_that_is_not_a_refusal_is_tried_again_soon() {
+        let network = |kind: ErrorKind| Error::Network {
+            request: "HEOS connect".into(),
+            source: kind.into(),
+        };
+        assert!(not_ready(&network(ErrorKind::NetworkUnreachable)));
+        assert!(not_ready(&network(ErrorKind::HostUnreachable)));
+        assert!(!not_ready(&network(ErrorKind::ConnectionRefused)));
+        assert!(!not_ready(&Error::NotConnected));
     }
 
     #[tokio::test]

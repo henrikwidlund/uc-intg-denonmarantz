@@ -48,17 +48,16 @@ const DISCONNECT_WAIT: Duration = Duration::from_secs(2);
 /// Time between reads of the state over HTTP, while telnet does not run. The Python integration
 /// reads every 10 seconds too.
 const HTTP_POLL_INTERVAL: Duration = Duration::from_secs(10);
-/// Time before HEOS is connected again after its connect failed. After a connect, the HEOS client
-/// connects again by itself.
 /// Waits before HEOS is asked again, while a receiver with HEOS does not answer or its player is
-/// not in the HEOS list. The last wait repeats.
+/// not in the HEOS list. The last wait repeats. After a connect, the HEOS client connects again by
+/// itself.
 #[cfg(not(test))]
 const HEOS_WAITS: [Duration; 5] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
     Duration::from_secs(30),
-    Duration::from_secs(60),
-    Duration::from_secs(120),
-    Duration::from_secs(300),
-    Duration::from_secs(600),
 ];
 #[cfg(test)]
 const HEOS_WAITS: [Duration; 5] = [Duration::from_millis(100); 5];
@@ -160,6 +159,8 @@ struct Timers {
     /// The reads after a connect: missing web pages and toggles. Cancelling it drops its copy of
     /// the old `Avr`.
     pages: Option<SpawnHandle>,
+    /// The telnet connects after the start could not open telnet.
+    telnet: Option<SpawnHandle>,
     /// The HEOS connect, or the wait before it is tried again.
     heos: Option<SpawnHandle>,
 }
@@ -608,6 +609,11 @@ impl DenonActor {
             let status = WatchStream::from_changes(avr.telnet_status())
                 .map(move |s| LinkChanged(generation, s == TelnetStatus::Connected));
             ctx.add_message_stream(status);
+            if !self.telnet_up {
+                let fast_until = start + discovery::NETWORK_RETRY_TIMEOUT;
+                let keep = discovery::keep_telnet(avr.clone(), fast_until, self.cfg.name.clone());
+                self.timers.telnet = Some(ctx.spawn(keep.into_actor(self)));
+            }
         }
         // Without telnet events, the state is read over HTTP. This also covers a telnet connection
         // that is down.
@@ -649,8 +655,15 @@ impl DenonActor {
         let host = info.host.clone();
         self.heos_host = Some(host.clone());
         let generation = self.heos_generation;
+        // Only the first try retries fast. The tries after a wait do not.
+        let fast = if self.heos_attempt == 0 {
+            discovery::NETWORK_RETRY_TIMEOUT
+        } else {
+            Duration::ZERO
+        };
+        let fast_until = Instant::now() + fast;
         let handle = ctx.spawn(
-            async move { heos::connect(&host).await }
+            async move { heos::connect_soon(&host, fast_until).await }
                 .into_actor(self)
                 .map(move |result, act, ctx| {
                     if act.heos_generation != generation {
@@ -1094,6 +1107,7 @@ impl DenonActor {
             self.timers.poll.take(),
             self.timers.signal.take(),
             self.timers.pages.take(),
+            self.timers.telnet.take(),
         ]
         .into_iter()
         .flatten()
@@ -1120,7 +1134,7 @@ impl DenonActor {
         let heos = self.timers.heos.take();
         let t = std::mem::take(&mut self.timers);
         self.timers.heos = heos;
-        for handle in [t.connect, t.reconnect, t.poll, t.signal, t.pages]
+        for handle in [t.connect, t.reconnect, t.poll, t.signal, t.pages, t.telnet]
             .into_iter()
             .flatten()
         {
@@ -1757,24 +1771,31 @@ pub(super) async fn send_command(
         &msg.cmd_id,
         msg.params.as_ref(),
     );
-    let Some(mut attempt) = attempt else {
-        return send.await;
-    };
-    if attempt.has_changed().unwrap_or(true) {
-        info!("[{name}] {} not sent: standby or a new wake-up", msg.cmd_id);
-        return Ok(());
-    }
-    tokio::select! {
-        result = send => result,
-        // An error means that the actor is gone.
-        _ = attempt.changed() => {
-            info!(
-                "[{name}] {} stopped by standby or a new wake-up, it may have run",
-                msg.cmd_id
-            );
-            Ok(())
+    let started = Instant::now();
+    let result = if let Some(mut attempt) = attempt {
+        if attempt.has_changed().unwrap_or(true) {
+            info!("[{name}] {} not sent: standby or a new wake-up", msg.cmd_id);
+            return Ok(());
         }
+        tokio::select! {
+            result = send => result,
+            // An error means that the actor is gone.
+            _ = attempt.changed() => {
+                info!(
+                    "[{name}] {} stopped by standby or a new wake-up, it may have run",
+                    msg.cmd_id
+                );
+                return Ok(());
+            }
+        }
+    } else {
+        send.await
+    };
+    if result.is_ok() {
+        let took = started.elapsed().as_millis();
+        debug!("[{name}] {} done in {took} ms", command_name(msg));
     }
+    result
 }
 
 /// Log how long a command waited before it goes to the receiver.

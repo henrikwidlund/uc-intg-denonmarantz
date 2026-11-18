@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use tokio::time::{sleep, timeout};
 
 /// Shortest time limit of one connect try, see [`Stall`].
-pub(crate) const STALL_MIN: Duration = Duration::from_millis(500);
+pub(crate) const STALL_MIN: Duration = Duration::from_millis(200);
 /// The time limit of a connect try is this many times the last connect.
 const STALL_FACTOR: u32 = 3;
 /// A longer time limit is not used: the receiver is slow, and its tries are not started again.
@@ -32,7 +32,7 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const CONNECT_RETRY: Duration = Duration::from_secs(3);
 /// Time between connects while the network is not ready, for example right after wake-up. The fast
 /// tries end after [`NETWORK_RETRY_TIMEOUT`].
-const NETWORK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+pub(crate) const NETWORK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 /// Longest time to retry fast while the network is not ready.
 pub const NETWORK_RETRY_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -275,6 +275,36 @@ const TELNET_WAIT: Duration = Duration::from_secs(25);
 pub async fn start(avr: &Arc<Avr>, telnet: bool) -> Result<Started, Error> {
     let options = StartOptions::new().telnet(telnet).telnet_wait(TELNET_WAIT);
     avr.start_with(options).await
+}
+
+/// First wait between telnet connects that are not fast tries. It doubles after each failure.
+const TELNET_RETRY_MIN: Duration = Duration::from_millis(500);
+/// Longest wait between telnet connects.
+const TELNET_RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// Open telnet after the start could not open it. The library does not try again then. After a
+/// network error, it tries again every [`NETWORK_RETRY_INTERVAL`] until `fast_until`, then with a
+/// growing wait. Ends when telnet is open.
+pub async fn keep_telnet(avr: Arc<Avr>, fast_until: Instant, name: String) {
+    let mut wait = TELNET_RETRY_MIN;
+    let mut first = true;
+    loop {
+        let Err(e) = avr.telnet_connect().await else {
+            return;
+        };
+        if first {
+            debug!("[{name}] telnet not open, trying again: {e}");
+            first = false;
+        }
+        let pause = if e.is_network() && Instant::now() + NETWORK_RETRY_INTERVAL < fast_until {
+            NETWORK_RETRY_INTERVAL
+        } else {
+            let pause = wait;
+            wait = (wait * 2).min(TELNET_RETRY_MAX);
+            pause
+        };
+        sleep(pause).await;
+    }
 }
 
 /// Time before a web page that failed is read again.
