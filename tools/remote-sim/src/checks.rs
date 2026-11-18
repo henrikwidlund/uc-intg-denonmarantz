@@ -2150,6 +2150,12 @@ pub async fn heos(ctx: &mut Ctx) -> Check {
         "album {:?}, HEOS has {album:?}",
         ctx.client.text(&mp, "media_album")
     );
+    ensure!(
+        ctx.client.text(&mp, "media_image_url") == media.image_url.as_ref(),
+        "image {:?}, HEOS has {:?}",
+        ctx.client.text(&mp, "media_image_url"),
+        media.image_url
+    );
 
     // The position: the Remote counts on from `media_position_updated_at`.
     let position = heos_position(ctx, &mp)?;

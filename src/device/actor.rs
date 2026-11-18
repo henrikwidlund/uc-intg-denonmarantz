@@ -1058,16 +1058,25 @@ impl DenonActor {
         }
     }
 
+    /// Whether network audio plays now.
+    fn net_audio_playing(&self) -> bool {
+        self.avr
+            .as_ref()
+            .is_some_and(|avr| avr.state().borrow().device().now_playing.is_playing() == Some(true))
+    }
+
     /// Run the steps of a remote command in the background.
     fn spawn_run(
         &self,
         run: remote::RemoteRun,
+        msg: Command,
         connecting: Option<watch::Receiver<DeviceStatus>>,
         ctx: &mut Context<Self>,
     ) {
         let lock = self.cmd_lock.clone();
         let cfg = self.cfg.clone();
         let expected = self.expected.clone();
+        let received = Instant::now();
         ctx.spawn(
             async move {
                 connect_ended(connecting).await;
@@ -1079,16 +1088,20 @@ impl DenonActor {
                 let name = act.cfg.name.clone();
                 async move {
                     let Some(avr) = avr else {
-                        warn!("[{name}] remote command: the receiver is not connected");
+                        warn!(
+                            "[{name}] {}: the receiver is not connected",
+                            command_name(&msg)
+                        );
                         return;
                     };
+                    log_sending(&name, &msg, received);
                     match commands::run_steps(&avr, heos.as_ref(), &cfg, &expected, &run, &lock)
                         .await
                     {
                         Err(ServiceError::Blocked(reason)) => {
-                            info!("[{name}] remote command ignored: {reason}");
+                            info!("[{name}] {} ignored: {reason}", command_name(&msg));
                         }
-                        Err(e) => warn!("[{name}] remote command failed: {e}"),
+                        Err(e) => warn!("[{name}] {} failed: {e}", command_name(&msg)),
                         Ok(()) => {}
                     }
                 }
@@ -1498,6 +1511,22 @@ impl Handler<UpdateConfig> for DenonActor {
     }
 }
 
+/// The name of a command for the log: the command of a remote entity, else the command id.
+fn command_name(msg: &Command) -> &str {
+    msg.params
+        .as_ref()
+        .filter(|_| msg.kind == EntityKind::Remote)
+        .and_then(|p| p.get("command"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&msg.cmd_id)
+}
+
+/// Log how long a command waited before it goes to the receiver.
+fn log_sending(name: &str, msg: &Command, received: Instant) {
+    let waited = received.elapsed().as_millis();
+    debug!("[{name}] sending {} after {waited} ms", command_name(msg));
+}
+
 impl Handler<Command> for DenonActor {
     type Result = ResponseActFuture<Self, Result<(), ServiceError>>;
 
@@ -1520,7 +1549,7 @@ impl Handler<Command> for DenonActor {
             match remote::command(&msg.cmd_id, msg.params.as_ref()) {
                 Err(e) => return Box::pin(fut::ready(Err(e))),
                 Ok(run) if run.steps() > 1 => {
-                    self.spawn_run(run, connecting, ctx);
+                    self.spawn_run(run, msg, connecting, ctx);
                     return Box::pin(fut::ready(Ok(())));
                 }
                 Ok(_) => {}
@@ -1532,10 +1561,9 @@ impl Handler<Command> for DenonActor {
         let lock = self.cmd_lock.clone();
         let cfg = self.cfg.clone();
         let expected = self.expected.clone();
+        let received = Instant::now();
         // Network audio plays now: a pause command pauses it.
-        let was_playing = self.avr.as_ref().is_some_and(|avr| {
-            avr.state().borrow().device().now_playing.is_playing() == Some(true)
-        });
+        let was_playing = self.net_audio_playing();
         // The remote entity passes the media player commands on, as in the Python integration.
         let media_command = match msg.kind {
             EntityKind::MediaPlayer => Some(msg.cmd_id.clone()),
@@ -1567,6 +1595,7 @@ impl Handler<Command> for DenonActor {
                     let Some(avr) = avr else {
                         return Err(ServiceError::NotConnected);
                     };
+                    log_sending(&name, &msg, received);
                     let result = commands::run(
                         &avr,
                         heos.as_ref(),
@@ -1617,6 +1646,21 @@ impl Handler<Command> for DenonActor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_log_names_the_remote_command_else_the_command_id() {
+        let cmd = |kind, cmd_id: &str, command: Option<&str>| Command {
+            kind,
+            cmd_id: cmd_id.to_owned(),
+            params: command.map(|c| Map::from_iter([("command".to_owned(), c.into())])),
+        };
+        let remote = cmd(EntityKind::Remote, "send_cmd", Some("MUTE_TOGGLE"));
+        assert_eq!("MUTE_TOGGLE", command_name(&remote));
+        let sequence = cmd(EntityKind::Remote, "send_cmd_sequence", None);
+        assert_eq!("send_cmd_sequence", command_name(&sequence));
+        let media = cmd(EntityKind::MediaPlayer, "volume", Some("x"));
+        assert_eq!("volume", command_name(&media));
+    }
 
     #[test]
     fn the_position_is_sent_only_when_it_jumps_or_the_play_state_changes() {
