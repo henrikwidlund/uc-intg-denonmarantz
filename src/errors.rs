@@ -23,6 +23,10 @@ pub enum ServiceError {
     NotConnected,
     #[error("Service unavailable: {0}")]
     ServiceUnavailable(String),
+    /// The connection to the receiver could not be opened, so the request was not sent. Another
+    /// try can work. The Remote gets the same answer as for `ServiceUnavailable`.
+    #[error("Service unavailable: {0}")]
+    NotSent(String),
     #[error("Timeout")]
     Timeout,
     #[error("Not supported: {0}")]
@@ -77,9 +81,39 @@ impl From<strum::ParseError> for ServiceError {
     }
 }
 
+/// The request was not sent: the connection could not be opened. Only errors of the connect are
+/// counted, so a command that is sent again does not run twice.
+fn not_sent(e: &denon_marantz::Error) -> bool {
+    use denon_marantz::Error;
+    match e {
+        // A request that gets no answer has the longer time limit of the whole request.
+        Error::Timeout { limit, .. } => *limit == crate::device::discovery::CONNECT_TIMEOUT,
+        Error::Network { .. } => {
+            let mut source = std::error::Error::source(e);
+            while let Some(cause) = source {
+                if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+                    return matches!(
+                        io.kind(),
+                        ErrorKind::NetworkUnreachable
+                            | ErrorKind::HostUnreachable
+                            | ErrorKind::NetworkDown
+                            | ErrorKind::ConnectionRefused
+                            | ErrorKind::AddrNotAvailable
+                    );
+                }
+                source = cause.source();
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 impl From<denon_marantz::Error> for ServiceError {
     fn from(e: denon_marantz::Error) -> Self {
-        if e.is_not_connected() {
+        if not_sent(&e) {
+            Self::NotSent(e.to_string())
+        } else if e.is_not_connected() {
             Self::NotConnected
         } else if e.is_timeout() {
             Self::Timeout
@@ -118,6 +152,7 @@ impl From<denon_marantz_heos::Error> for ServiceError {
 mod tests {
     use super::*;
     use denon_marantz::Error;
+    use std::time::Duration;
 
     #[test]
     fn a_query_over_http_is_not_a_missing_feature() {
@@ -144,6 +179,40 @@ mod tests {
             ServiceError::Timeout,
             ServiceError::from(MailboxError::Timeout)
         );
+    }
+
+    fn network(kind: ErrorKind) -> Error {
+        Error::Network {
+            request: "GET http://receiver/".into(),
+            source: Box::new(std::io::Error::from(kind)),
+        }
+    }
+
+    #[test]
+    fn a_failed_connect_is_not_sent() {
+        for kind in [ErrorKind::NetworkUnreachable, ErrorKind::ConnectionRefused] {
+            let e = ServiceError::from(network(kind));
+            assert!(matches!(e, ServiceError::NotSent(_)), "{e:?}");
+        }
+        let connect = Error::Timeout {
+            request: "GET http://receiver/".into(),
+            limit: crate::device::discovery::CONNECT_TIMEOUT,
+        };
+        assert!(matches!(
+            ServiceError::from(connect),
+            ServiceError::NotSent(_)
+        ));
+    }
+
+    #[test]
+    fn a_request_that_can_have_arrived_is_not_sent_again() {
+        let e = ServiceError::from(network(ErrorKind::ConnectionReset));
+        assert!(matches!(e, ServiceError::ServiceUnavailable(_)), "{e:?}");
+        let answer = Error::Timeout {
+            request: "GET http://receiver/".into(),
+            limit: Duration::from_secs(15),
+        };
+        assert_eq!(ServiceError::Timeout, ServiceError::from(answer));
     }
 
     #[test]

@@ -5,9 +5,9 @@
 
 use crate::config_store::{self, DeviceConfig};
 use denon_marantz::{
-    Ask, Avr, AvrBuilder, Brand, DiscoveredReceiver, DiscoveryConfig, Error, Info, InfoCheck,
-    PageStatus, Query, QueryGroup, ReceiverType, StartOptions, StartReport, Started, TelnetSync,
-    UpdateMethod, discover_all,
+    Ask, Avr, AvrBuilder, Brand, DiscoveredReceiver, DiscoveryConfig, Error, HttpConfig, Info,
+    InfoCheck, PageStatus, Query, QueryGroup, ReceiverType, StartOptions, StartReport, Started,
+    TelnetSync, UpdateMethod, discover_all,
 };
 use log::debug;
 use std::sync::Arc;
@@ -20,10 +20,13 @@ use tokio::time::{sleep, timeout};
 /// After wake-up, the Wi-Fi link of the Remote can go down for a short time. Lost packets then
 /// wait for the TCP resend (1 s or more). A connect step takes much less.
 pub(crate) const STALL_TIMEOUT: Duration = Duration::from_millis(250);
-/// Time between connects while the network is not ready, for example right after wake-up. It
-/// grows, so that a receiver that is off does not get a connect attempt every 50 ms.
+/// Time allowed to open an HTTP connection to the receiver. On the local network it takes a few
+/// milliseconds. After wake-up, a lost connect packet is sent again only after 1 s: a new try after
+/// this time is faster.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+/// Time between connects while the network is not ready, for example right after wake-up. The fast
+/// tries end after [`NETWORK_RETRY_TIMEOUT`].
 const NETWORK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
-const NETWORK_RETRY_INTERVAL_MAX: Duration = Duration::from_millis(250);
 /// Longest time to retry fast while the network is not ready.
 pub const NETWORK_RETRY_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -159,7 +162,10 @@ pub async fn connect_known(host: &str, info: Info) -> Result<Avr, Error> {
 /// The builder of a connection. A test can change it, so that the library talks to a fake
 /// receiver.
 fn builder(host: &str, known: Option<Known>) -> AvrBuilder {
-    let mut builder = Avr::builder(host);
+    let mut builder = Avr::builder(host).http_config(HttpConfig {
+        connect_timeout: CONNECT_TIMEOUT,
+        ..HttpConfig::default()
+    });
     if let Some(known) = known {
         builder = builder.brand(known.brand);
         if let Some(receiver_type) = known.receiver_type {
@@ -207,24 +213,33 @@ pub async fn start_retry(
     retry_network(&avr.info().host, deadline, || start(avr, telnet)).await
 }
 
-/// Run `step` again after a network error, with a short growing delay, until `deadline`.
+/// Run `step` again after a network error, with a short delay, until `deadline`.
 async fn retry_network<T, F: Future<Output = Result<T, Error>>>(
     host: &str,
     deadline: Instant,
-    mut step: impl FnMut() -> F,
+    step: impl FnMut() -> F,
 ) -> Result<T, Error> {
-    let mut delay = NETWORK_RETRY_INTERVAL;
+    retry_while(host, deadline, step, Error::is_unreachable).await
+}
+
+/// Run `step` again while `retry` is true for its error, with a short delay, until
+/// `deadline`. `name` is for the log.
+pub async fn retry_while<T, E: std::fmt::Display, F: Future<Output = Result<T, E>>>(
+    name: &str,
+    deadline: Instant,
+    mut step: impl FnMut() -> F,
+    retry: impl Fn(&E) -> bool,
+) -> Result<T, E> {
     let mut first = true;
     loop {
         match step().await {
-            Err(e) if e.is_unreachable() && Instant::now() + delay < deadline => {
+            Err(e) if retry(&e) && Instant::now() + NETWORK_RETRY_INTERVAL < deadline => {
                 // One line for the first failure only: wake-up can need many tries.
                 if first {
-                    debug!("[{host}] network not ready: {e}");
+                    debug!("[{name}] network not ready: {e}");
                     first = false;
                 }
-                sleep(delay).await;
-                delay = (delay + NETWORK_RETRY_INTERVAL).min(NETWORK_RETRY_INTERVAL_MAX);
+                sleep(NETWORK_RETRY_INTERVAL).await;
             }
             result => return result,
         }

@@ -70,13 +70,15 @@ to the log that says why.
   the last address first, then it searches the network for its MAC address or serial number and saves the new
   address.
 - After the Remote wakes up, the network of the Remote can be down for a short time. The driver tries again
-  with a growing delay for up to 3 seconds. When a lookup of the receiver has no answer in 0.25 seconds, a
-  second one starts and the first answer is used.
-- A command that comes while the first connect runs waits for it, at most 6 seconds. Commands that do not need the
+  every 0.05 seconds for up to 3 seconds. A connection to the receiver that does not open in 0.25 seconds is
+  tried again. When a lookup of the receiver has no answer in 0.25 seconds, a second one starts and the first
+  answer is used.
+- A command that comes while the first connect runs waits for it, at most 3 seconds. Commands that do not need the
   state of the receiver (power, volume, mute, cursor keys, back, info, channel up and down, raw text, and next,
   previous and stop on receivers without HEOS) are sent when the receiver is known, before the start ends.
-  Commands keep their order: a command after one that waits also waits. If the receiver is not reachable, a
-  command fails at once.
+  Commands keep their order: a command after one that waits also waits. A command that is sent before the start
+  ends and cannot open its connection is sent again for up to 3 seconds. Otherwise, if the receiver is not
+  reachable, a command fails at once.
 
 ## Requirements
 

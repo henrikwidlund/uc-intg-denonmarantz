@@ -26,8 +26,10 @@ use tokio::time::timeout;
 use tokio_stream::wrappers::{BroadcastStream, WatchStream};
 
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
-/// Longest wait for a running connect before a command runs. The core waits 10 s for the answer.
-const CONNECT_WAIT: Duration = Duration::from_secs(6);
+/// Longest wait for a running connect before a command runs: as long as the fast retries of the
+/// connect while the network is not ready ([`discovery::NETWORK_RETRY_TIMEOUT`]). The core waits
+/// 10 s for the answer.
+const CONNECT_WAIT: Duration = Duration::from_secs(3);
 /// A connection that stayed up this long resets the reconnect delay.
 const STABLE_CONNECTION: Duration = Duration::from_secs(60);
 /// Changes come in bursts. Entity attributes are sent once after the last one.
@@ -217,8 +219,9 @@ pub struct DenonActor {
     attempts: u32,
     /// The connects look the receiver up and do not use the stored values, until one succeeds.
     look_up: bool,
-    /// Incremented on each connect attempt and on close. Results of older attempts are ignored.
-    attempt: u64,
+    /// Incremented on each connect attempt and on close. Results of older attempts are ignored, and
+    /// commands of an older attempt are not sent again.
+    attempt: watch::Sender<u64>,
     /// Incremented on each connect and disconnect. Results of older connections are ignored.
     generation: u64,
     connected_at: Option<Instant>,
@@ -289,7 +292,7 @@ impl DenonActor {
             keep_state: false,
             attempts: 0,
             look_up: false,
-            attempt: 0,
+            attempt: watch::Sender::new(0),
             generation: 0,
             connected_at: None,
             emit_due: false,
@@ -486,8 +489,8 @@ impl DenonActor {
             return;
         }
         self.set_status(DeviceStatus::Connecting);
-        self.attempt += 1;
-        let attempt = self.attempt;
+        self.attempt.send_modify(|a| *a += 1);
+        let attempt = *self.attempt.borrow();
         // Values from before the connect are not valid anymore. Commands can run before the start
         // ends, so they are cleared now.
         self.expected.clear();
@@ -502,7 +505,7 @@ impl DenonActor {
         let fut = connect_avr(cfg, known, move |avr| addr.do_send(Early(attempt, avr)));
         let handle = ctx.spawn(fut.into_actor(self).map(move |result, act, ctx| {
             act.timers.connect = None;
-            if act.attempt != attempt {
+            if *act.attempt.borrow() != attempt {
                 debug!(
                     "[{}] result of an old connect attempt ignored",
                     act.cfg.name
@@ -1059,7 +1062,7 @@ impl DenonActor {
     /// Close the connection and stop all tasks of it.
     fn close(&mut self, ctx: &mut Context<Self>) {
         self.generation += 1;
-        self.attempt += 1;
+        self.attempt.send_modify(|a| *a += 1);
         // A connection that drops at once keeps the reconnect delay growing.
         if self
             .connected_at
@@ -1543,7 +1546,7 @@ impl Handler<Early> for DenonActor {
     type Result = ();
 
     fn handle(&mut self, msg: Early, _: &mut Self::Context) {
-        if msg.0 == self.attempt && self.want && self.status == DeviceStatus::Connecting {
+        if msg.0 == *self.attempt.borrow() && self.want && self.status == DeviceStatus::Connecting {
             self.early_tx.send_replace(Some(msg.1));
         }
     }
@@ -1717,6 +1720,55 @@ fn command_name(msg: &Command) -> &str {
         .unwrap_or(&msg.cmd_id)
 }
 
+/// When a command that was not sent is sent again.
+pub(super) struct Resend {
+    /// The last time to send it again.
+    pub until: Instant,
+    /// The connect attempt of the command, from when it got its turn. Once another attempt starts
+    /// or the connection is closed, the command is not sent: it fails with
+    /// [`ServiceError::NotConnected`].
+    pub attempt: watch::Receiver<u64>,
+}
+
+/// Run a command. With `resend`, a command that was not sent is sent again.
+pub(super) async fn send_command(
+    avr: &Avr,
+    heos: Option<&heos::Link>,
+    cfg: &DeviceConfig,
+    expected: &Expected,
+    msg: &Command,
+    resend: Option<Resend>,
+    name: &str,
+) -> Result<(), ServiceError> {
+    let send = || {
+        commands::run(
+            avr,
+            heos,
+            cfg,
+            expected,
+            msg.kind,
+            &msg.cmd_id,
+            msg.params.as_ref(),
+        )
+    };
+    let Some(Resend { until, attempt }) = resend else {
+        return send().await;
+    };
+    let try_send = || {
+        let old = attempt.has_changed().unwrap_or(true);
+        async move {
+            if old {
+                return Err(ServiceError::NotConnected);
+            }
+            send().await
+        }
+    };
+    discovery::retry_while(name, until, try_send, |e| {
+        matches!(e, ServiceError::NotSent(_))
+    })
+    .await
+}
+
 /// Log how long a command waited before it goes to the receiver.
 fn log_sending(name: &str, msg: &Command, received: Instant, early: bool) {
     let waited = received.elapsed().as_millis();
@@ -1791,22 +1843,21 @@ impl Handler<Command> for DenonActor {
                     };
                     let heos = act.heos.clone();
                     let name = act.cfg.name.clone();
+                    // Before the start ends, the network of the Remote can still be down after
+                    // wake-up. The connect retries then, and so does the command.
+                    let resend = early.then(|| Resend {
+                        until: received + discovery::NETWORK_RETRY_TIMEOUT,
+                        attempt: act.attempt.subscribe(),
+                    });
                     async move {
                         let _guard = guard?;
                         let Some(avr) = avr else {
                             return Err(ServiceError::NotConnected);
                         };
                         log_sending(&name, &msg, received, early);
-                        let result = commands::run(
-                            &avr,
-                            heos.as_ref(),
-                            &cfg,
-                            &expected,
-                            msg.kind,
-                            &msg.cmd_id,
-                            msg.params.as_ref(),
-                        )
-                        .await;
+                        let result =
+                            send_command(&avr, heos.as_ref(), &cfg, &expected, &msg, resend, &name)
+                                .await;
                         match result {
                             // The state of the receiver does not allow it. The Remote shows an error
                             // banner for any other answer than OK that the user must close, and the

@@ -5,7 +5,8 @@
 //! The tests check what the actor asks for and shows when the receiver answers, does not answer,
 //! sends events or closes the connection.
 
-use super::actor::{CurrentAvr, read_differently};
+use super::actor::{CurrentAvr, Resend, read_differently, send_command};
+use super::commands;
 use super::discovery::{self, Known, TEST_BUILDER, TEST_DISCOVERY, TestBuilder};
 use super::heos::TEST_HEOS;
 use super::{Command, Connect, DenonActor, DeviceEvent, DeviceStatus, Disconnect, UpdateConfig};
@@ -726,19 +727,22 @@ async fn hang_first(target: u16) -> u16 {
     let port = listener.local_addr().expect("address").port();
     tokio::spawn(async move {
         let mut held = None;
-        while let Ok((mut socket, _)) = listener.accept().await {
+        while let Ok((socket, _)) = listener.accept().await {
             if held.is_none() {
                 held = Some(socket);
                 continue;
             }
-            tokio::spawn(async move {
-                if let Ok(mut fake) = tokio::net::TcpStream::connect(("127.0.0.1", target)).await {
-                    let _ = tokio::io::copy_bidirectional(&mut socket, &mut fake).await;
-                }
-            });
+            tokio::spawn(forward(socket, target));
         }
     });
     port
+}
+
+/// Pass a connection on to the port `target`.
+async fn forward(mut socket: tokio::net::TcpStream, target: u16) {
+    if let Ok(mut fake) = tokio::net::TcpStream::connect(("127.0.0.1", target)).await {
+        let _ = tokio::io::copy_bidirectional(&mut socket, &mut fake).await;
+    }
 }
 
 #[actix::test]
@@ -1396,6 +1400,101 @@ async fn a_command_that_does_not_read_the_state_is_sent_before_the_start_ends() 
         "{:?}",
         rig.http.commands()
     );
+}
+
+/// A free port. It refuses connections until `open` passes them to `target`.
+async fn closed_port() -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    listener.local_addr().expect("address").port()
+}
+
+/// Pass the connections to `port` on to `target`.
+async fn open(port: u16, target: u16) {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .expect("bind again");
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            tokio::spawn(forward(socket, target));
+        }
+    });
+}
+
+/// A receiver whose HTTP port is `port`. The connect sends no request.
+async fn avr_on(fake: &Fake, port: u16) -> denon_marantz::Avr {
+    let info = Info {
+        port,
+        ..fake.avr().await.info().clone()
+    };
+    denon_marantz::Avr::builder("127.0.0.1")
+        .known(info)
+        .connect()
+        .await
+        .expect("connect")
+}
+
+#[actix::test]
+async fn a_command_before_the_start_ends_is_sent_again_until_the_network_is_up() {
+    let fake = Fake::start(true).await;
+    let port = closed_port().await;
+    let avr = avr_on(&fake, port).await;
+    let (cfg, expected) = (cfg(), commands::Expected::default());
+    let msg = media_command("volume_down");
+    let failed = send_command(&avr, None, &cfg, &expected, &msg, None, "AVR").await;
+    assert!(
+        matches!(failed, Err(ServiceError::NotSent(_))),
+        "{failed:?}"
+    );
+    let (_attempts, attempt) = tokio::sync::watch::channel(1_u64);
+    let resend = Resend {
+        until: Instant::now() + Duration::from_secs(3),
+        attempt,
+    };
+    let send = send_command(&avr, None, &cfg, &expected, &msg, Some(resend), "AVR");
+    let opened = async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        open(port, fake.port()).await;
+    };
+    let (result, ()) = tokio::join!(send, opened);
+    result.expect("volume down");
+    assert!(
+        fake.commands().iter().any(|c| c == "MVDOWN"),
+        "{:?}",
+        fake.commands()
+    );
+}
+
+#[actix::test]
+async fn a_command_is_not_sent_again_after_a_new_wakeup() {
+    let fake = Fake::start(true).await;
+    let port = closed_port().await;
+    let avr = avr_on(&fake, port).await;
+    let (cfg, expected) = (cfg(), commands::Expected::default());
+    let msg = media_command("volume_down");
+    let (attempts, attempt) = tokio::sync::watch::channel(1_u64);
+    let resend = Resend {
+        until: Instant::now() + Duration::from_secs(3),
+        attempt,
+    };
+    let start = Instant::now();
+    let send = send_command(&avr, None, &cfg, &expected, &msg, Some(resend), "AVR");
+    let stopped = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Standby closes the connection and the next wake-up connects again, before the next try.
+        attempts.send_modify(|a| *a += 1);
+        attempts.send_modify(|a| *a += 1);
+        // A try that started before can still be on its way: it fails before the port opens.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The receiver can be reached again: a command that is still sent again gets there.
+        open(port, fake.port()).await;
+    };
+    let (result, ()) = tokio::join!(send, stopped);
+    assert_eq!(Err(ServiceError::NotConnected), result);
+    assert!(start.elapsed() < Duration::from_secs(1));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(fake.commands().is_empty(), "{:?}", fake.commands());
 }
 
 #[actix::test]
