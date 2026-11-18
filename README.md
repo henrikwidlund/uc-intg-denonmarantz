@@ -76,9 +76,9 @@ to the log that says why.
 - A command that comes while the first connect runs waits for it, at most 3 seconds. Commands that do not need the
   state of the receiver (power, volume, mute, cursor keys, back, info, channel up and down, raw text, and next,
   previous and stop on receivers without HEOS) are sent when the receiver is known, before the start ends.
-  Commands keep their order: a command after one that waits also waits. A command that is sent before the start
-  ends and cannot open its connection is sent again for up to 3 seconds. Otherwise, if the receiver is not
-  reachable, a command fails at once.
+  Commands keep their order: a command after one that waits also waits. A command whose connection cannot be
+  opened is tried again for up to 3 seconds; a command sent before the start ends stops when the Remote goes to
+  standby or wakes up again. If the receiver is not connected and no connect runs, a command fails at once.
 
 ## Requirements
 

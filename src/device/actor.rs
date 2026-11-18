@@ -1720,53 +1720,45 @@ fn command_name(msg: &Command) -> &str {
         .unwrap_or(&msg.cmd_id)
 }
 
-/// When a command that was not sent is sent again.
-pub(super) struct Resend {
-    /// The last time to send it again.
-    pub until: Instant,
-    /// The connect attempt of the command, from when it got its turn. Once another attempt starts
-    /// or the connection is closed, the command is not sent: it fails with
-    /// [`ServiceError::NotConnected`].
-    pub attempt: watch::Receiver<u64>,
-}
-
-/// Run a command. With `resend`, a command that was not sent is sent again.
+/// Run a command. With `attempt`, the command stops once another connect attempt starts or the
+/// connection is closed. The library tries again while the connection cannot be built, but it does
+/// not know about standby. A stopped command answers OK: the user cannot do anything about it.
 pub(super) async fn send_command(
     avr: &Avr,
     heos: Option<&heos::Link>,
     cfg: &DeviceConfig,
     expected: &Expected,
     msg: &Command,
-    resend: Option<Resend>,
+    attempt: Option<watch::Receiver<u64>>,
     name: &str,
 ) -> Result<(), ServiceError> {
-    let send = || {
-        commands::run(
-            avr,
-            heos,
-            cfg,
-            expected,
-            msg.kind,
-            &msg.cmd_id,
-            msg.params.as_ref(),
-        )
+    let send = commands::run(
+        avr,
+        heos,
+        cfg,
+        expected,
+        msg.kind,
+        &msg.cmd_id,
+        msg.params.as_ref(),
+    );
+    let Some(mut attempt) = attempt else {
+        return send.await;
     };
-    let Some(Resend { until, attempt }) = resend else {
-        return send().await;
-    };
-    let try_send = || {
-        let old = attempt.has_changed().unwrap_or(true);
-        async move {
-            if old {
-                return Err(ServiceError::NotConnected);
-            }
-            send().await
+    if attempt.has_changed().unwrap_or(true) {
+        info!("[{name}] {} not sent: standby or a new wake-up", msg.cmd_id);
+        return Ok(());
+    }
+    tokio::select! {
+        result = send => result,
+        // An error means that the actor is gone.
+        _ = attempt.changed() => {
+            info!(
+                "[{name}] {} stopped by standby or a new wake-up, it may have run",
+                msg.cmd_id
+            );
+            Ok(())
         }
-    };
-    discovery::retry_while(name, until, try_send, |e| {
-        matches!(e, ServiceError::NotSent(_))
-    })
-    .await
+    }
 }
 
 /// Log how long a command waited before it goes to the receiver.
@@ -1844,20 +1836,25 @@ impl Handler<Command> for DenonActor {
                     let heos = act.heos.clone();
                     let name = act.cfg.name.clone();
                     // Before the start ends, the network of the Remote can still be down after
-                    // wake-up. The connect retries then, and so does the command.
-                    let resend = early.then(|| Resend {
-                        until: received + discovery::NETWORK_RETRY_TIMEOUT,
-                        attempt: act.attempt.subscribe(),
-                    });
+                    // wake-up. The library tries the command again then, but not after standby or
+                    // a new wake-up.
+                    let attempt = early.then(|| act.attempt.subscribe());
                     async move {
                         let _guard = guard?;
                         let Some(avr) = avr else {
                             return Err(ServiceError::NotConnected);
                         };
                         log_sending(&name, &msg, received, early);
-                        let result =
-                            send_command(&avr, heos.as_ref(), &cfg, &expected, &msg, resend, &name)
-                                .await;
+                        let result = send_command(
+                            &avr,
+                            heos.as_ref(),
+                            &cfg,
+                            &expected,
+                            &msg,
+                            attempt,
+                            &name,
+                        )
+                        .await;
                         match result {
                             // The state of the receiver does not allow it. The Remote shows an error
                             // banner for any other answer than OK that the user must close, and the

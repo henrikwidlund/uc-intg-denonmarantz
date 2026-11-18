@@ -23,10 +23,6 @@ pub enum ServiceError {
     NotConnected,
     #[error("Service unavailable: {0}")]
     ServiceUnavailable(String),
-    /// The connection to the receiver could not be opened, so the request was not sent. Another
-    /// try can work. The Remote gets the same answer as for `ServiceUnavailable`.
-    #[error("Service unavailable: {0}")]
-    NotSent(String),
     #[error("Timeout")]
     Timeout,
     #[error("Not supported: {0}")]
@@ -81,40 +77,13 @@ impl From<strum::ParseError> for ServiceError {
     }
 }
 
-/// The request was not sent: the connection could not be opened. Only errors of the connect are
-/// counted, so a command that is sent again does not run twice.
-fn not_sent(e: &denon_marantz::Error) -> bool {
-    use denon_marantz::Error;
-    match e {
-        // A request that gets no answer has the longer time limit of the whole request.
-        Error::Timeout { limit, .. } => *limit == crate::device::discovery::CONNECT_TIMEOUT,
-        Error::Network { .. } => {
-            let mut source = std::error::Error::source(e);
-            while let Some(cause) = source {
-                if let Some(io) = cause.downcast_ref::<std::io::Error>() {
-                    return matches!(
-                        io.kind(),
-                        ErrorKind::NetworkUnreachable
-                            | ErrorKind::HostUnreachable
-                            | ErrorKind::NetworkDown
-                            | ErrorKind::ConnectionRefused
-                            | ErrorKind::AddrNotAvailable
-                    );
-                }
-                source = cause.source();
-            }
-            false
-        }
-        _ => false,
-    }
-}
-
 impl From<denon_marantz::Error> for ServiceError {
     fn from(e: denon_marantz::Error) -> Self {
-        if not_sent(&e) {
-            Self::NotSent(e.to_string())
-        } else if e.is_not_connected() {
+        if e.is_not_connected() {
             Self::NotConnected
+        } else if e.is_not_sent() {
+            // The connection could not be opened, also after the tries of the library.
+            Self::ServiceUnavailable(e.to_string())
         } else if e.is_timeout() {
             Self::Timeout
         } else if e.is_invalid_input() {
@@ -190,10 +159,10 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_connect_is_not_sent() {
+    fn a_failed_connect_is_unavailable() {
         for kind in [ErrorKind::NetworkUnreachable, ErrorKind::ConnectionRefused] {
             let e = ServiceError::from(network(kind, false));
-            assert!(matches!(e, ServiceError::NotSent(_)), "{e:?}");
+            assert!(matches!(e, ServiceError::ServiceUnavailable(_)), "{e:?}");
         }
         let connect = Error::Timeout {
             request: "GET http://receiver/".into(),
@@ -202,12 +171,12 @@ mod tests {
         };
         assert!(matches!(
             ServiceError::from(connect),
-            ServiceError::NotSent(_)
+            ServiceError::ServiceUnavailable(_)
         ));
     }
 
     #[test]
-    fn a_request_that_can_have_arrived_is_not_sent_again() {
+    fn a_request_that_can_have_arrived_keeps_its_class() {
         let e = ServiceError::from(network(ErrorKind::ConnectionReset, true));
         assert!(matches!(e, ServiceError::ServiceUnavailable(_)), "{e:?}");
         let answer = Error::Timeout {

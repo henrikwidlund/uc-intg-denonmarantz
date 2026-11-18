@@ -360,7 +360,7 @@ fn service_error_to_ws_message(id: &str, req_id: u32, error: ServiceError) -> Ws
             503,
             WsResultMsgData::new("SERVICE_UNAVAILABLE", "Receiver is not connected"),
         ),
-        ServiceError::ServiceUnavailable(e) | ServiceError::NotSent(e) => {
+        ServiceError::ServiceUnavailable(e) => {
             (503, WsResultMsgData::new("SERVICE_UNAVAILABLE", e))
         }
         ServiceError::Timeout => (

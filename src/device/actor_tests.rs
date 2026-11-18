@@ -5,7 +5,7 @@
 //! The tests check what the actor asks for and shows when the receiver answers, does not answer,
 //! sends events or closes the connection.
 
-use super::actor::{CurrentAvr, Resend, read_differently, send_command};
+use super::actor::{CurrentAvr, read_differently, send_command};
 use super::commands;
 use super::discovery::{self, Known, TEST_BUILDER, TEST_DISCOVERY, TestBuilder};
 use super::heos::TEST_HEOS;
@@ -1422,13 +1422,18 @@ async fn open(port: u16, target: u16) {
     });
 }
 
-/// A receiver whose HTTP port is `port`. The connect sends no request.
-async fn avr_on(fake: &Fake, port: u16) -> denon_marantz::Avr {
+/// A receiver whose HTTP port is `port`. The connect sends no request. A connection that cannot
+/// be built is tried again for `retry`.
+async fn avr_on(fake: &Fake, port: u16, retry: Duration) -> denon_marantz::Avr {
     let info = Info {
         port,
         ..fake.avr().await.info().clone()
     };
     denon_marantz::Avr::builder("127.0.0.1")
+        .http_config(denon_marantz::HttpConfig {
+            connect_retry: retry,
+            ..denon_marantz::HttpConfig::default()
+        })
         .known(info)
         .connect()
         .await
@@ -1436,23 +1441,20 @@ async fn avr_on(fake: &Fake, port: u16) -> denon_marantz::Avr {
 }
 
 #[actix::test]
-async fn a_command_before_the_start_ends_is_sent_again_until_the_network_is_up() {
+async fn a_command_before_the_start_ends_is_sent_once_the_network_is_up() {
     let fake = Fake::start(true).await;
     let port = closed_port().await;
-    let avr = avr_on(&fake, port).await;
     let (cfg, expected) = (cfg(), commands::Expected::default());
     let msg = media_command("volume_down");
-    let failed = send_command(&avr, None, &cfg, &expected, &msg, None, "AVR").await;
+    let at_once = avr_on(&fake, port, Duration::ZERO).await;
+    let failed = send_command(&at_once, None, &cfg, &expected, &msg, None, "AVR").await;
     assert!(
-        matches!(failed, Err(ServiceError::NotSent(_))),
+        matches!(failed, Err(ServiceError::ServiceUnavailable(_))),
         "{failed:?}"
     );
+    let avr = avr_on(&fake, port, Duration::from_secs(3)).await;
     let (_attempts, attempt) = tokio::sync::watch::channel(1_u64);
-    let resend = Resend {
-        until: Instant::now() + Duration::from_secs(3),
-        attempt,
-    };
-    let send = send_command(&avr, None, &cfg, &expected, &msg, Some(resend), "AVR");
+    let send = send_command(&avr, None, &cfg, &expected, &msg, Some(attempt), "AVR");
     let opened = async {
         tokio::time::sleep(Duration::from_millis(200)).await;
         open(port, fake.port()).await;
@@ -1467,33 +1469,29 @@ async fn a_command_before_the_start_ends_is_sent_again_until_the_network_is_up()
 }
 
 #[actix::test]
-async fn a_command_is_not_sent_again_after_a_new_wakeup() {
+async fn a_command_is_not_sent_after_a_new_wakeup() {
     let fake = Fake::start(true).await;
     let port = closed_port().await;
-    let avr = avr_on(&fake, port).await;
+    let avr = avr_on(&fake, port, Duration::from_secs(3)).await;
     let (cfg, expected) = (cfg(), commands::Expected::default());
     let msg = media_command("volume_down");
     let (attempts, attempt) = tokio::sync::watch::channel(1_u64);
-    let resend = Resend {
-        until: Instant::now() + Duration::from_secs(3),
-        attempt,
-    };
     let start = Instant::now();
-    let send = send_command(&avr, None, &cfg, &expected, &msg, Some(resend), "AVR");
+    let send = send_command(&avr, None, &cfg, &expected, &msg, Some(attempt), "AVR");
     let stopped = async {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        // Standby closes the connection and the next wake-up connects again, before the next try.
+        // Standby closes the connection and the next wake-up connects again.
         attempts.send_modify(|a| *a += 1);
         attempts.send_modify(|a| *a += 1);
-        // A try that started before can still be on its way: it fails before the port opens.
         tokio::time::sleep(Duration::from_millis(100)).await;
-        // The receiver can be reached again: a command that is still sent again gets there.
+        // The receiver can be reached again: a command that still runs gets there.
         open(port, fake.port()).await;
     };
     let (result, ()) = tokio::join!(send, stopped);
-    assert_eq!(Err(ServiceError::NotConnected), result);
+    // The user cannot do anything about it: no error.
+    assert_eq!(Ok(()), result);
     assert!(start.elapsed() < Duration::from_secs(1));
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(fake.commands().is_empty(), "{:?}", fake.commands());
 }
 

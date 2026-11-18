@@ -229,7 +229,7 @@ async fn retry_network<T, F: Future<Output = Result<T, Error>>>(
 
 /// Run `step` again while `retry` is true for its error, with a short delay, until
 /// `deadline`. `name` is for the log.
-pub async fn retry_while<T, E: std::fmt::Display, F: Future<Output = Result<T, E>>>(
+async fn retry_while<T, E: std::fmt::Display, F: Future<Output = Result<T, E>>>(
     name: &str,
     deadline: Instant,
     mut step: impl FnMut() -> F,
