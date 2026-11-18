@@ -24,6 +24,10 @@ pub(crate) const STALL_TIMEOUT: Duration = Duration::from_millis(250);
 /// milliseconds. After wake-up, a lost connect packet is sent again only after 1 s: a new try after
 /// this time is faster.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+/// How long the library tries again to open an HTTP connection that cannot be built, for example
+/// while the network comes up after wake-up. Such a request was not sent, so this is safe for
+/// commands too.
+const CONNECT_RETRY: Duration = Duration::from_secs(3);
 /// Time between connects while the network is not ready, for example right after wake-up. The fast
 /// tries end after [`NETWORK_RETRY_TIMEOUT`].
 const NETWORK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
@@ -164,6 +168,7 @@ pub async fn connect_known(host: &str, info: Info) -> Result<Avr, Error> {
 fn builder(host: &str, known: Option<Known>) -> AvrBuilder {
     let mut builder = Avr::builder(host).http_config(HttpConfig {
         connect_timeout: CONNECT_TIMEOUT,
+        connect_retry: CONNECT_RETRY,
         ..HttpConfig::default()
     });
     if let Some(known) = known {

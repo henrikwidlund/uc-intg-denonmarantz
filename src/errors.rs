@@ -181,22 +181,24 @@ mod tests {
         );
     }
 
-    fn network(kind: ErrorKind) -> Error {
+    fn network(kind: ErrorKind, sent: bool) -> Error {
         Error::Network {
             request: "GET http://receiver/".into(),
             source: Box::new(std::io::Error::from(kind)),
+            sent,
         }
     }
 
     #[test]
     fn a_failed_connect_is_not_sent() {
         for kind in [ErrorKind::NetworkUnreachable, ErrorKind::ConnectionRefused] {
-            let e = ServiceError::from(network(kind));
+            let e = ServiceError::from(network(kind, false));
             assert!(matches!(e, ServiceError::NotSent(_)), "{e:?}");
         }
         let connect = Error::Timeout {
             request: "GET http://receiver/".into(),
             limit: crate::device::discovery::CONNECT_TIMEOUT,
+            sent: false,
         };
         assert!(matches!(
             ServiceError::from(connect),
@@ -206,11 +208,12 @@ mod tests {
 
     #[test]
     fn a_request_that_can_have_arrived_is_not_sent_again() {
-        let e = ServiceError::from(network(ErrorKind::ConnectionReset));
+        let e = ServiceError::from(network(ErrorKind::ConnectionReset, true));
         assert!(matches!(e, ServiceError::ServiceUnavailable(_)), "{e:?}");
         let answer = Error::Timeout {
             request: "GET http://receiver/".into(),
             limit: Duration::from_secs(15),
+            sent: true,
         };
         assert_eq!(ServiceError::Timeout, ServiceError::from(answer));
     }
