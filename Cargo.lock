@@ -611,7 +611,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=2e1c692#2e1c692db2b0a7685201279cc1e24fd28e0bdb31"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=eaaa1b6#eaaa1b68df445263bdc1aca24b672f4c35476ab9"
 dependencies = [
  "bytes",
  "denon-marantz-discovery",
@@ -631,7 +631,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz-discovery"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=2e1c692#2e1c692db2b0a7685201279cc1e24fd28e0bdb31"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=eaaa1b6#eaaa1b68df445263bdc1aca24b672f4c35476ab9"
 dependencies = [
  "http 1.5.0",
 ]
@@ -639,7 +639,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz-heos"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=2e1c692#2e1c692db2b0a7685201279cc1e24fd28e0bdb31"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=eaaa1b6#eaaa1b68df445263bdc1aca24b672f4c35476ab9"
 dependencies = [
  "denon-marantz-heos-proto",
  "serde",
@@ -651,7 +651,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz-heos-proto"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=2e1c692#2e1c692db2b0a7685201279cc1e24fd28e0bdb31"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=eaaa1b6#eaaa1b68df445263bdc1aca24b672f4c35476ab9"
 dependencies = [
  "serde",
  "serde_json",
@@ -661,7 +661,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz-proto"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=2e1c692#2e1c692db2b0a7685201279cc1e24fd28e0bdb31"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=eaaa1b6#eaaa1b68df445263bdc1aca24b672f4c35476ab9"
 dependencies = [
  "quick-xml",
  "serde",
