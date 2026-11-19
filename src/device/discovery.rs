@@ -3,7 +3,7 @@
 
 //! Find receivers on the network and connect to them.
 
-use crate::config_store::{self, DeviceConfig, Feature, Generation};
+use crate::config_store::{self, DeviceConfig, Feature};
 use denon_marantz::proto::NetworkAudioCommand;
 use denon_marantz::{
     Ask, Avr, AvrBuilder, Brand, Command, DiscoveredReceiver, DiscoveryConfig, Error, HttpConfig,
@@ -400,9 +400,7 @@ impl ExtraReads {
         Self {
             older,
             favorites: cfg.offers(Feature::NetworkAudio),
-            // `OPTPN` is in no spec. It is not sent to HEOS models until it is tested on one.
-            tuner_presets: !matches!(cfg.has_tuner, Some(false))
-                && !matches!(cfg.generation(), Generation::Current),
+            tuner_presets: !matches!(cfg.has_tuner, Some(false)),
         }
     }
 }

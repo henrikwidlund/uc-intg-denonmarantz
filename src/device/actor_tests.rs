@@ -224,9 +224,11 @@ async fn the_values_of_older_receivers_are_read_only_on_older_receivers() {
     let rig = rig(answers_all, QUICK).await;
     after_the_extra_values(&rig).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    for line in ["PSDIL ?", "PSMODE: ?", "MNPRV?", "NSH", "OPTPN ?"] {
+    for line in ["PSDIL ?", "PSMODE: ?", "MNPRV?", "NSH"] {
         assert_eq!(0, rig.telnet.count(line), "{line}");
     }
+    // The tuner presets are asked on all receivers that may have a tuner.
+    until("the tuner presets", 5, || rig.telnet.count("OPTPN ?") == 1).await;
 
     let http = Fake::start_with_info(
         b"<Device_Info><CommApiVers>0300</CommApiVers><ModelName>AVR-X2100W</ModelName>\

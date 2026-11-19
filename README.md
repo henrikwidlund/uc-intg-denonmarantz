@@ -80,10 +80,10 @@ that it does not have, so a button can do nothing on some models.
   Dialog Level Adjust and dialog level, Audyssey DSX, stage width and height, height gain, InstaPrevue. The
   driver asks for these values after each connect.
 - Selects (telnet): network favorites on receivers without HEOS (36 on Denon 0250 and 0300, else 56), and the
-  tuner presets on receivers that may have a tuner. They show the names that the receiver reports. The tuner
-  preset names are asked only below `CommApiVers` 0301 (the query is in no spec). On older receivers a tuner
-  preset is selected only after the receiver has shown if its presets are `01` to `56` or `A1` to `G8`; the
-  driver saves this. Receivers with 0301 and higher use `01` to `56`. On some older US models the receiver does not report the tuner frequency and preset.
+  tuner presets on receivers that may have a tuner. They show the names that the receiver reports. On older
+  receivers a tuner preset is selected only after the receiver has shown if its presets are `01` to `56` or
+  `A1` to `G8`; the driver saves this. Receivers with 0301 and higher use `01` to `56`. On some older US
+  models the receiver does not report the tuner frequency and preset.
 
 Commands with a number are sent as raw text with the remote entity:
 
@@ -92,7 +92,7 @@ Commands with a number are sent as raw text with the remote entity:
 | `NSB00` to `NSB55` | Play network favorite 1 to 56 (receivers without HEOS) |
 | `NSC00` to `NSC55` | Save what plays as network favorite 1 to 56. This replaces the favorite. The driver then reads the names again. |
 | `TFAN` + 6 digits | Tune the tuner, in hundredths: of MHz for FM (`TFAN010110` = 101.10 MHz), of kHz for AM (`TFAN105000` = 1050 kHz) |
-| `TPANMEM01` to `TPANMEM56` | Save the tuned station as tuner preset 1 to 56 (`TPANMEMA1` to `TPANMEMG8` on receivers with lettered presets). The driver then reads the names again, below `CommApiVers` 0301. |
+| `TPANMEM01` to `TPANMEM56` | Save the tuned station as tuner preset 1 to 56 (`TPANMEMA1` to `TPANMEMG8` on receivers with lettered presets). The driver then reads the names again. |
 | `TFHD` + 6 digits | Tune the HD Radio tuner, in the same way (North America models) |
 
 ## Compared to the Python integration
