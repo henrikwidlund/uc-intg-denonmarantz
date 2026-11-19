@@ -22,6 +22,7 @@ use futures::StreamExt;
 use log::{debug, info, warn};
 use serde_json::Map;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, watch};
 use tokio::time::timeout;
@@ -201,8 +202,7 @@ pub struct DenonActor {
     /// The sound mode groups are the choices while the receiver gave no list. See
     /// `View::sound_groups`.
     sound_groups: bool,
-    /// What plays was reported after the last source change. The receiver keeps the values of the
-    /// old source, so they are not shown before.
+    /// The connection status.
     status: DeviceStatus,
     /// Sends each status change. Commands wait on it while a connect runs.
     status_tx: watch::Sender<DeviceStatus>,
@@ -262,6 +262,8 @@ pub struct DenonActor {
     poll_interval: Duration,
     /// Commands run one after the other.
     cmd_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Incremented by `stop_send`. A remote run stops when it changed since the run started.
+    run_stop: Arc<AtomicU64>,
     expected: Arc<Expected>,
     timers: Timers,
 }
@@ -327,6 +329,7 @@ impl DenonActor {
             page_retry_delay: discovery::PAGE_RETRY_DELAY,
             poll_interval: HTTP_POLL_INTERVAL,
             cmd_lock: Arc::default(),
+            run_stop: Arc::default(),
             expected: Arc::default(),
             timers: Timers::default(),
         }
@@ -1282,6 +1285,26 @@ impl DenonActor {
             .is_some_and(|avr| avr.state().borrow().device().now_playing.is_playing() == Some(true))
     }
 
+    /// Start a remote command with more than one step. It is answered
+    /// at once, as the Python integration does: the Remote waits at most 10 s for an answer. The
+    /// steps do not hold up the other commands. `None` for a command with one step: it runs as
+    /// the other commands.
+    fn remote_run(
+        &self,
+        msg: &Command,
+        connecting: &mut Option<watch::Receiver<DeviceStatus>>,
+        ctx: &mut Context<Self>,
+    ) -> Option<Result<(), ServiceError>> {
+        match remote::command(&msg.cmd_id, msg.params.as_ref()) {
+            Err(e) => Some(Err(e)),
+            Ok(run) if run.steps() > 1 => {
+                self.spawn_run(run, msg.clone(), connecting.take(), ctx);
+                Some(Ok(()))
+            }
+            Ok(_) => None,
+        }
+    }
+
     /// Run the steps of a remote command in the background.
     fn spawn_run(
         &self,
@@ -1294,6 +1317,8 @@ impl DenonActor {
         let cfg = self.cfg.clone();
         let expected = self.expected.clone();
         let received = Instant::now();
+        let stop = self.run_stop.clone();
+        let started = stop.load(Ordering::Relaxed);
         ctx.spawn(
             async move {
                 connect_ended(connecting).await;
@@ -1312,8 +1337,17 @@ impl DenonActor {
                         return;
                     };
                     log_sending(&name, &msg, received, false);
-                    match commands::run_steps(&avr, heos.as_ref(), &cfg, &expected, &run, &lock)
-                        .await
+                    let stopped = || stop.load(Ordering::Relaxed) != started;
+                    match commands::run_steps(
+                        &avr,
+                        heos.as_ref(),
+                        &cfg,
+                        &expected,
+                        &run,
+                        &lock,
+                        stopped,
+                    )
+                    .await
                     {
                         Err(ServiceError::Blocked(reason)) => {
                             info!("[{name}] {} ignored: {reason}", command_name(&msg));
@@ -1325,6 +1359,21 @@ impl DenonActor {
                 .into_actor(act)
             }),
         );
+    }
+
+    /// Remember the pause after a media command. The receiver sends its own changes: only the
+    /// media player is sent, and only if the pause changed.
+    fn track_pause(&mut self, cmd: &str, was_playing: bool, ctx: &mut Context<Self>) {
+        let paused = match cmd {
+            "play_pause" => !self.paused && was_playing,
+            "stop" | "next" | "previous" | "off" | "toggle" => false,
+            _ => self.paused,
+        };
+        if paused != self.paused {
+            self.paused = paused;
+            self.dirty_part |= PART_PLAYER;
+            self.arm_emit(ctx);
+        }
     }
 
     /// Start a connect if none runs.
@@ -1952,6 +2001,11 @@ impl Handler<Command> for DenonActor {
     type Result = ResponseActFuture<Self, Result<(), ServiceError>>;
 
     fn handle(&mut self, msg: Command, ctx: &mut Self::Context) -> Self::Result {
+        // A stop needs no receiver: it only ends the running remote commands.
+        if msg.kind == EntityKind::Remote && remote::is_stop(&msg.cmd_id) {
+            self.run_stop.fetch_add(1, Ordering::Relaxed);
+            return Box::pin(fut::ready(Ok(())));
+        }
         // The core can send a command before `exit_standby`. While a retry after a failed connect
         // is pending, the receiver is not reachable: the command fails at once.
         let backoff = self.want && self.timers.reconnect.is_some();
@@ -1960,21 +2014,14 @@ impl Handler<Command> for DenonActor {
             self.start_connect(ctx);
         }
         // A command can come right after the Remote wakes up, while the connect still runs.
-        let connecting = self.running_connect();
+        let mut connecting = self.running_connect();
         if self.avr.is_none() && connecting.is_none() {
             return Box::pin(fut::ready(Err(ServiceError::NotConnected)));
         }
-        // A remote command with more than one step is answered at once, as the Python integration
-        // does, and runs on its own. Its steps do not hold up the other commands.
-        if msg.kind == EntityKind::Remote {
-            match remote::command(&msg.cmd_id, msg.params.as_ref()) {
-                Err(e) => return Box::pin(fut::ready(Err(e))),
-                Ok(run) if run.steps() > 1 => {
-                    self.spawn_run(run, msg, connecting, ctx);
-                    return Box::pin(fut::ready(Ok(())));
-                }
-                Ok(_) => {}
-            }
+        if msg.kind == EntityKind::Remote
+            && let Some(answer) = self.remote_run(&msg, &mut connecting, ctx)
+        {
+            return Box::pin(fut::ready(answer));
         }
         if let Some(run) = self.heos_command(&msg) {
             return run;
@@ -2056,12 +2103,7 @@ impl Handler<Command> for DenonActor {
                     if result.is_ok()
                         && let Some(cmd) = media_command.as_deref()
                     {
-                        match cmd {
-                            "play_pause" => act.paused = !act.paused && was_playing,
-                            "stop" | "next" | "previous" | "off" | "toggle" => act.paused = false,
-                            _ => {}
-                        }
-                        act.schedule_emit(ctx);
+                        act.track_pause(cmd, was_playing, ctx);
                     }
                     result
                 }),

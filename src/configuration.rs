@@ -16,7 +16,7 @@ use uc_api::intg::IntegrationDriverUpdate;
 /// Environment variable for the driver setup flow timeout in seconds. `0` disables the timeout.
 pub const ENV_SETUP_TIMEOUT: &str = "UC_SETUP_TIMEOUT";
 /// Default driver setup flow timeout in seconds.
-pub const DEF_SETUP_TIMEOUT_SEC: u64 = 300;
+pub const DEF_SETUP_TIMEOUT_SEC: u64 = 3600;
 /// Environment variable for the configuration directory. The Remote sets it.
 const ENV_CONFIG_HOME: &str = "UC_CONFIG_HOME";
 /// Environment variable for the network interface to listen on.
@@ -43,7 +43,7 @@ const DRIVER_METADATA: &str = include_str!("../resources/driver.json");
 pub struct Settings {
     /// Interface address to listen on.
     pub interface: String,
-    /// HTTP port for the WebSocket server and the artwork route.
+    /// HTTP port for the WebSocket server.
     pub http_port: u16,
     /// Directory for the configuration files.
     pub config_home: PathBuf,

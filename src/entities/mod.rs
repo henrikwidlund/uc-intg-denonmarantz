@@ -277,13 +277,6 @@ impl EntityKind {
     }
 }
 
-/// Build all entity definitions of a receiver.
-pub fn definitions(cfg: &DeviceConfig) -> Vec<AvailableIntgEntity> {
-    EntityKind::all(cfg)
-        .map(|kind| definition(cfg, kind))
-        .collect()
-}
-
 /// Build the definition of one entity.
 pub fn definition(cfg: &DeviceConfig, kind: EntityKind) -> AvailableIntgEntity {
     let entity = AvailableIntgEntity {

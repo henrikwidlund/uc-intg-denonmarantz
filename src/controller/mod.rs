@@ -8,6 +8,7 @@ mod devices;
 mod handler;
 mod messages;
 
+pub(crate) use handler::driver_version;
 pub use messages::*;
 
 use crate::config_store::{ConfigStore, DriverSettings};
@@ -41,22 +42,26 @@ state_machine! {
         R2Request => Running,
         AbortSetup => RequireSetup,
     },
+    // The configured receivers stay usable during a setup flow.
     SetupFlow => {
         RequestUserInput => WaitSetupUserData,
         Successful => Running [CancelSetupFlowTimer],
         SetupError => SetupError [CancelSetupFlowTimer],
         AbortSetup => RequireSetup [CancelSetupFlowTimer],
+        R2Request => SetupFlow,
     },
     WaitSetupUserData => {
         SetupUserData => SetupFlow,
         SetupError => SetupError [CancelSetupFlowTimer],
         AbortSetup => RequireSetup [CancelSetupFlowTimer],
+        R2Request => WaitSetupUserData,
     },
     SetupError => {
         ConfigurationAvailable => Running,
         AbortSetup => RequireSetup,
         SetupDriverRequest => SetupFlow [SetupFlowTimer],
         SetupError => SetupError,
+        R2Request => SetupError,
     }
 }
 
@@ -115,6 +120,9 @@ pub struct Controller {
     setup_owner: Option<Arc<str>>,
     /// Id of the setup flow. Changes on each start and end, so that old setup tasks are ignored.
     setup_flow: u32,
+    /// A first setup or a reset: the receiver that the setup adds replaces the configured ones.
+    /// Nothing is removed if the setup does not end with a receiver.
+    setup_replace: bool,
     store: ConfigStore,
     driver_settings: DriverSettings,
     /// Configured receivers by device key.
@@ -139,6 +147,7 @@ impl Controller {
             setup: None,
             setup_owner: None,
             setup_flow: 0,
+            setup_replace: false,
             store,
             driver_settings,
             devices: HashMap::default(),
@@ -240,10 +249,15 @@ fn setup_timeout() -> Option<Duration> {
     (timeout > 0).then(|| Duration::from_secs(timeout))
 }
 
+/// Messages that can wait for the controller. A request waits outside the queue while it is
+/// full, so a later event could be handled first.
+const MAILBOX_CAPACITY: usize = 1024;
+
 impl Actor for Controller {
     type Context = Context<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
+        ctx.set_mailbox_capacity(MAILBOX_CAPACITY);
         let devices = self.store.load_devices();
         info!("{} configured receivers", devices.len());
         if !devices.is_empty() {

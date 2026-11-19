@@ -188,7 +188,7 @@ cargo run --release
 | `UC_INTEGRATION_INTERFACE` | `0.0.0.0`         | Network interface to listen on.                                 |
 | `UC_INTEGRATION_HTTP_PORT` | `9090`            | WebSocket port.                                                 |
 | `UC_DISABLE_MDNS_PUBLISH`  | `false`           | Do not announce the driver with mDNS.                           |
-| `UC_SETUP_TIMEOUT`         | `300`             | Setup timeout in seconds. `0` disables it.                      |
+| `UC_SETUP_TIMEOUT`         | `3600`            | Setup timeout in seconds. `0` disables it.                      |
 | `UC_API_MSG_TRACING`       | off               | Log WebSocket messages: `all`, `in` or `out`.                   |
 | `RUST_LOG`                 | `info`            | Log level, for example `info,denon_marantz=debug`.              |
 

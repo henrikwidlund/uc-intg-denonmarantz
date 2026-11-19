@@ -140,7 +140,6 @@ impl Controller {
         devices
     }
 
-    /// Save the configuration of all devices.
     /// Save the configuration of all devices. The write runs on its own thread. The result says
     /// when it is done.
     pub(super) fn save_devices(&self) -> Result<SaveWait, ServiceError> {
@@ -153,10 +152,26 @@ impl Controller {
         Ok(())
     }
 
-    pub(super) fn available_entities(&self) -> Vec<AvailableIntgEntity> {
+    /// The entity definitions of all receivers, only of `entity_type` if it is given.
+    pub(super) fn available_entities(
+        &self,
+        entity_type: Option<EntityType>,
+    ) -> Vec<AvailableIntgEntity> {
         self.devices
             .values()
-            .flat_map(|d| entities::definitions(&d.cfg))
+            .flat_map(|d| {
+                EntityKind::all(&d.cfg)
+                    .filter(|k| entity_type.is_none_or(|t| k.entity_type() == t))
+                    .map(|k| entities::definition(&d.cfg, k))
+            })
+            .collect()
+    }
+
+    /// The ids of all entities of all receivers.
+    fn all_entity_ids(&self) -> Vec<String> {
+        self.devices
+            .iter()
+            .flat_map(|(key, d)| EntityKind::all(&d.cfg).map(|k| k.entity_id(key)))
             .collect()
     }
 
@@ -183,7 +198,14 @@ impl Controller {
     /// Subscribe a Remote to entities, and send only the states that it does not have. One event
     /// per entity can fill the event queue of the Remote, and the Remote then closes the
     /// connection.
+    ///
+    /// No ids means all entities.
     pub(super) fn subscribe(&mut self, ws_id: &str, entity_ids: Vec<String>) {
+        let entity_ids = if entity_ids.is_empty() {
+            self.all_entity_ids()
+        } else {
+            entity_ids
+        };
         let Some(session) = self.sessions.get_mut(ws_id) else {
             return;
         };
@@ -242,10 +264,14 @@ impl Controller {
         }
     }
 
+    /// No ids means all entities.
     pub(super) fn unsubscribe(&mut self, ws_id: &str, entity_ids: &[String]) {
         let Some(session) = self.sessions.get_mut(ws_id) else {
             return;
         };
+        if entity_ids.is_empty() {
+            session.subscribed_entities.clear();
+        }
         for id in entity_ids {
             session.subscribed_entities.remove(id);
         }

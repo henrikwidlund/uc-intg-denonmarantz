@@ -159,9 +159,8 @@ pub fn attributes(v: &View<'_>, kind: SensorKind, out: &mut Map<String, Value>) 
     out.insert("state".into(), availability(v).into());
     let (value, unit) = value(v, kind);
     out.insert("value".into(), value);
-    if let Some(unit) = unit {
-        out.insert("unit".into(), unit.into());
-    }
+    // Null when the value has no unit, so the Remote does not keep an old one.
+    out.insert("unit".into(), unit.into());
 }
 
 /// Volume of the Remote: the dB value plus 80, from 0 to 98.

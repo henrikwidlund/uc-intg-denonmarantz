@@ -73,7 +73,7 @@ pub struct Stop;
 pub struct UpdateConfig(pub DeviceConfig);
 
 /// Entity command.
-#[derive(Debug, Message)]
+#[derive(Debug, Clone, Message)]
 #[rtype(result = "Result<(), ServiceError>")]
 pub struct Command {
     pub kind: EntityKind,

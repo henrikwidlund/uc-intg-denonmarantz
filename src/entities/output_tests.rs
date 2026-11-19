@@ -411,6 +411,48 @@ fn the_sources_use_the_names_of_the_receiver() {
 }
 
 #[test]
+fn sources_with_the_same_name_get_their_code() {
+    let cfg = cfg();
+    let state = state(&[
+        "PWON",
+        "SISAT/CBL",
+        "SSFUNGAME TV",
+        "SSFUNSAT/CBL TV",
+        "SSFUNMPLAY Apple TV",
+    ]);
+    let v = view(&state, &cfg);
+    let input = select(&v, SelectKind::InputSource);
+    let options = input["options"].as_array().expect("options");
+    assert!(options.contains(&json!("TV (GAME)")), "{options:?}");
+    assert!(options.contains(&json!("TV (SAT/CBL)")), "{options:?}");
+    assert!(options.contains(&json!("Apple TV")), "{options:?}");
+    assert_eq!(json!("TV (SAT/CBL)"), input["current_option"]);
+    assert_eq!(
+        json!("TV (SAT/CBL)"),
+        sensor(&v, SensorKind::InputSource)["value"]
+    );
+}
+
+#[test]
+fn a_hidden_current_source_with_a_shown_name_gets_its_code() {
+    let cfg = cfg();
+    let state = state(&[
+        "PWON",
+        "SISAT/CBL",
+        "SSFUNGAME TV",
+        "SSFUNSAT/CBL TV",
+        "SSSODGAME USE",
+        "SSSODSAT/CBL DEL",
+    ]);
+    let v = view(&state, &cfg);
+    let input = select(&v, SelectKind::InputSource);
+    let options = input["options"].as_array().expect("options");
+    assert!(options.contains(&json!("TV")), "{options:?}");
+    assert!(!options.contains(&json!("TV (SAT/CBL)")), "{options:?}");
+    assert_eq!(json!("TV (SAT/CBL)"), input["current_option"]);
+}
+
+#[test]
 fn the_dirac_filter_shows_the_names_of_the_slots() {
     let cfg = cfg();
     let named = state(&[

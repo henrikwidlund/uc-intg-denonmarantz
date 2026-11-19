@@ -20,6 +20,10 @@ use uc_api::ws::{WsMessage, WsResultMsgData};
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 /// Messages that can wait to be sent to one Remote.
 const MAILBOX_CAPACITY: usize = 1024;
+/// Invalid messages within [`INVALID_WINDOW`] before the connection is closed. A Remote does not
+/// send invalid messages: many of them are a bug or another client.
+const INVALID_LIMIT: u8 = 5;
+const INVALID_WINDOW: Duration = Duration::from_secs(60);
 
 /// Sends messages from the controller to the WebSocket connection.
 ///
@@ -94,6 +98,32 @@ impl Handler<SendWsMessage> for WsSender {
     }
 }
 
+/// Counts invalid messages within [`INVALID_WINDOW`].
+#[derive(Debug)]
+pub(super) struct InvalidMessages {
+    count: u8,
+    since: Instant,
+}
+
+impl InvalidMessages {
+    pub(super) fn new() -> Self {
+        Self {
+            count: 0,
+            since: Instant::now(),
+        }
+    }
+
+    /// Count one invalid message. True if the connection must be closed.
+    fn add(&mut self, now: Instant) -> bool {
+        if now.duration_since(self.since) > INVALID_WINDOW {
+            self.since = now;
+            self.count = 0;
+        }
+        self.count = self.count.saturating_add(1);
+        self.count >= INVALID_LIMIT
+    }
+}
+
 impl WsConn {
     /// Runs the message processing of the WebSocket connection until it is closed.
     ///
@@ -109,9 +139,8 @@ impl WsConn {
         use futures::StreamExt;
 
         // Only header-based authentication is used, so the authentication message is sent right away.
-        let _ = session
-            .text(r#"{"kind":"resp","req_id":0,"code":200,"msg":"authentication"}"#)
-            .await;
+        // It has the driver version, so the Remote does not need to ask for it.
+        let _ = session.text(self.authentication.clone()).await;
 
         let sender = WsSender {
             id: Arc::clone(&self.id),
@@ -226,29 +255,40 @@ impl WsConn {
             AggregatedMessage::Pong(_) => Ok(()),
             AggregatedMessage::Close(reason) => {
                 info!("[{}] Remote closed connection. Reason: {reason:?}", self.id);
-                Err(None)
+                // The close is answered with a close, with the same code.
+                Err(Some(reason.unwrap_or_else(|| CloseCode::Normal.into())))
             }
         }
     }
 
+    /// An invalid message is answered with an error. The connection is closed after
+    /// [`INVALID_LIMIT`] of them within [`INVALID_WINDOW`].
     fn handle_text_message(
-        &self,
+        &mut self,
         text: &str,
         sender: &Addr<WsSender>,
     ) -> Result<(), Option<CloseReason>> {
-        match serde_json::from_str::<WsMessage>(text) {
+        let e = match serde_json::from_str::<WsMessage>(text) {
             Ok(msg) => {
                 self.process_intg_api_message(msg, sender);
-                Ok(())
+                return Ok(());
             }
-            Err(e) => {
-                warn!("[{}] Invalid JSON message: {e}", self.id);
-                Err(Some(CloseReason {
-                    code: CloseCode::Unsupported,
-                    description: Some("Invalid JSON message".into()),
-                }))
-            }
+            Err(e) => e,
+        };
+        if self.invalid.add(Instant::now()) {
+            warn!(
+                "[{}] {INVALID_LIMIT} invalid messages, closing the connection",
+                self.id
+            );
+            return Err(Some(CloseReason {
+                code: CloseCode::Policy,
+                description: Some("Invalid JSON messages".into()),
+            }));
         }
+        warn!("[{}] Invalid JSON message: {e}", self.id);
+        let error = ServiceError::BadRequest("Invalid JSON message".into());
+        send_error_response(&self.id, 0, error, sender);
+        Ok(())
     }
 
     /// Process a received Integration-API request, response or event message.
@@ -377,7 +417,29 @@ fn service_error_to_ws_message(id: &str, req_id: u32, error: ServiceError) -> Ws
 
 #[cfg(test)]
 mod tests {
-    use super::is_backup_message;
+    use super::{INVALID_LIMIT, INVALID_WINDOW, InvalidMessages, is_backup_message};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_connection_closes_after_too_many_invalid_messages() {
+        let mut invalid = InvalidMessages::new();
+        let start = Instant::now();
+        for _ in 1..INVALID_LIMIT {
+            assert!(!invalid.add(start));
+        }
+        assert!(invalid.add(start));
+    }
+
+    #[test]
+    fn invalid_messages_are_counted_again_after_the_window() {
+        let mut invalid = InvalidMessages::new();
+        let start = Instant::now();
+        for _ in 1..INVALID_LIMIT {
+            assert!(!invalid.add(start));
+        }
+        let later = start + INVALID_WINDOW + Duration::from_secs(1);
+        assert!(!invalid.add(later));
+    }
 
     #[test]
     fn backup_messages_are_found() {

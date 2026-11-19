@@ -21,6 +21,8 @@ use uc_api::intg::{
 const MAX_REPEAT: u64 = 20;
 /// Longest pause between commands in milliseconds.
 const MAX_DELAY_MS: u64 = 5_000;
+/// Most commands in one sequence.
+const MAX_SEQUENCE: usize = 100;
 
 /// Button mapping and UI pages, from `resources/remote_ui.json`.
 struct Ui {
@@ -123,7 +125,7 @@ pub const fn state(v: &View<'_>) -> &'static str {
 /// Commands of the remote entity.
 #[derive(Debug, Clone)]
 pub struct RemoteRun {
-    /// Actions to run in order.
+    /// Actions to run in order. Empty for `stop_send`: the actor stops the running commands.
     pub actions: Vec<Action>,
     /// How often each action runs, before the next one starts.
     pub repeat: u64,
@@ -138,6 +140,14 @@ impl RemoteRun {
             .unwrap_or(u64::MAX)
             .saturating_mul(self.repeat)
     }
+}
+
+/// The command stops the running commands.
+pub fn is_stop(cmd_id: &str) -> bool {
+    matches!(
+        IntgRemoteCommand::from_str(cmd_id),
+        Ok(IntgRemoteCommand::StopSend)
+    )
 }
 
 /// Map a remote entity command.
@@ -171,6 +181,11 @@ pub fn command(
                 .and_then(|p| p.get("sequence"))
                 .and_then(Value::as_array)
                 .ok_or_else(|| ServiceError::BadRequest("Missing parameter: sequence".into()))?;
+            if sequence.is_empty() || sequence.len() > MAX_SEQUENCE {
+                return Err(ServiceError::BadRequest(format!(
+                    "A sequence must have 1 to {MAX_SEQUENCE} commands"
+                )));
+            }
             let actions = sequence
                 .iter()
                 .map(|c| {
@@ -187,7 +202,11 @@ pub fn command(
                 delay: delay(params),
             })
         }
-        IntgRemoteCommand::StopSend => Err(ServiceError::NotSupported(cmd_id.into())),
+        IntgRemoteCommand::StopSend => Ok(RemoteRun {
+            actions: Vec::new(),
+            repeat: 0,
+            delay: Duration::ZERO,
+        }),
     }
 }
 
@@ -333,6 +352,21 @@ mod tests {
             run.actions.as_slice(),
             [Action::Back, Action::CursorDown]
         ));
+    }
+
+    #[test]
+    fn a_sequence_has_1_to_100_commands() {
+        let sequence = |n: usize| params(json!({ "sequence": vec!["back"; n] }));
+        assert!(command("send_cmd_sequence", Some(&sequence(0))).is_err());
+        assert!(command("send_cmd_sequence", Some(&sequence(MAX_SEQUENCE))).is_ok());
+        assert!(command("send_cmd_sequence", Some(&sequence(MAX_SEQUENCE + 1))).is_err());
+    }
+
+    #[test]
+    fn stop_send_stops_and_sends_nothing() {
+        assert!(is_stop("stop_send"));
+        assert!(!is_stop("send_cmd"));
+        assert_eq!(0, command("stop_send", None).expect("ok").steps());
     }
 
     #[test]

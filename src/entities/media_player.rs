@@ -140,12 +140,9 @@ pub fn attributes(v: &View<'_>, out: &mut Map<String, Value>) {
     let device = v.state.device();
     let off = is_off(v);
     set(out, Attr::State, state(v).into());
-    if let Some(volume) = zone.volume {
-        set(out, Attr::Volume, absolute_volume(volume).into());
-    }
-    if let Some(muted) = zone.muted {
-        set(out, Attr::Muted, muted.into());
-    }
+    // An unknown value is sent as null, so the Remote does not keep an old one.
+    set(out, Attr::Volume, zone.volume.map(absolute_volume).into());
+    set(out, Attr::Muted, zone.muted.into());
 
     let choices = select::choices(v, crate::entities::SelectKind::InputSource);
     set(out, Attr::SourceList, Value::from(choices.options));

@@ -18,7 +18,8 @@ impl WsConn {
     /// Forward a request message to the controller.
     ///
     /// The message is in the controller queue when this returns, so it keeps its order with
-    /// later events. The returned request gives the result:
+    /// later events. This holds while the queue has room, see [`Controller`]. The returned
+    /// request gives the result:
     /// - A [`ServiceError`] is sent back as an error response.
     /// - `Ok(None)` means the controller sends the response later.
     ///

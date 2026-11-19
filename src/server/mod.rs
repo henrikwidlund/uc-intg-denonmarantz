@@ -10,7 +10,7 @@ mod ws;
 
 #[cfg(feature = "mdns-sd")]
 pub use mdns::publish_service;
-pub use ws::ws_index;
+pub use ws::{Authentication, ws_index};
 
 /// Fallback if no mDNS library is enabled.
 #[cfg(not(feature = "mdns-sd"))]

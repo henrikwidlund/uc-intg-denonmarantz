@@ -111,6 +111,11 @@ impl Entry {
             }
     }
 
+    /// The command sends one of two values, for example `PSGEQ ON/OFF`.
+    pub fn toggles(&self) -> bool {
+        self.name.ends_with("_TOGGLE") && self.text.contains('/') && !self.text.contains(" / ")
+    }
+
     /// The text to send to the receiver now.
     pub fn text(&self, is_denon: bool, state: &State) -> String {
         if let Some((denon, marantz)) = self.text.split_once(" / ") {

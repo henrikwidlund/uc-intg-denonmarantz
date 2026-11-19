@@ -8,6 +8,7 @@ use crate::entities::sensor::EMPTY;
 use crate::entities::{SelectKind, View, availability, is_off};
 use crate::errors::ServiceError;
 use denon_marantz::proto::NetworkAudioCommand;
+use denon_marantz::proto::SourceInfo;
 use denon_marantz::proto::source::{display_to_select_code, telnet_to_display_source};
 use denon_marantz::proto::{
     BluetoothOutputMode, DigitalCodec, DimmerMode, DiracFilter, DiracSlot, DynamicVolume, EcoMode,
@@ -16,6 +17,7 @@ use denon_marantz::proto::{
 };
 use denon_marantz::{Avr, Command, SoundModeEntry, State, Zone};
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 
 /// Options of a select: the shown text, and the current one.
 pub struct Choices {
@@ -221,7 +223,7 @@ pub fn choices(v: &View<'_>, kind: SelectKind) -> Choices {
             });
             Choices {
                 options: source_options(v)
-                    .map(|(_, label)| label.to_owned())
+                    .map(|(_, label)| label.into_owned())
                     .collect(),
                 current,
                 numeric: false,
@@ -450,32 +452,47 @@ fn dirac_labels(v: &View<'_>) -> Vec<String> {
     labels
 }
 
-/// Sources to show: the telnet code and the shown name.
-pub fn source_options<'a>(v: &'a View<'_>) -> impl Iterator<Item = (&'a str, &'a str)> {
+/// Sources to show: the telnet code and the shown name. A name that two shown sources share gets
+/// the code, for example `TV (SAT/CBL)`, so that each source can be selected.
+pub fn source_options<'a>(v: &'a View<'_>) -> impl Iterator<Item = (&'a str, Cow<'a, str>)> {
+    shown_sources(v).map(move |s| (s.code.as_str(), shown_source_label(v, s)))
+}
+
+fn shown_sources<'a>(v: &'a View<'_>) -> impl Iterator<Item = &'a SourceInfo> {
     v.state
         .device()
         .sources
         .as_slice()
         .iter()
         .filter(|s| v.cfg.show_all_inputs || s.in_use != Some(false))
-        .map(|s| {
-            let label = s
-                .name
-                .as_deref()
-                .or(s.default_name.as_deref())
-                .unwrap_or(&s.code);
-            (s.code.as_str(), label)
-        })
+}
+
+/// The name of a source: the user name, else the default name, else the code.
+fn source_name(s: &SourceInfo) -> &str {
+    s.name
+        .as_deref()
+        .or(s.default_name.as_deref())
+        .unwrap_or(&s.code)
+}
+
+/// The name of a source, with the code if a shown source with another code has the same name.
+/// The source itself can be hidden: it is the current one.
+fn shown_source_label<'a>(v: &View<'_>, s: &'a SourceInfo) -> Cow<'a, str> {
+    let name = source_name(s);
+    let shared = shown_sources(v).any(|o| o.code != s.code && source_name(o) == name);
+    if shared {
+        Cow::Owned(format!("{name} ({})", s.code))
+    } else {
+        Cow::Borrowed(name)
+    }
 }
 
 /// Shown name of a source code.
 pub fn source_label(v: &View<'_>, code: &str) -> String {
-    let sources = &v.state.device().sources;
-    sources
-        .get(code)
-        .and_then(|s| s.name.as_deref().or(s.default_name.as_deref()))
-        .unwrap_or_else(|| telnet_to_display_source(code))
-        .to_owned()
+    v.state.device().sources.get(code).map_or_else(
+        || telnet_to_display_source(code).to_owned(),
+        |s| shown_source_label(v, s).into_owned(),
+    )
 }
 
 enum SoundModeChoice<'a> {
@@ -522,7 +539,7 @@ pub async fn select_option(
         }
         SelectKind::InputSource => {
             let (code, _) = source_options(v)
-                .find(|(_, label)| *label == option)
+                .find(|(_, label)| label == option)
                 .ok_or_else(invalid)?;
             avr.zone(Zone::Main)?.select_source(code).await?;
         }

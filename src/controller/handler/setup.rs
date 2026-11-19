@@ -298,11 +298,8 @@ impl Handler<SetupDriverMsg> for Controller {
                 act.request_input(&ws_id, page, ctx);
             });
         } else {
-            // A first setup starts with a clean configuration.
-            if let Err(e) = self.reset_devices() {
-                self.finish_setup(&ws_id, Some(IntegrationSetupError::Other), ctx);
-                return Err(e);
-            }
+            // A first setup replaces the configuration when it ends with a receiver.
+            self.setup_replace = true;
             ctx.run_later(ACK_DELAY, move |act, ctx| {
                 if act.is_setup_flow(flow, &ws_id) {
                     act.setup = Some(SetupState::RestoreChoice);
@@ -403,7 +400,7 @@ impl Controller {
         {
             return;
         }
-        // A reconfiguration that was aborted keeps the configured devices.
+        // An aborted setup keeps the configured devices.
         if let Some(session) = self.sessions.get_mut(ws_id) {
             session.reconfiguring = None;
         }
@@ -417,6 +414,7 @@ impl Controller {
     fn end_setup_flow(&mut self) {
         self.setup = None;
         self.setup_owner = None;
+        self.setup_replace = false;
         self.setup_flow = self.setup_flow.wrapping_add(1);
     }
 
@@ -589,11 +587,14 @@ impl Controller {
                             return;
                         }
                     };
+                    // A setup that replaces the receivers offers the configured ones too.
                     let found: Vec<Found> = found
                         .into_iter()
                         .filter(|f| {
-                            act.find_device(f.serial.as_deref(), f.mac.as_deref())
-                                .is_none()
+                            act.setup_replace
+                                || act
+                                    .find_device(f.serial.as_deref(), f.mac.as_deref())
+                                    .is_none()
                         })
                         .collect();
                     if found.is_empty() {
@@ -666,6 +667,9 @@ impl Controller {
                             .map_or_else(Vec::new, |c| c.network_favorite_names.clone()),
                         info: Some(identified.info),
                     };
+                    if act.setup_replace {
+                        act.remove_other_devices(cfg.key());
+                    }
                     if let Some(device) = act.devices.get_mut(cfg.key()) {
                         device.cfg = cfg.clone();
                         device.addr.do_send(UpdateConfig(cfg));
@@ -758,11 +762,9 @@ impl Controller {
                 });
             }
             "reset" => {
-                if let Err(e) = self.reset_devices() {
-                    warn!("[{ws_id}] saving the configuration failed: {e}");
-                    return Err(InputError::Failed(IntegrationSetupError::Other));
-                }
-                info!("[{ws_id}] configuration reset");
+                // The receivers are replaced when the setup ends with a receiver.
+                self.setup_replace = true;
+                info!("[{ws_id}] configuration reset after the setup");
                 ctx.run_later(ACK_DELAY, move |act, ctx| {
                     if act.is_setup_flow(flow, &ws_id) {
                         act.request_discover(&ws_id, ctx);
@@ -870,21 +872,22 @@ impl Controller {
         }
     }
 
-    /// Remove all devices and their entities.
-    fn reset_devices(&mut self) -> Result<(), ServiceError> {
-        if self.devices.is_empty() {
-            return Ok(());
-        }
-        let keys: Vec<String> = self.devices.keys().map(ToString::to_string).collect();
+    /// Remove all devices but the one with `key`, and their entities. The caller saves.
+    fn remove_other_devices(&mut self, key: &str) {
+        let keys: Vec<String> = self
+            .devices
+            .keys()
+            .filter(|k| ***k != *key)
+            .map(ToString::to_string)
+            .collect();
         for key in &keys {
             self.remove_device(key);
         }
-        self.entities.clear();
         for session in self.sessions.values_mut() {
-            session.subscribed_entities.clear();
+            session
+                .subscribed_entities
+                .retain(|id| EntityKind::parse(id).is_some_and(|(k, _)| k == key));
         }
-        // The setup goes on at once: a write error is logged.
-        self.queue_devices()
     }
 
     /// Replace all devices with the devices of a backup.
@@ -1538,6 +1541,103 @@ mod tests {
                 .collect()
         }
 
+        /// Send a request and give its response.
+        async fn request(
+            controller: &Addr<Controller>,
+            request: R2Request,
+            msg_data: Option<Value>,
+        ) -> Result<Option<uc_api::ws::WsMessage>, crate::errors::ServiceError> {
+            let msg = R2RequestMsg {
+                ws_id: "a".into(),
+                req_id: 1,
+                request,
+                msg_data,
+            };
+            controller.send(msg).await.expect("send")
+        }
+
+        #[actix::test]
+        async fn entity_requests_work_during_a_setup() {
+            let controller = controller("requests-in-setup", Some(PYTHON_CONFIG));
+            connect(&controller, "a").await;
+            controller
+                .send(start_setup("a", true))
+                .await
+                .expect("send")
+                .expect("setup started");
+            settle().await;
+            assert_eq!(69, entity_ids(&controller).await.len());
+        }
+
+        #[actix::test]
+        async fn an_aborted_first_setup_keeps_the_receivers() {
+            let controller = controller("abort-first-setup", Some(PYTHON_CONFIG));
+            connect(&controller, "a").await;
+            controller
+                .send(start_setup("a", false))
+                .await
+                .expect("send")
+                .expect("setup started");
+            settle().await;
+            controller
+                .send(crate::controller::handler::AbortDriverSetup {
+                    ws_id: "a".into(),
+                    timeout: false,
+                })
+                .await
+                .expect("send");
+            settle().await;
+            assert_eq!(69, entity_ids(&controller).await.len());
+        }
+
+        #[actix::test]
+        async fn the_filter_gives_only_one_entity_type() {
+            let controller = controller("filter", Some(PYTHON_CONFIG));
+            connect(&controller, "a").await;
+            let filter = json!({ "filter": { "entity_type": "media_player" } });
+            let response = request(&controller, R2Request::GetAvailableEntities, Some(filter))
+                .await
+                .expect("ok")
+                .expect("response");
+            let data = response.msg_data.expect("data");
+            assert_eq!(json!("media_player"), data["filter"]["entity_type"]);
+            assert_eq!(
+                1,
+                data["available_entities"].as_array().expect("list").len()
+            );
+        }
+
+        /// Reads the subscriptions of a Remote in the controller.
+        struct Subscribed(&'static str);
+
+        impl actix::Message for Subscribed {
+            type Result = usize;
+        }
+
+        impl Handler<Subscribed> for Controller {
+            type Result = usize;
+            fn handle(&mut self, msg: Subscribed, _: &mut Context<Self>) -> usize {
+                self.sessions
+                    .get(msg.0)
+                    .map_or(0, |s| s.subscribed_entities.len())
+            }
+        }
+
+        #[actix::test]
+        async fn subscribe_and_unsubscribe_without_ids_mean_all_entities() {
+            let controller = controller("subscribe-all", Some(PYTHON_CONFIG));
+            connect(&controller, "a").await;
+            request(&controller, R2Request::SubscribeEvents, Some(json!({})))
+                .await
+                .expect("subscribe");
+            let all = entity_ids(&controller).await.len();
+            assert_eq!(all, controller.send(Subscribed("a")).await.expect("send"));
+            request(&controller, R2Request::UnsubscribeEvents, Some(json!({})))
+                .await
+                .expect("unsubscribe");
+            assert_eq!(0, controller.send(Subscribed("a")).await.expect("send"));
+        }
+
         #[actix::test]
         async fn a_python_configuration_gives_the_python_entities() {
             let controller = controller("python-config", Some(PYTHON_CONFIG));
@@ -2028,6 +2128,44 @@ mod tests {
             let device = &config_file("no-serial")[0];
             assert_eq!(json!("0123456789AB"), device["id"]);
             assert_eq!(None, device.get("serial"));
+        }
+
+        /// Choose the fake receiver in HTTP mode and wait for the end of the setup.
+        async fn choose_fake(controller: &Addr<Controller>, events: &Mutex<Vec<Value>>) {
+            controller
+                .send(values(
+                    "a",
+                    &[("choice", FAKE_HOST), ("connection_mode", "use_http")],
+                ))
+                .await
+                .expect("send")
+                .expect("ok");
+            wait_state(events, "OK").await;
+        }
+
+        #[actix::test]
+        async fn a_first_setup_replaces_the_receivers_when_it_adds_one() {
+            let _fake = fake_receiver().await;
+            let controller = controller("first-setup-replaces", Some(PYTHON_CONFIG));
+            let events = connect(&controller, "a").await;
+            setup_fake(&controller, &events, false).await;
+            choose_fake(&controller, &events).await;
+            let config = config_file("first-setup-replaces");
+            assert_eq!(1, config.as_array().expect("list").len());
+            assert_eq!(json!("0123456789AB"), config[0]["id"]);
+        }
+
+        #[actix::test]
+        async fn a_first_setup_offers_a_configured_receiver_and_keeps_its_id() {
+            let _fake = fake_receiver().await;
+            let config = PYTHON_CONFIG.replace("SERIAL0000001", "XXX");
+            let controller = controller("first-setup-keeps-id", Some(&config));
+            let events = connect(&controller, "a").await;
+            setup_fake(&controller, &events, false).await;
+            choose_fake(&controller, &events).await;
+            let config = config_file("first-setup-keeps-id");
+            assert_eq!(1, config.as_array().expect("list").len());
+            assert_eq!(json!("XXX"), config[0]["id"]);
         }
 
         #[actix::test]

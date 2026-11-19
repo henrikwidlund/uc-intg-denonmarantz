@@ -5,13 +5,16 @@
 //! WebSocket server for the Remote Two integration API.
 
 use crate::configuration::{ENV_API_MSG_TRACING, HeartbeatSettings};
-use crate::controller::Controller;
+use crate::controller::{Controller, driver_version};
 use actix::Addr;
 use actix_web::{Error, HttpRequest, HttpResponse, get, web};
+use bytestring::ByteString;
 use log::debug;
 use std::env;
 use std::sync::Arc;
 use std::time::Instant;
+use uc_api::intg::IntegrationDriverUpdate;
+use uc_api::ws::WsMessage;
 
 mod connection;
 mod events;
@@ -31,6 +34,24 @@ struct WsConn {
     msg_tracing_in: bool,
     /// Log every outgoing message.
     msg_tracing_out: bool,
+    /// The `authentication` message, sent first.
+    authentication: ByteString,
+    /// Invalid messages from the Remote.
+    invalid: connection::InvalidMessages,
+}
+
+/// The `authentication` message with the driver version. It is the same for each connection.
+#[derive(Clone)]
+pub struct Authentication(pub ByteString);
+
+impl Authentication {
+    pub fn new(metadata: &IntegrationDriverUpdate) -> Self {
+        let msg = WsMessage::response(0, "authentication", driver_version(metadata));
+        let text = serde_json::to_string(&msg).unwrap_or_else(|_| {
+            r#"{"kind":"resp","req_id":0,"code":200,"msg":"authentication"}"#.into()
+        });
+        Self(text.into())
+    }
 }
 
 impl WsConn {
@@ -38,9 +59,12 @@ impl WsConn {
         client_id: String,
         controller_addr: Addr<Controller>,
         heartbeat: HeartbeatSettings,
+        authentication: ByteString,
     ) -> Self {
         let msg_tracing = env::var(ENV_API_MSG_TRACING).unwrap_or_default();
         Self {
+            authentication,
+            invalid: connection::InvalidMessages::new(),
             id: client_id.into(),
             hb: Instant::now(),
             controller_addr,
@@ -58,6 +82,7 @@ pub async fn ws_index(
     stream: web::Payload,
     heartbeat: web::Data<HeartbeatSettings>,
     controller: web::Data<Addr<Controller>>,
+    authentication: web::Data<Authentication>,
 ) -> Result<HttpResponse, Error> {
     // Use peer IP:port as unique client identifier.
     let client_id = request
@@ -74,6 +99,7 @@ pub async fn ws_index(
         client_id,
         controller.get_ref().clone(),
         *heartbeat.get_ref(),
+        authentication.0.clone(),
     );
 
     actix_web::rt::spawn(async move {

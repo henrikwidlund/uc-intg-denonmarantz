@@ -11,6 +11,7 @@ use crate::entities::{
 };
 use crate::errors::ServiceError;
 use denon_marantz::proto::Power;
+use denon_marantz::proto::telnet::Message;
 use denon_marantz::{Avr, Command, RemoteKey, State, Zone};
 use denon_marantz_heos::PlayState;
 use serde_json::{Map, Value};
@@ -18,14 +19,12 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
-/// A volume or mute value from a command is used for the next toggle or step until the receiver
-/// reports it.
+/// A mute value from a command is used for the next toggle until the receiver reports it.
 const EXPECTED_MAX_AGE: Duration = Duration::from_secs(3);
 
 /// Values set by the last commands.
 #[derive(Debug, Default)]
 pub struct Expected {
-    volume: Mutex<Option<(Instant, f32)>>,
     mute: Mutex<Option<(Instant, bool)>>,
 }
 
@@ -45,9 +44,6 @@ fn store<T>(slot: &Mutex<Option<(Instant, T)>>, value: T) {
 impl Expected {
     /// Forget the values, for example after a new connect.
     pub fn clear(&self) {
-        if let Ok(mut guard) = self.volume.lock() {
-            *guard = None;
-        }
         if let Ok(mut guard) = self.mute.lock() {
             *guard = None;
         }
@@ -55,7 +51,8 @@ impl Expected {
 }
 
 /// Run the steps of a remote command one after the other. The lock is taken for each step only,
-/// so that other commands, for example the volume buttons, do not wait for a long run.
+/// so that other commands, for example the volume buttons, do not wait for a long run. The run
+/// ends before the next step when `stopped` is true.
 pub async fn run_steps(
     avr: &Avr,
     heos: Option<&heos::Link>,
@@ -63,16 +60,39 @@ pub async fn run_steps(
     expected: &Expected,
     run: &remote::RemoteRun,
     lock: &tokio::sync::Mutex<()>,
+    stopped: impl Fn() -> bool,
 ) -> Result<(), ServiceError> {
     let mut first = true;
+    // The last toggle line of each command sent in this run. The receiver can answer after the
+    // next step: the next toggle reads them, so that it does not send the same value again.
+    let mut toggled: Vec<(&str, String)> = Vec::new();
     for action in &run.actions {
         for _ in 0..run.repeat {
             if !first && !run.delay.is_zero() {
                 sleep(run.delay).await;
             }
+            if stopped() {
+                return Ok(());
+            }
             first = false;
             let _guard = lock.lock().await;
-            action_run(avr, heos, cfg, expected, action.clone()).await?;
+            match action {
+                Action::Simple(entry) if entry.toggles() => {
+                    let mut state = avr.snapshot();
+                    for (_, line) in &toggled {
+                        if let Some(message) = Message::parse(line) {
+                            state.apply_message(&message);
+                        }
+                    }
+                    let line = entry.text(cfg.is_denon, &state);
+                    match toggled.iter_mut().find(|(name, _)| *name == entry.name) {
+                        Some((_, last)) => *last = line,
+                        None => toggled.push((entry.name, line)),
+                    }
+                    simple_run(avr, cfg, entry, &state).await?;
+                }
+                _ => action_run(avr, heos, cfg, expected, action.clone()).await?,
+            }
         }
     }
     Ok(())
@@ -315,14 +335,40 @@ pub async fn heos_run(heos: &heos::Link, action: &Action) -> Result<(), ServiceE
 /// other actions, and when HEOS is not used.
 async fn heos_transport(
     heos: Option<&heos::Link>,
-    state: &State,
+    avr: &Avr,
     action: &Action,
 ) -> Option<Result<(), ServiceError>> {
     if !is_heos_action(action) {
         return None;
     }
-    let heos = heos.filter(|link| heos_in_use(link, state))?;
+    let heos = heos.filter(|link| heos_in_use(link, &avr.state().borrow()))?;
     Some(heos_run(heos, action).await)
+}
+
+/// Read a value of the state. The state is not copied, and the borrow ends before any wait.
+fn read<T>(avr: &Avr, f: impl FnOnce(&State) -> T) -> T {
+    f(&avr.state().borrow())
+}
+
+/// Run a simple command with this state. The typed call of the library checks the state and the
+/// range. A command without one is sent as the text of the table.
+async fn simple_run(
+    avr: &Avr,
+    cfg: &DeviceConfig,
+    entry: &simple_commands::Entry,
+    state: &State,
+) -> Result<(), ServiceError> {
+    if let Some(run) = entry.typed() {
+        let cx = simple_commands::Cx {
+            is_denon: cfg.is_denon,
+            state,
+        };
+        run(avr, &cx).await?;
+    } else {
+        let text = entry.text(cfg.is_denon, state);
+        send(avr, Command::Raw(&text)).await?;
+    }
+    Ok(())
 }
 
 async fn action_run(
@@ -333,23 +379,21 @@ async fn action_run(
     action: Action,
 ) -> Result<(), ServiceError> {
     let zone = avr.zone(Zone::Main)?;
-    let state = avr.snapshot();
-    let main = state.zone(Zone::Main);
-    if let Some(result) = heos_transport(heos, &state, &action).await {
+    if let Some(result) = heos_transport(heos, avr, &action).await {
         return result;
     }
     match action {
         Action::On => zone.power_on().await?,
         Action::Off => zone.power_standby().await?,
         Action::Toggle => {
-            if main.power == Some(Power::On) {
+            if read(avr, |s| s.zone(Zone::Main).power) == Some(Power::On) {
                 zone.power_standby().await?;
             } else {
                 zone.power_on().await?;
             }
         }
         Action::PlayPause => {
-            if state.device().now_playing.is_playing() == Some(true) {
+            if read(avr, |s| s.device().now_playing.is_playing()) == Some(true) {
                 send(avr, Command::Pause).await?;
             } else {
                 send(avr, Command::Play).await?;
@@ -364,16 +408,14 @@ async fn action_run(
         Action::Stop => send(avr, Command::Stop).await?,
         Action::Next => zone.press(RemoteKey::NextTrack).await?,
         Action::Previous => zone.press(RemoteKey::PreviousTrack).await?,
-        Action::Volume(volume) => {
-            let db = media_player::volume_db(volume);
-            store(&expected.volume, db);
-            zone.set_volume_db(db).await?;
-        }
+        Action::Volume(volume) => zone.set_volume_db(media_player::volume_db(volume)).await?,
         // The receiver steps from its own volume, so the state is not needed.
         Action::VolumeUp => zone.volume_up().await?,
         Action::VolumeDown => zone.volume_down().await?,
         Action::MuteToggle => {
-            let muted = fresh(&expected.mute).or(main.muted).unwrap_or(false);
+            let muted = fresh(&expected.mute)
+                .or_else(|| read(avr, |s| s.zone(Zone::Main).muted))
+                .unwrap_or(false);
             store(&expected.mute, !muted);
             zone.set_mute(!muted).await?;
         }
@@ -388,7 +430,7 @@ async fn action_run(
         Action::CursorEnter => send(avr, Command::CursorEnter).await?,
         Action::Back => send(avr, Command::Back).await?,
         Action::Menu => {
-            let open = state.device().settings_menu.unwrap_or(false);
+            let open = read(avr, |s| s.device().settings_menu).unwrap_or(false);
             send(avr, Command::SetupMenu(!open)).await?;
         }
         Action::ContextMenu => send(avr, Command::Options).await?,
@@ -398,23 +440,12 @@ async fn action_run(
         Action::SelectSource(name) => {
             // The input switch works only if the receiver is on.
             zone.power_on().await?;
+            // The select reads the state while it waits for the receiver: it needs a copy.
+            let state = avr.snapshot();
             let view = command_view(&state, cfg);
             select::select_option(avr, &view, SelectKind::InputSource, &name).await?;
         }
-        Action::Simple(entry) => {
-            // The typed call of the library checks the state and the range. A command without one
-            // is sent as the text of the table.
-            if let Some(run) = entry.typed() {
-                let cx = simple_commands::Cx {
-                    is_denon: cfg.is_denon,
-                    state: &state,
-                };
-                run(avr, &cx).await?;
-            } else {
-                let text = entry.text(cfg.is_denon, &state);
-                send(avr, Command::Raw(&text)).await?;
-            }
-        }
+        Action::Simple(entry) => simple_run(avr, cfg, entry, &avr.snapshot()).await?,
         Action::Raw(text) => {
             send(avr, Command::Raw(&text)).await?;
             // The receiver does not send a new name by itself. The selects with names need telnet.
@@ -426,6 +457,7 @@ async fn action_run(
             }
         }
         Action::SelectSoundMode(name) => {
+            let state = avr.snapshot();
             let view = command_view(&state, cfg);
             select::select_option(avr, &view, SelectKind::SoundMode, &name).await?;
         }

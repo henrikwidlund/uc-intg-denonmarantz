@@ -53,6 +53,7 @@ async fn main() -> io::Result<()> {
     info!("Listening on: {address}");
 
     let heartbeat = web::Data::new(settings.heartbeat);
+    let authentication = web::Data::new(server::Authentication::new(&driver_metadata));
     let api_port = settings.http_port;
     let controller =
         web::Data::new(Controller::new(settings, driver_settings, driver_metadata.clone()).start());
@@ -60,6 +61,7 @@ async fn main() -> io::Result<()> {
     let http_server = HttpServer::new(move || {
         App::new()
             .app_data(heartbeat.clone())
+            .app_data(authentication.clone())
             .app_data(controller.clone())
             .service(server::ws_index)
     })
@@ -94,7 +96,7 @@ fn publish_mdns(api_port: u16, drv_metadata: IntegrationDriverUpdate) {
                 .and_then(|d| d.name)
                 .unwrap_or_default()
         ),
-        // Without it, `/` is used and the Remote cannot connect.
+        // `/` is the default of the spec. It is sent so that the path is clear.
         "ws_path=/".into(),
         format!("pwd={}", drv_metadata.pwd_protected.unwrap_or_default()),
         format!("ver={APP_VERSION}"),

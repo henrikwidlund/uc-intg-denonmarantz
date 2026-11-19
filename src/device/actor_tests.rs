@@ -524,6 +524,137 @@ async fn a_pause_shows_paused_until_the_source_changes() {
     .await;
 }
 
+/// The number of entity updates that the actor sent.
+fn changes_count(events: &Mutex<Vec<DeviceEvent>>) -> usize {
+    events
+        .lock()
+        .expect("lock")
+        .iter()
+        .filter(|event| matches!(event, DeviceEvent::Changes { .. }))
+        .count()
+}
+
+/// Wait until the actor sent no entity update for 500 ms.
+async fn until_quiet(events: &Mutex<Vec<DeviceEvent>>) {
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        let before = changes_count(events);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if changes_count(events) == before {
+            return;
+        }
+        assert!(Instant::now() < end, "the actor does not stop sending");
+    }
+}
+
+#[actix::test]
+async fn a_command_sends_only_the_media_player_and_only_when_the_pause_changes() {
+    let rig = rig(answers_all, QUICK).await;
+    until("the first read", 5, || rig.telnet.count("SLP?") >= 1).await;
+    for line in ["PWON", "SINET", "NSE0Now Playing", "NSE1A Title"] {
+        rig.telnet.send(line);
+    }
+    until("playing", 5, || {
+        media_state(&rig.events) == Some("PLAYING".into())
+    })
+    .await;
+    until_quiet(&rig.events).await;
+    let command = |cmd_id: &str| Command {
+        kind: EntityKind::MediaPlayer,
+        cmd_id: cmd_id.into(),
+        params: None,
+    };
+    // The receiver does not answer the cursor: nothing changed, so nothing is sent.
+    let before = changes_count(&rig.events);
+    rig.actor
+        .send(command("cursor_up"))
+        .await
+        .expect("send")
+        .expect("cursor");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(before, changes_count(&rig.events));
+    // The pause is shown with the media player alone.
+    rig.actor
+        .send(command("play_pause"))
+        .await
+        .expect("send")
+        .expect("pause");
+    until("paused", 5, || {
+        media_state(&rig.events) == Some("PAUSED".into())
+    })
+    .await;
+    let events = rig.events.lock().expect("lock");
+    let Some(DeviceEvent::Changes { changes, .. }) = events.last() else {
+        panic!("no entity update");
+    };
+    let kinds: Vec<EntityKind> = changes.iter().map(|(kind, _)| *kind).collect();
+    assert_eq!(vec![EntityKind::MediaPlayer], kinds);
+}
+
+#[actix::test]
+async fn stop_send_stops_a_running_sequence() {
+    let rig = rig(answers_all, QUICK).await;
+    until("the first read", 5, || rig.telnet.count("SLP?") >= 1).await;
+    rig.telnet.send("PWON");
+    let remote = |cmd_id: &str, params: Option<Value>| Command {
+        kind: EntityKind::Remote,
+        cmd_id: cmd_id.into(),
+        params: params.and_then(|p| p.as_object().cloned()),
+    };
+    let params = serde_json::json!({ "sequence": ["cursor_up"], "repeat": 10, "delay": 200 });
+    // The run is answered at once.
+    rig.actor
+        .send(remote("send_cmd_sequence", Some(params)))
+        .await
+        .expect("send")
+        .expect("run");
+    until("the first step", 5, || rig.telnet.count("MNCUP") >= 1).await;
+    rig.actor
+        .send(remote("stop_send", None))
+        .await
+        .expect("send")
+        .expect("stop");
+    let stopped = rig.telnet.count("MNCUP");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(rig.telnet.count("MNCUP") <= stopped + 1, "the run goes on");
+    assert!(rig.telnet.count("MNCUP") < 10);
+}
+
+#[actix::test]
+async fn a_repeated_toggle_switches_each_time() {
+    // The receiver does not answer the change: only the run knows what it sent.
+    let rig = rig(answers_all, QUICK).await;
+    until("the dynamic EQ", 5, || rig.telnet.count("PSDYNEQ ?") >= 1).await;
+    rig.telnet.send("PWON");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let params = serde_json::json!({ "command": "DYNAMIC_EQ_TOGGLE", "repeat": 2 });
+    let command = Command {
+        kind: EntityKind::Remote,
+        cmd_id: "send_cmd".into(),
+        params: params.as_object().cloned(),
+    };
+    rig.actor.send(command).await.expect("send").expect("run");
+    until("both steps", 5, || {
+        rig.telnet.count("PSDYNEQ ON") + rig.telnet.count("PSDYNEQ OFF") >= 2
+    })
+    .await;
+    assert_eq!(1, rig.telnet.count("PSDYNEQ ON"));
+    assert_eq!(1, rig.telnet.count("PSDYNEQ OFF"));
+}
+
+#[actix::test]
+async fn stop_send_is_answered_while_the_receiver_is_not_connected() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let collector = Collector(events).start();
+    let actor = DenonActor::new("SERIAL0000001".into(), cfg(), collector.recipient()).start();
+    let stop = Command {
+        kind: EntityKind::Remote,
+        cmd_id: "stop_send".into(),
+        params: None,
+    };
+    actor.send(stop).await.expect("send").expect("stop");
+}
+
 #[actix::test]
 async fn a_command_that_the_state_of_the_receiver_does_not_allow_is_answered_with_ok() {
     let rig = rig(with_a_dirac_filter, QUICK).await;

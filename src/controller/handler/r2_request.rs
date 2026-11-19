@@ -11,10 +11,12 @@ use crate::util::{DeserializeMsgData, return_fut_err, return_fut_ok};
 use crate::{APP_VERSION, built_info};
 use actix::{Handler, ResponseFuture};
 use log::debug;
+use serde::Deserialize;
 use serde_json::Value;
 use strum::EnumMessage;
+use uc_api::intg::ws::AvailableEntitiesFilter;
 use uc_api::intg::ws::{AvailableEntitiesMsgData, DriverVersionMsgData, R2Request};
-use uc_api::intg::{IntegrationVersion, SubscribeEvents};
+use uc_api::intg::{IntegrationDriverUpdate, IntegrationVersion};
 use uc_api::ws::WsMessage;
 
 /// Integration-API version from the `uc_api` dependency.
@@ -23,6 +25,30 @@ fn api_version() -> &'static str {
         .iter()
         .find(|p| p.0 == "uc_api")
         .map_or("?", |v| v.1)
+}
+
+/// `msg_data` of `get_available_entities`.
+#[derive(Deserialize)]
+struct AvailableEntitiesRequest {
+    filter: Option<AvailableEntitiesFilter>,
+}
+
+/// `msg_data` of `subscribe_events` and `unsubscribe_events`. No ids means all entities.
+#[derive(Deserialize)]
+struct EntityIds {
+    #[serde(default)]
+    entity_ids: Vec<String>,
+}
+
+/// The name and the versions of the driver.
+pub(crate) fn driver_version(metadata: &IntegrationDriverUpdate) -> DriverVersionMsgData {
+    DriverVersionMsgData {
+        name: metadata.name.as_ref().and_then(|n| n.get("en").cloned()),
+        version: Some(IntegrationVersion {
+            api: Some(api_version().into()),
+            driver: Some(APP_VERSION.into()),
+        }),
+    }
 }
 
 impl Handler<R2RequestMsg> for Controller {
@@ -55,17 +81,7 @@ impl Handler<R2RequestMsg> for Controller {
                 return_fut_ok!(Some(WsMessage::response(
                     req_id,
                     resp_msg,
-                    DriverVersionMsgData {
-                        name: self
-                            .drv_metadata
-                            .name
-                            .as_ref()
-                            .and_then(|n| n.get("en").cloned()),
-                        version: Some(IntegrationVersion {
-                            api: Some(api_version().into()),
-                            driver: Some(APP_VERSION.into()),
-                        }),
-                    },
+                    driver_version(&self.drv_metadata),
                 )));
             }
             R2Request::GetDriverMetadata => {
@@ -102,7 +118,7 @@ impl Handler<R2RequestMsg> for Controller {
             _ => {}
         }
 
-        // The other requests need the running mode.
+        // The other requests need a configuration: the running mode or a setup flow.
         if self
             .sm_consume(&msg.ws_id, &operation_mode::Input::R2Request, ctx)
             .is_err()
@@ -114,9 +130,17 @@ impl Handler<R2RequestMsg> for Controller {
 
         match msg.request {
             R2Request::GetAvailableEntities => {
+                let filter = match msg.msg_data {
+                    Some(data) => match serde_json::from_value::<AvailableEntitiesRequest>(data) {
+                        Ok(request) => request.filter,
+                        Err(e) => return_fut_err!(e.into()),
+                    },
+                    None => None,
+                };
+                let entity_type = filter.as_ref().and_then(|f| f.entity_type);
                 let msg_data = AvailableEntitiesMsgData {
-                    filter: None,
-                    available_entities: self.available_entities(),
+                    available_entities: self.available_entities(entity_type),
+                    filter,
                 };
                 return_fut_ok!(Some(WsMessage::response(req_id, resp_msg, msg_data)));
             }
@@ -126,7 +150,7 @@ impl Handler<R2RequestMsg> for Controller {
             }
             R2Request::SubscribeEvents => {
                 let ws_id = msg.ws_id.clone();
-                match msg.deserialize::<SubscribeEvents>() {
+                match msg.deserialize::<EntityIds>() {
                     Ok(subscribe) => self.subscribe(&ws_id, subscribe.entity_ids),
                     Err(e) => return_fut_err!(e.into()),
                 }
@@ -134,7 +158,7 @@ impl Handler<R2RequestMsg> for Controller {
             }
             R2Request::UnsubscribeEvents => {
                 let ws_id = msg.ws_id.clone();
-                match msg.deserialize::<SubscribeEvents>() {
+                match msg.deserialize::<EntityIds>() {
                     Ok(subscribe) => self.unsubscribe(&ws_id, &subscribe.entity_ids),
                     Err(e) => return_fut_err!(e.into()),
                 }
