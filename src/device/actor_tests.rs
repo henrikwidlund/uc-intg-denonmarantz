@@ -77,6 +77,9 @@ fn cfg() -> DeviceConfig {
         comm_api_version: None,
         has_tuner: None,
         tuner_presets_lettered: None,
+        tuner: None,
+        tuner_preset_names: Vec::new(),
+        network_favorite_names: Vec::new(),
         info: None,
     }
 }
@@ -224,72 +227,159 @@ async fn the_values_of_older_receivers_are_read_only_on_older_receivers() {
     let rig = rig(answers_all, QUICK).await;
     after_the_extra_values(&rig).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    for line in ["PSDIL ?", "PSMODE: ?", "MNPRV?", "NSH"] {
+    for line in ["PSDIL ?", "PSMODE: ?", "MNPRV?"] {
         assert_eq!(0, rig.telnet.count(line), "{line}");
     }
-    // The tuner presets are asked on all receivers that may have a tuner.
-    until("the tuner presets", 5, || rig.telnet.count("OPTPN ?") == 1).await;
 
-    let http = Fake::start_with_info(
-        b"<Device_Info><CommApiVers>0300</CommApiVers><ModelName>AVR-X2100W</ModelName>\
-        <DeviceZones>2</DeviceZones><MacAddress>0123456789AB</MacAddress></Device_Info>",
-    )
-    .await;
-    let old = rig_on(http, |_| cfg(), answers_all, QUICK).await;
-    for line in [
-        "PSDIL ?",
-        "PSMODE: ?",
-        "PSDSX ?",
-        "MNPRV?",
-        "NSH",
-        "OPTPN ?",
-    ] {
+    let old = rig_on(older_receiver().await, |_| cfg(), answers_all, QUICK).await;
+    for line in ["PSDIL ?", "PSMODE: ?", "PSDSX ?", "MNPRV?"] {
         until(line, 10, || old.telnet.count(line) >= 1).await;
     }
     // Not in the spec of 2014 and 2015.
     assert_eq!(0, old.telnet.count("PSSB: ?"));
+}
+
+/// A Denon receiver of 2015 (`CommApiVers` 0300), with network favorites before HEOS.
+async fn older_receiver() -> Fake {
+    Fake::start_with_info(
+        b"<Device_Info><CommApiVers>0300</CommApiVers><ModelName>AVR-X2100W</ModelName>\
+        <DeviceZones>2</DeviceZones><MacAddress>0123456789AB</MacAddress></Device_Info>",
+    )
+    .await
+}
+
+/// The last names that the actor stored.
+fn stored(events: &Mutex<Vec<DeviceEvent>>) -> (Vec<String>, Vec<String>) {
+    let events = events.lock().expect("lock");
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            DeviceEvent::Config { cfg, .. } => Some((
+                cfg.tuner_preset_names.clone(),
+                cfg.network_favorite_names.clone(),
+            )),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+#[actix::test]
+async fn names_are_asked_only_while_they_are_used_and_then_stored() {
+    let rig = rig_on(older_receiver().await, |_| cfg(), answers_all, QUICK).await;
+    after_the_extra_values(&rig).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(0, rig.telnet.count("OPTPN ?"));
+    assert_eq!(0, rig.telnet.count("NSH"));
+
+    // Not in standby: the receiver may not answer. Asked when it turns on.
+    rig.telnet.send("ZMOFF");
+    rig.telnet.send("SITUNER");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(0, rig.telnet.count("OPTPN ?"));
+    rig.telnet.send("ZMON");
+    until("the tuner presets", 5, || rig.telnet.count("OPTPN ?") == 1).await;
+
+    // Once per connection, while the tuner or network audio plays.
+    rig.telnet.send("SINET");
+    until("the favorites", 5, || rig.telnet.count("NSH") == 1).await;
+    rig.telnet.send("SITUNER");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(1, rig.telnet.count("OPTPN ?"));
+
+    // The names are stored when the answers stop. The select shows the stored names.
+    for line in [
+        "OPTPN01KEXP     009250",
+        "OPTPN02         010110",
+        "NSH00Radio 1",
+        "NSH01",
+    ] {
+        rig.telnet.send(line);
+    }
+    until("the stored names", 5, || {
+        stored(&rig.events)
+            == (
+                vec!["KEXP".to_owned(), "101.10 MHz".to_owned()],
+                vec!["Radio 1".to_owned(), String::new()],
+            )
+    })
+    .await;
+    let favorite = EntityKind::Select(SelectKind::NetworkFavorite);
+    until("the stored name in the select", 5, || {
+        entity_state(&rig.events, favorite, "options") == Some(serde_json::json!(["1 Radio 1"]))
+    })
+    .await;
+
+    // Another preset: only the current option, not the 56 options.
+    let preset = EntityKind::Select(SelectKind::TunerPreset);
+    let before = rig.events.lock().expect("lock").len();
+    rig.telnet.send("TPAN02");
+    until("the current preset", 5, || {
+        entity_state(&rig.events, preset, "current_option") == Some("2 101.10 MHz".into())
+    })
+    .await;
+    let options_of = |from: usize| {
+        let events = rig.events.lock().expect("lock");
+        events[from..].iter().any(|event| {
+            matches!(event, DeviceEvent::Changes { changes, .. }
+                if changes.iter().any(|(k, attrs)| *k == preset && attrs.contains_key("options")))
+        })
+    };
+    assert!(!options_of(before));
+    // The options are empty while the receiver is off, and come back when it turns on.
+    rig.telnet.send("ZMOFF");
+    until("no options", 5, || {
+        entity_state(&rig.events, preset, "options") == Some(serde_json::json!([EMPTY]))
+    })
+    .await;
+    rig.telnet.send("ZMON");
+    until("the options again", 5, || {
+        entity_state(&rig.events, preset, "options")
+            == Some(serde_json::json!(["1 KEXP", "2 101.10 MHz"]))
+    })
+    .await;
 
     // A saved favorite has a new name: the names are read again.
-    let names = old.telnet.count("NSH");
+    let names = rig.telnet.count("NSH");
     let save = Command {
         kind: EntityKind::MediaPlayer,
-        cmd_id: "NSC02".into(),
+        cmd_id: "NSC01".into(),
         params: None,
     };
-    old.actor.send(save).await.expect("send").expect("save");
-    until("the names again", 5, || old.telnet.count("NSH") > names).await;
-    let presets = old.telnet.count("OPTPN ?");
+    rig.actor.send(save).await.expect("send").expect("save");
+    until("the names again", 5, || rig.telnet.count("NSH") > names).await;
+    let presets = rig.telnet.count("OPTPN ?");
     let save = Command {
         kind: EntityKind::MediaPlayer,
         cmd_id: "TPANMEM03".into(),
         params: None,
     };
-    old.actor.send(save).await.expect("send").expect("save");
+    rig.actor.send(save).await.expect("send").expect("save");
     until("the presets again", 5, || {
-        old.telnet.count("OPTPN ?") > presets
+        rig.telnet.count("OPTPN ?") > presets
     })
     .await;
 
-    // A new name is sent. Other changes do not send the select with its 56 options again.
-    let favorite = EntityKind::Select(SelectKind::NetworkFavorite);
-    old.telnet.send("NSH02Jazz");
+    // A new name is sent. Other changes do not build the options of the select again.
+    rig.telnet.send("NSH01Jazz");
     until("the new name", 5, || {
-        entity_state(&old.events, favorite, "options")
-            .is_some_and(|o| o.to_string().contains("3 Jazz"))
+        entity_state(&rig.events, favorite, "options")
+            .is_some_and(|o| o.to_string().contains("2 Jazz"))
     })
     .await;
-    let before = old.events.lock().expect("lock").len();
-    old.telnet.send("SLP010");
+    let before = rig.events.lock().expect("lock").len();
+    rig.telnet.send("SLP010");
     let sleep = EntityKind::Sensor(SensorKind::SleepTimer);
     until("the sleep timer", 5, || {
-        entity_state(&old.events, sleep, "value") == Some(10.into())
+        entity_state(&rig.events, sleep, "value") == Some(10.into())
     })
     .await;
-    let events = old.events.lock().expect("lock");
-    let sent = events[before..].iter().any(|event| {
-        matches!(event, DeviceEvent::Changes { changes, .. } if changes.iter().any(|(k, _)| *k == favorite))
+    let events = rig.events.lock().expect("lock");
+    let built = events[before..].iter().any(|event| {
+        matches!(event, DeviceEvent::Changes { changes, .. }
+            if changes.iter().any(|(k, attrs)| *k == favorite && attrs.contains_key("options")))
     });
-    assert!(!sent);
+    assert!(!built);
 }
 
 #[actix::test]

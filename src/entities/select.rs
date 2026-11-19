@@ -98,9 +98,10 @@ const TUNER_PRESETS: u8 = 56;
 const QUICK_SELECTS: usize = 5;
 
 /// Six selects always exist. With a telnet connection there are more, the Dirac filter if the
-/// receiver supports it, the network favorites on receivers before HEOS, and the tuner presets if
-/// the receiver may have a tuner. Over HTTP, the `MultEq` select also comes with `AppCommand` if the receiver
-/// lists the query, and the monitor output if the receiver reads it over HTTP.
+/// receiver supports it, the network favorites on receivers before HEOS, and the tuner band and
+/// presets if the receiver may have a tuner. Over HTTP, the `MultEq` select also comes with
+/// `AppCommand` if the receiver lists the query, and the monitor output if the receiver reads it
+/// over HTTP.
 pub const fn available(cfg: &DeviceConfig, kind: SelectKind) -> bool {
     match kind {
         SelectKind::SoundMode
@@ -114,12 +115,13 @@ pub const fn available(cfg: &DeviceConfig, kind: SelectKind) -> bool {
         SelectKind::SpeakerPreset
         | SelectKind::PictureMode
         | SelectKind::DigitalCodec
-        | SelectKind::TunerBand
         | SelectKind::BluetoothOutput => cfg.use_telnet,
         SelectKind::MultiEq => cfg.use_telnet || cfg.reads_audyssey(),
         SelectKind::DiracFilter => cfg.use_telnet && cfg.has_dirac(),
         SelectKind::NetworkFavorite => cfg.use_telnet && cfg.offers(Feature::NetworkAudio),
-        SelectKind::TunerPreset => cfg.use_telnet && !matches!(cfg.has_tuner, Some(false)),
+        SelectKind::TunerBand | SelectKind::TunerPreset => {
+            cfg.use_telnet && cfg.offers(Feature::Tuner)
+        }
     }
 }
 
@@ -153,6 +155,27 @@ pub fn attributes(v: &View<'_>, kind: SelectKind, out: &mut Map<String, Value>) 
         out.insert("options".into(), options.into());
         out.insert("current_option".into(), current.into());
     }
+}
+
+/// Insert the state and the current option of a select, without its options. For the selects
+/// with many options when only the current one can have changed.
+pub fn current_attributes(v: &View<'_>, kind: SelectKind, out: &mut Map<String, Value>) {
+    out.insert("state".into(), availability(v).into());
+    let current = match kind {
+        _ if is_off(v) => None,
+        SelectKind::TunerPreset => v
+            .state
+            .device()
+            .tuner
+            .preset
+            .and_then(|n| tuner_preset_label(v, n)),
+        SelectKind::NetworkFavorite => None,
+        _ => choices(v, kind).current,
+    };
+    out.insert(
+        "current_option".into(),
+        current.unwrap_or_else(|| EMPTY.to_owned()).into(),
+    );
 }
 
 /// All options of the select and the current one.
@@ -337,15 +360,14 @@ fn quick_select_labels(v: &View<'_>) -> Vec<String> {
         .collect()
 }
 
-/// The network favorites with their number from 1: `n name` for the ones with a name. While no
-/// names are known, `Favorite n` for all of them.
+/// The network favorites with their number from 1: `n name` for the ones with a stored name.
+/// While no names are known, `Favorite n` for all of them.
 fn network_favorite_labels(v: &View<'_>) -> impl Iterator<Item = (u8, String)> {
-    let favorites = &v.state.device().network_preset_names;
+    let favorites = &v.cfg.network_favorite_names;
     let named = |i: usize| {
         favorites
             .get(i)
-            .and_then(Option::as_deref)
-            .map(str::trim)
+            .map(String::as_str)
             .filter(|name| !name.is_empty())
     };
     let count = v.cfg.network_favorites();
@@ -358,25 +380,29 @@ fn network_favorite_labels(v: &View<'_>) -> impl Iterator<Item = (u8, String)> {
 }
 
 /// The tuner presets with their number from 1: `n name`, or `n frequency` for a preset without a
-/// name. While no presets are known, `Preset n` for all 56.
+/// name, as stored. While no presets are known, `Preset n` for all 56.
 fn tuner_preset_labels(v: &View<'_>) -> impl Iterator<Item = (u8, String)> {
-    let presets = &v.state.device().tuner.presets;
-    let any = presets
-        .iter()
-        .any(|p| p.name.is_some() || p.frequency.is_some());
-    (1..=TUNER_PRESETS).filter_map(move |n| {
-        let preset = presets.get(usize::from(n - 1));
-        let name = preset
-            .and_then(|p| p.name.as_deref())
-            .map(str::trim)
-            .filter(|name| !name.is_empty());
-        match (name, preset.and_then(|p| p.frequency)) {
-            (Some(name), _) => Some((n, format!("{n} {name}"))),
-            (None, Some(frequency)) => Some((n, format!("{n} {frequency}"))),
-            (None, None) if !any => Some((n, format!("Preset {n}"))),
-            (None, None) => None,
-        }
-    })
+    let any = v.cfg.tuner_preset_names.iter().any(|p| !p.is_empty());
+    (1..=TUNER_PRESETS).filter_map(move |n| preset_label(v, n, any).map(|label| (n, label)))
+}
+
+/// The label of one tuner preset. `None` if the select does not offer it.
+fn tuner_preset_label(v: &View<'_>, n: u8) -> Option<String> {
+    let any = v.cfg.tuner_preset_names.iter().any(|p| !p.is_empty());
+    preset_label(v, n, any)
+}
+
+/// `any`: some preset has a stored text.
+fn preset_label(v: &View<'_>, n: u8, any: bool) -> Option<String> {
+    let text = n
+        .checked_sub(1)
+        .and_then(|i| v.cfg.tuner_preset_names.get(usize::from(i)))
+        .filter(|p| !p.is_empty());
+    match text {
+        Some(text) => Some(format!("{n} {text}")),
+        None if !any && (1..=TUNER_PRESETS).contains(&n) => Some(format!("Preset {n}")),
+        None => None,
+    }
 }
 
 fn enum_choices<T: Copy>(all: &[T], current: Option<T>, label: fn(T) -> &'static str) -> Choices {
@@ -639,6 +665,11 @@ mod tests {
             let message = denon_marantz::proto::telnet::Message::parse(line).expect("message");
             state.apply_message(&message);
         }
+        // The select shows the stored names, not the ones of the state.
+        assert_eq!(36, labels(&cfg, &state).len());
+        let favorites = crate::device::discovery::Names::NetworkFavorites;
+        cfg.network_favorite_names = favorites.merged(&cfg, &state).expect("new names");
+        assert_eq!(None, favorites.merged(&cfg, &state));
         assert_eq!(
             vec![(1, "1 Radio 1".to_owned()), (3, "3 Jazz".to_owned())],
             labels(&cfg, &state)
@@ -647,12 +678,12 @@ mod tests {
 
     #[test]
     fn tuner_presets_show_their_names_or_frequencies() {
-        let cfg = crate::entities::tests::cfg(true, true);
+        let mut cfg = crate::entities::tests::cfg(true, true);
         let mut state = State::new(true);
-        let v = |state: &'_ State| -> Vec<(u8, String)> {
+        let v = |cfg: &DeviceConfig, state: &'_ State| -> Vec<(u8, String)> {
             let v = View {
                 state,
-                cfg: &cfg,
+                cfg,
                 connected: true,
                 artwork_url: None,
                 paused: false,
@@ -663,7 +694,7 @@ mod tests {
             };
             tuner_preset_labels(&v).collect()
         };
-        let all = v(&state);
+        let all = v(&cfg, &state);
         assert_eq!(
             (56, (1, "Preset 1".to_owned())),
             (all.len(), all[0].clone())
@@ -672,9 +703,18 @@ mod tests {
             let message = denon_marantz::proto::telnet::Message::parse(line).expect("message");
             state.apply_message(&message);
         }
+        // A stored preset that the receiver did not report again stays.
+        cfg.tuner_preset_names = vec!["Old".to_owned()];
+        let presets = crate::device::discovery::Names::TunerPresets;
+        cfg.tuner_preset_names = presets.merged(&cfg, &state).expect("new names");
+        assert_eq!(None, presets.merged(&cfg, &state));
         assert_eq!(
-            vec![(3, "3 KEXP".to_owned()), (5, "5 101.10 MHz".to_owned())],
-            v(&state)
+            vec![
+                (1, "1 Old".to_owned()),
+                (3, "3 KEXP".to_owned()),
+                (5, "5 101.10 MHz".to_owned())
+            ],
+            v(&cfg, &state)
         );
         let view = View {
             state: &state,

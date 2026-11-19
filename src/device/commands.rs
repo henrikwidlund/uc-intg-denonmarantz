@@ -417,9 +417,12 @@ async fn action_run(
         }
         Action::Raw(text) => {
             send(avr, Command::Raw(&text)).await?;
-            // The selects with the names need telnet.
-            if cfg.use_telnet {
-                discovery::read_names_after_save(avr, discovery::ExtraReads::new(cfg), &text).await;
+            // The receiver does not send a new name by itself. The selects with names need telnet.
+            if cfg.use_telnet
+                && let Some(names) =
+                    discovery::Names::saved_by(discovery::ExtraReads::new(cfg), &text)
+            {
+                names.read(avr).await;
             }
         }
         Action::SelectSoundMode(name) => {

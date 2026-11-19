@@ -120,6 +120,9 @@ pub const fn available(cfg: &DeviceConfig, kind: SensorKind) -> bool {
     if matches!(kind, SensorKind::DiracFilter) {
         return cfg.use_telnet && cfg.has_dirac();
     }
+    if matches!(kind, SensorKind::TunerFrequency) {
+        return cfg.use_telnet && cfg.offers(Feature::Tuner);
+    }
     // The values of older receivers come on telnet only.
     if let Some(feature) = feature(kind) {
         return cfg.use_telnet && cfg.offers(feature);

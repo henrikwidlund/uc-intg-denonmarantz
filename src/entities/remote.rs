@@ -4,7 +4,7 @@
 //! Remote entity: buttons, UI pages and commands. The commands, the pages and the button mapping
 //! are the ones of the Python integration. Commands use the media player mapping.
 
-use crate::config_store::DeviceConfig;
+use crate::config_store::{DeviceConfig, Feature};
 use crate::entities::View;
 use crate::entities::media_player::{self, Action};
 use crate::entities::{is_off, simple_commands};
@@ -73,19 +73,20 @@ pub fn definition(mut entity: AvailableIntgEntity, cfg: &DeviceConfig) -> Availa
     entity
 }
 
-/// The UI pages without the buttons of quick select slots that the receiver does not have. A page
-/// without buttons is left out.
+/// The UI pages without the buttons of quick select slots and tuner commands that the receiver
+/// does not have. A page without buttons is left out.
 fn pages_for(pages: &Value, cfg: &DeviceConfig) -> Value {
+    let tuner = cfg.offers(Feature::Tuner);
     let has = |item: &Value| {
-        item["command"]["cmd_id"]
-            .as_str()
-            .and_then(simple_commands::quick_select_slot)
+        let cmd = item["command"]["cmd_id"].as_str();
+        cmd.and_then(simple_commands::quick_select_slot)
             .is_none_or(|slot| cfg.has_quick_select(slot))
+            && (tuner || !cmd.is_some_and(simple_commands::needs_tuner))
     };
     let Some(pages) = pages.as_array() else {
         return Value::Null;
     };
-    if cfg.quick_select_count.is_none() {
+    if cfg.quick_select_count.is_none() && tuner {
         return Value::Array(pages.clone());
     }
     Value::Array(

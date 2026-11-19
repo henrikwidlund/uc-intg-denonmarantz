@@ -4,7 +4,9 @@
 
 //! Driver setup flow: discovery, options and reconfiguration.
 
-use crate::config_store::{DeviceConfig, DriverSettings, SaveWait, backup_json, parse_backup};
+use crate::config_store::{
+    DeviceConfig, DriverSettings, Feature, SaveWait, backup_json, parse_backup,
+};
 use crate::controller::handler::AbortDriverSetup;
 use crate::controller::{Controller, operation_mode};
 use crate::device::{UpdateConfig, discovery};
@@ -12,7 +14,7 @@ use crate::entities::EntityKind;
 use crate::errors::ServiceError;
 use crate::logging;
 use actix::{ActorFutureExt, AsyncContext, Context, Handler, Message, WrapFuture};
-use denon_marantz::Error as AvrError;
+use denon_marantz::{Avr, Error as AvrError, TunerInfo};
 use log::{debug, info, warn};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -54,10 +56,12 @@ pub struct Found {
     mac: Option<String>,
     is_denon: bool,
     is_dirac_supported: bool,
+    /// `None` if the setup could not find it out.
+    has_tuner: Option<bool>,
 }
 
 impl Found {
-    fn new(receiver: &denon_marantz::DiscoveredReceiver, is_dirac_supported: bool) -> Self {
+    fn new(receiver: &denon_marantz::DiscoveredReceiver, detected: Detected) -> Self {
         Self {
             host: receiver.host.clone(),
             name: receiver
@@ -72,12 +76,13 @@ impl Found {
                 .as_deref()
                 .and_then(crate::config_store::mac_text),
             is_denon: receiver.brand != denon_marantz::Brand::Marantz,
-            is_dirac_supported,
+            is_dirac_supported: detected.dirac,
+            has_tuner: detected.tuner,
         }
     }
 
     /// A receiver that the user gave the address of.
-    fn from_identified(host: &str, id: &discovery::Identified) -> Self {
+    fn from_identified(host: &str, id: &discovery::Identified, has_tuner: Option<bool>) -> Self {
         Self {
             host: host.to_owned(),
             name: id.name.clone(),
@@ -86,6 +91,7 @@ impl Found {
             mac: id.mac.clone(),
             is_denon: id.is_denon,
             is_dirac_supported: id.is_dirac_supported,
+            has_tuner,
         }
     }
 }
@@ -98,6 +104,9 @@ struct Options {
     is_denon: bool,
     use_telnet: bool,
     is_dirac_supported: bool,
+    has_tuner: bool,
+    /// The setup could not find out if the receiver has a tuner: the field asks the user.
+    tuner_unknown: bool,
     signal_poll_secs: u16,
 }
 
@@ -108,6 +117,8 @@ impl Options {
             is_denon: cfg.is_denon,
             use_telnet: cfg.use_telnet,
             is_dirac_supported: cfg.has_dirac(),
+            has_tuner: cfg.offers(Feature::Tuner),
+            tuner_unknown: cfg.tuner.is_none() && cfg.has_tuner.is_none(),
             signal_poll_secs: cfg.signal_poll_secs,
         }
     }
@@ -118,6 +129,8 @@ impl Options {
             is_denon: found.is_denon,
             use_telnet: true,
             is_dirac_supported: found.is_dirac_supported,
+            has_tuner: !matches!(found.has_tuner, Some(false)),
+            tuner_unknown: found.has_tuner.is_none(),
             signal_poll_secs: 0,
         }
     }
@@ -133,6 +146,9 @@ impl Options {
         }
         if let Some(v) = values.get("is_dirac_supported") {
             self.is_dirac_supported = v.eq_ignore_ascii_case("true");
+        }
+        if let Some(v) = values.get("has_tuner") {
+            self.has_tuner = v.eq_ignore_ascii_case("true");
         }
         if let Some(secs) = values.get("signal_poll_secs") {
             let secs = secs.trim();
@@ -185,6 +201,21 @@ impl Options {
                 "label": { "en": "Device supports Dirac" },
                 "field": { "dropdown": {
                     "value": if self.is_dirac_supported { "True" } else { "False" },
+                    "items": [
+                        { "id": "True", "label": { "en": "Yes" } },
+                        { "id": "False", "label": { "en": "No" } }
+                    ]
+                } }
+            }),
+            json!({
+                "id": "has_tuner",
+                "label": { "en": if self.tuner_unknown {
+                    "Receiver has an AM/FM tuner (not found out: turn the receiver on to find it out, or choose)"
+                } else {
+                    "Receiver has an AM/FM tuner"
+                } },
+                "field": { "dropdown": {
+                    "value": if self.has_tuner { "True" } else { "False" },
                     "items": [
                         { "id": "True", "label": { "en": "Yes" } },
                         { "id": "False", "label": { "en": "No" } }
@@ -627,7 +658,12 @@ impl Controller {
                         listed_queries: identified.kind.listed_queries,
                         comm_api_version: identified.kind.comm_api_version,
                         has_tuner: identified.kind.has_tuner,
+                        tuner: Some(options.has_tuner),
                         tuner_presets_lettered: old.and_then(|c| c.tuner_presets_lettered),
+                        tuner_preset_names: old
+                            .map_or_else(Vec::new, |c| c.tuner_preset_names.clone()),
+                        network_favorite_names: old
+                            .map_or_else(Vec::new, |c| c.network_favorite_names.clone()),
                         info: Some(identified.info),
                     };
                     if let Some(device) = act.devices.get_mut(cfg.key()) {
@@ -744,20 +780,25 @@ impl Controller {
     }
 
     /// Show the options of a configured receiver. Like the Python integration, ask the receiver
-    /// if it has Dirac. If it does not answer, the saved value is shown.
+    /// if it has Dirac. If it does not answer, the saved value is shown. The tuner is asked only
+    /// if it was never set.
     fn request_configure(&self, ws_id: String, cfg: DeviceConfig, ctx: &mut Context<Self>) {
         let flow = self.setup_flow;
         let host = cfg.address.clone();
+        let ask_tuner = cfg.tuner.is_none();
         ctx.spawn(
-            async move { detect_dirac_opt(&host).await }
+            async move { detect_opt(&host, ask_tuner).await }
                 .into_actor(self)
                 .map(move |detected, act, ctx| {
                     if !act.is_setup_flow(flow, &ws_id) {
                         return;
                     }
                     let mut cfg = cfg;
-                    if let Some(dirac) = detected {
-                        cfg.is_dirac_supported = Some(dirac);
+                    if let Some(detected) = detected {
+                        cfg.is_dirac_supported = Some(detected.dirac);
+                        if ask_tuner && detected.tuner.is_some() {
+                            cfg.tuner = detected.tuner;
+                        }
                     }
                     act.setup = Some(SetupState::Configure {
                         key: cfg.id.clone(),
@@ -880,6 +921,7 @@ impl Controller {
         cfg.is_denon = options.is_denon;
         cfg.use_telnet = options.use_telnet;
         cfg.is_dirac_supported = Some(options.is_dirac_supported);
+        cfg.tuner = Some(options.has_tuner);
         cfg.signal_poll_secs = options.signal_poll_secs;
         if let Some(address) = address {
             cfg.address = address;
@@ -1164,14 +1206,15 @@ async fn find_receivers(address: Option<String>) -> Result<Vec<Found>, AvrError>
         let avr = discovery::identify(&host, None).await?;
         let id = discovery::Identified::new(&avr)
             .map_err(|reason| AvrError::InvalidRequest(format!("[{host}] not used: {reason}")))?;
-        return Ok(vec![Found::from_identified(&host, &id)]);
+        let tuner = detect_tuner(&avr).await;
+        return Ok(vec![Found::from_identified(&host, &id, tuner)]);
     }
     let receivers = discovery::discover().await?;
-    // The search does not say if the receiver has Dirac: ask each one.
-    let dirac = futures::future::join_all(receivers.iter().map(|r| detect_dirac(&r.host))).await;
+    // The search does not say if the receiver has Dirac or a tuner: ask each one.
+    let detected = futures::future::join_all(receivers.iter().map(|r| detect(&r.host))).await;
     Ok(receivers
         .iter()
-        .zip(dirac)
+        .zip(detected)
         .map(|(r, d)| Found::new(r, d))
         .collect())
 }
@@ -1179,17 +1222,48 @@ async fn find_receivers(address: Option<String>) -> Result<Vec<Found>, AvrError>
 /// Time to wait for the answer of a receiver to the Dirac question.
 const DETECT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Ask the receiver if it supports Dirac Live. `None` if it does not answer.
-async fn detect_dirac(host: &str) -> bool {
-    detect_dirac_opt(host).await.unwrap_or(false)
+/// What the setup asks the receiver for its option defaults.
+#[derive(Debug, Clone, Copy)]
+struct Detected {
+    dirac: bool,
+    /// `None` if it could not be found out.
+    tuner: Option<bool>,
 }
 
-async fn detect_dirac_opt(host: &str) -> Option<bool> {
+/// Ask the receiver if it supports Dirac Live and has a tuner. Without an answer: no Dirac, and
+/// the tuner is not known.
+async fn detect(host: &str) -> Detected {
+    detect_opt(host, true).await.unwrap_or(Detected {
+        dirac: false,
+        tuner: None,
+    })
+}
+
+/// `None` if the receiver does not answer. The tuner is not checked without `ask_tuner`.
+async fn detect_opt(host: &str, ask_tuner: bool) -> Option<Detected> {
     let avr = tokio::time::timeout(DETECT_TIMEOUT, discovery::identify(host, None))
         .await
         .ok()?
         .ok()?;
-    Some(avr.info().dirac_live)
+    let tuner = if ask_tuner {
+        detect_tuner(&avr).await
+    } else {
+        None
+    };
+    Some(Detected {
+        dirac: avr.info().dirac_live,
+        tuner,
+    })
+}
+
+/// The default of the tuner option: from `Deviceinfo.xml`, else from the telnet check while the
+/// receiver is on. `None` if it is not known: the user chooses.
+async fn detect_tuner(avr: &Avr) -> Option<bool> {
+    match avr.info().tuner {
+        TunerInfo::Present(_) => Some(true),
+        TunerInfo::Absent => Some(false),
+        _ => discovery::probe_tuner(&avr.info().host, discovery::TELNET_PORT).await,
+    }
 }
 
 /// Read the id and the name of the receiver at an address.
@@ -1251,6 +1325,8 @@ mod tests {
             is_denon: true,
             use_telnet: true,
             is_dirac_supported: false,
+            has_tuner: true,
+            tuner_unknown: false,
             signal_poll_secs: 0,
         }
     }
@@ -1270,13 +1346,46 @@ mod tests {
                 ("show_all_inputs", "true"),
                 ("connection_mode", "use_http"),
                 ("is_dirac_supported", "True"),
+                ("has_tuner", "False"),
                 ("signal_poll_secs", "10"),
             ]))
             .expect("ok");
         assert!(!o.is_denon && o.show_all_inputs && !o.use_telnet && o.is_dirac_supported);
+        assert!(!o.has_tuner);
         assert_eq!(10, o.signal_poll_secs);
         // Missing fields keep the values.
         assert_eq!(options(), options().read(&HashMap::new()).expect("ok"));
+    }
+
+    #[test]
+    fn the_tuner_field_asks_when_the_setup_could_not_find_it_out() {
+        let field = |has_tuner| {
+            let found = Found {
+                host: "h".into(),
+                name: "N".into(),
+                model: "M".into(),
+                serial: None,
+                mac: None,
+                is_denon: true,
+                is_dirac_supported: false,
+                has_tuner,
+            };
+            Options::for_found(&found)
+                .fields()
+                .into_iter()
+                .find(|f| f["id"] == "has_tuner")
+                .expect("tuner field")
+        };
+        let unknown = field(None);
+        assert!(
+            unknown["label"]["en"]
+                .as_str()
+                .is_some_and(|l| l.contains("not found out"))
+        );
+        assert_eq!("True", unknown["field"]["dropdown"]["value"]);
+        let none = field(Some(false));
+        assert_eq!("Receiver has an AM/FM tuner", none["label"]["en"]);
+        assert_eq!("False", none["field"]["dropdown"]["value"]);
     }
 
     #[test]

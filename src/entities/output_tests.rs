@@ -40,6 +40,9 @@ fn cfg() -> DeviceConfig {
         comm_api_version: None,
         has_tuner: None,
         tuner_presets_lettered: None,
+        tuner: None,
+        tuner_preset_names: Vec::new(),
+        network_favorite_names: Vec::new(),
         info: None,
     }
 }
@@ -689,4 +692,48 @@ fn the_quick_select_offers_the_slots_of_the_receiver() {
         ..self::cfg()
     };
     assert!(!EntityKind::all(&none).any(|k| k == EntityKind::Select(SelectKind::QuickSelect)));
+}
+
+#[test]
+fn a_receiver_without_a_tuner_has_no_tuner_parts() {
+    let with = |has_tuner| DeviceConfig { has_tuner, ..cfg() };
+    let tuner_kinds = |c: &DeviceConfig| {
+        EntityKind::all(c)
+            .filter(|k| {
+                matches!(
+                    k,
+                    EntityKind::Select(SelectKind::TunerBand | SelectKind::TunerPreset)
+                        | EntityKind::Sensor(SensorKind::TunerFrequency)
+                )
+            })
+            .count()
+    };
+    let channels = |c: &DeviceConfig| {
+        let entity = definition(c, EntityKind::MediaPlayer);
+        entity
+            .features
+            .expect("features")
+            .iter()
+            .any(|f| f == "channel_switcher")
+    };
+    // The commands and the UI pages of the remote.
+    let remote = |c: &DeviceConfig| {
+        let options = definition(c, EntityKind::Remote).options.expect("options");
+        let text = Value::Object(options).to_string();
+        (
+            text.matches("TUNER_").count(),
+            // The analog input named `TUNER` is there without a tuner too.
+            text.contains("INPUT_TUNER"),
+        )
+    };
+    for has_tuner in [None, Some(true)] {
+        let c = with(has_tuner);
+        assert_eq!(3, tuner_kinds(&c), "{has_tuner:?}");
+        assert!(channels(&c));
+        assert!(remote(&c).1);
+    }
+    let none = with(Some(false));
+    assert_eq!(0, tuner_kinds(&none));
+    assert!(!channels(&none));
+    assert_eq!((0, true), remote(&none));
 }

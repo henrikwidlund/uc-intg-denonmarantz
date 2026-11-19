@@ -37,6 +37,9 @@ fn cfg() -> DeviceConfig {
         comm_api_version: None,
         has_tuner: None,
         tuner_presets_lettered: None,
+        tuner: None,
+        tuner_preset_names: Vec::new(),
+        network_favorite_names: Vec::new(),
         info: None,
     }
 }

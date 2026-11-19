@@ -4,11 +4,12 @@
 //! Find receivers on the network and connect to them.
 
 use crate::config_store::{self, DeviceConfig, Feature};
-use denon_marantz::proto::NetworkAudioCommand;
+use denon_marantz::proto::source::playing_kind;
+use denon_marantz::proto::{NetworkAudioCommand, PlayingKind, Power};
 use denon_marantz::{
     Ask, Avr, AvrBuilder, Brand, Command, DiscoveredReceiver, DiscoveryConfig, Error, HttpConfig,
     Info, InfoCheck, PageStatus, Query, QueryGroup, ReceiverType, StartOptions, StartReport,
-    Started, TelnetSync, TunerInfo, UpdateMethod, Zone, discover_all,
+    Started, State, TelnetSync, TunerInfo, UpdateMethod, Zone, discover_all,
 };
 use log::debug;
 use std::sync::Arc;
@@ -400,13 +401,13 @@ impl ExtraReads {
         Self {
             older,
             favorites: cfg.offers(Feature::NetworkAudio),
-            tuner_presets: !matches!(cfg.has_tuner, Some(false)),
+            tuner_presets: cfg.offers(Feature::Tuner),
         }
     }
 }
 
-/// Queue the extra values, the values of older receivers that the receiver may have, and the
-/// names of the network favorites and tuner presets. It does not wait for the answers.
+/// Queue the extra values and the values of older receivers that the receiver may have. It does
+/// not wait for the answers.
 pub async fn read_extra_values(avr: &Avr, reads: ExtraReads) {
     let brand = avr.info().brand;
     let older = OLDER_QUERIES
@@ -421,17 +422,6 @@ pub async fn read_extra_values(avr: &Avr, reads: ExtraReads) {
         .collect();
     if let Err(e) = avr.telnet_ask(&asks).await {
         debug!("extra values not read: {e}");
-    }
-    if reads.favorites {
-        let names = Command::NetworkAudio(NetworkAudioCommand::PresetNames);
-        if let Err(e) = avr.send(Zone::Main, names).await {
-            debug!("network favorites not read: {e}");
-        }
-    }
-    if reads.tuner_presets
-        && let Err(e) = avr.tuner().request_presets().await
-    {
-        debug!("tuner presets not read: {e}");
     }
 }
 
@@ -605,21 +595,234 @@ pub fn mac_address(info: &Info) -> Option<String> {
     info.mac_address.as_deref().and_then(config_store::mac_text)
 }
 
-/// Read the names of the network favorites or tuner presets again after a raw command that saves
-/// one (`NSC01`, `TPANMEM01`). The receiver does not send the new name by itself.
-pub async fn read_names_after_save(avr: &Avr, reads: ExtraReads, text: &str) {
-    let text = text.trim_start();
-    if reads.favorites && text.starts_with("NSC") {
-        let names = Command::NetworkAudio(NetworkAudioCommand::PresetNames);
-        if let Err(e) = avr.send(Zone::Main, names).await {
-            debug!("network favorites not read: {e}");
-        }
-    } else if reads.tuner_presets
-        && text.starts_with("TPANMEM")
-        && let Err(e) = avr.tuner().request_presets().await
-    {
-        debug!("tuner presets not read: {e}");
+/// The telnet port of the receivers.
+pub const TELNET_PORT: u16 = 23;
+
+/// Time to wait for the answer to one query of the tuner check.
+const TUNER_ANSWER_WAIT: Duration = Duration::from_millis(1500);
+
+/// Ask the receiver for its tuner band, then its frequency. An answer means a tuner. `None` if
+/// it is not known: telnet cannot be opened, or the receiver is not on.
+///
+/// `Deviceinfo.xml` cannot tell: a receiver without a tuner can list an analog input named
+/// `TUNER`, and the tuner depends on the sales region. A receiver without a tuner does not answer
+/// (seen on an AVC-A10H). No capture shows that a receiver with a tuner answers while another
+/// source plays, so the result is only a default for the setup.
+pub async fn probe_tuner(host: &str, port: u16) -> Option<bool> {
+    use tokio::io::AsyncWriteExt;
+    let mut stream = timeout(
+        Duration::from_secs(1),
+        tokio::net::TcpStream::connect((host, port)),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let mut lines = Lines::default();
+    // A receiver in standby may not answer the tuner queries.
+    stream.write_all(b"PW?\r").await.ok()?;
+    let on = lines
+        .wait(&mut stream, |line| match line {
+            b"PWON" => Some(true),
+            b"PWSTANDBY" => Some(false),
+            _ => None,
+        })
+        .await?;
+    if !on {
+        return None;
     }
+    for query in [&b"TMAN?\r"[..], b"TFAN?\r"] {
+        stream.write_all(query).await.ok()?;
+        let tuner =
+            |line: &[u8]| (line.starts_with(b"TM") || line.starts_with(b"TF")).then_some(());
+        if lines.wait(&mut stream, tuner).await.is_some() {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// Reads telnet lines. A line can be split over two reads.
+struct Lines {
+    buffer: [u8; 1024],
+    line: Vec<u8>,
+}
+
+impl Default for Lines {
+    fn default() -> Self {
+        Self {
+            buffer: [0; 1024],
+            line: Vec::with_capacity(64),
+        }
+    }
+}
+
+impl Lines {
+    /// The first line for which `pick` gives a value, within `TUNER_ANSWER_WAIT`. `None` if no
+    /// line fits, or if the connection ends.
+    async fn wait<T>(
+        &mut self,
+        stream: &mut tokio::net::TcpStream,
+        mut pick: impl FnMut(&[u8]) -> Option<T>,
+    ) -> Option<T> {
+        use tokio::io::AsyncReadExt;
+        let end = Instant::now() + TUNER_ANSWER_WAIT;
+        while let Some(left) = end.checked_duration_since(Instant::now()) {
+            let Ok(Ok(count)) = timeout(left, stream.read(&mut self.buffer)).await else {
+                return None;
+            };
+            if count == 0 {
+                return None;
+            }
+            for &byte in &self.buffer[..count] {
+                if byte != b'\r' {
+                    // A long line is not an answer of the check: only its start is kept.
+                    if self.line.len() < 64 {
+                        self.line.push(byte);
+                    }
+                    continue;
+                }
+                let found = pick(&self.line);
+                self.line.clear();
+                if found.is_some() {
+                    return found;
+                }
+            }
+        }
+        None
+    }
+}
+
+/// The names that the selects show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Names {
+    TunerPresets,
+    NetworkFavorites,
+}
+
+impl Names {
+    /// The bit of the names in a set of `u8`.
+    pub const fn bit(self) -> u8 {
+        match self {
+            Self::TunerPresets => 1,
+            Self::NetworkFavorites => 2,
+        }
+    }
+
+    /// The names that the main zone uses now: the tuner presets while the tuner plays, the network
+    /// favorites while network audio plays. None while the main zone is off: a receiver in standby
+    /// may not answer.
+    pub fn in_use(reads: ExtraReads, state: &State) -> Option<Self> {
+        if state.zone(Zone::Main).power != Some(Power::On) {
+            return None;
+        }
+        match main_playing_kind(state)? {
+            PlayingKind::Tuner if reads.tuner_presets => Some(Self::TunerPresets),
+            PlayingKind::NetAudio if reads.favorites => Some(Self::NetworkFavorites),
+            _ => None,
+        }
+    }
+
+    /// The names that a raw command saves (`TPANMEM01`, `NSC01`).
+    pub fn saved_by(reads: ExtraReads, text: &str) -> Option<Self> {
+        let text = text.trim_start();
+        if reads.tuner_presets && text.starts_with("TPANMEM") {
+            Some(Self::TunerPresets)
+        } else if reads.favorites && text.starts_with("NSC") {
+            Some(Self::NetworkFavorites)
+        } else {
+            None
+        }
+    }
+
+    /// Ask the receiver for the names. It does not wait for the answers.
+    pub async fn read(self, avr: &Avr) {
+        let result = match self {
+            Self::TunerPresets => avr.tuner().request_presets().await,
+            Self::NetworkFavorites => {
+                let names = Command::NetworkAudio(NetworkAudioCommand::PresetNames);
+                avr.send(Zone::Main, names).await
+            }
+        };
+        if let Err(e) = result {
+            debug!("{self:?} not read: {e}");
+        }
+    }
+
+    /// The stored names with the ones that the receiver reported. `None` if nothing changed. It
+    /// compares first, with one text buffer: while tuning, the presets do not change.
+    pub fn merged(self, cfg: &DeviceConfig, state: &State) -> Option<Vec<String>> {
+        let device = state.device();
+        let (stored, count) = match self {
+            Self::TunerPresets => (&cfg.tuner_preset_names, device.tuner.presets.len()),
+            Self::NetworkFavorites => (
+                &cfg.network_favorite_names,
+                device.network_preset_names.len(),
+            ),
+        };
+        // Write the reported text of entry `i` into `text`. False if it was not reported.
+        let reported = |i: usize, text: &mut String| -> bool {
+            text.clear();
+            match self {
+                // A preset that the receiver reported has a frequency.
+                Self::TunerPresets => {
+                    let preset = &device.tuner.presets[i];
+                    let name = preset
+                        .name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|n| !n.is_empty());
+                    match (name, preset.frequency) {
+                        (Some(name), _) => text.push_str(name),
+                        (None, Some(frequency)) => {
+                            use std::fmt::Write;
+                            let _ = write!(text, "{frequency}");
+                        }
+                        (None, None) => return false,
+                    }
+                }
+                // The answers come in order: the names up to the last one are reported.
+                Self::NetworkFavorites => {
+                    text.push_str(
+                        device.network_preset_names[i]
+                            .as_deref()
+                            .map_or("", str::trim),
+                    );
+                }
+            }
+            true
+        };
+        let mut text = String::new();
+        let changed = (0..count).any(|i| {
+            reported(i, &mut text) && stored.get(i).map(String::as_str) != Some(text.as_str())
+        });
+        if !changed {
+            return None;
+        }
+        let mut merged = stored.clone();
+        if merged.len() < count {
+            merged.resize(count, String::new());
+        }
+        for (i, slot) in merged.iter_mut().enumerate().take(count) {
+            if reported(i, &mut text) {
+                slot.clone_from(&text);
+            }
+        }
+        Some(merged)
+    }
+}
+
+/// What the source of the main zone plays, from its name or the code of a renamed source.
+fn main_playing_kind(state: &State) -> Option<PlayingKind> {
+    let source = state.zone(Zone::Main).source.as_deref()?;
+    playing_kind(source).or_else(|| {
+        state
+            .device()
+            .sources
+            .as_slice()
+            .iter()
+            .find(|info| info.name.as_deref() == Some(source))
+            .and_then(|info| playing_kind(&info.code))
+    })
 }
 
 /// What the configuration keeps of the receiver.
@@ -785,5 +988,73 @@ mod page_tests {
         read_missing_pages(avr, missing, "AVR".into(), Duration::from_millis(10), || ()).await;
         drop(held);
         assert_eq!(1, web.requests(AUDIO_PAGE));
+    }
+}
+
+#[cfg(test)]
+mod tuner_tests {
+    use super::*;
+    use crate::test_support::FakeTelnet;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn an_answer_to_the_tuner_query_means_a_tuner() {
+        let telnet = FakeTelnet::start(|line| match line {
+            "PW?" => vec!["PWON".to_owned()],
+            "TFAN?" => vec!["TFAN010110".to_owned()],
+            _ => Vec::new(),
+        })
+        .await;
+        assert_eq!(Some(true), probe_tuner("127.0.0.1", telnet.port).await);
+    }
+
+    #[tokio::test]
+    async fn no_answer_means_no_tuner() {
+        let telnet = FakeTelnet::start(|line| match line {
+            "PW?" => vec!["PWON".to_owned()],
+            _ => Vec::new(),
+        })
+        .await;
+        assert_eq!(Some(false), probe_tuner("127.0.0.1", telnet.port).await);
+    }
+
+    #[tokio::test]
+    async fn it_is_not_known_in_standby_or_with_a_closed_port() {
+        let telnet = FakeTelnet::start(|line| match line {
+            "PW?" => vec!["PWSTANDBY".to_owned()],
+            "TMAN?" => vec!["TMANFM".to_owned()],
+            _ => Vec::new(),
+        })
+        .await;
+        assert_eq!(None, probe_tuner("127.0.0.1", telnet.port).await);
+        assert_eq!(0, telnet.count("TMAN?"));
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("address")
+            .port();
+        assert_eq!(None, probe_tuner("127.0.0.1", closed).await);
+    }
+
+    #[tokio::test]
+    async fn an_answer_in_two_parts_is_found() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("address").port();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buffer = [0_u8; 64];
+            let _ = stream.read(&mut buffer).await;
+            stream.write_all(b"PWO").await.expect("write");
+            sleep(Duration::from_millis(50)).await;
+            stream.write_all(b"N\r").await.expect("write");
+            let _ = stream.read(&mut buffer).await;
+            stream.write_all(b"MVMAX 98\rT").await.expect("write");
+            sleep(Duration::from_millis(50)).await;
+            stream.write_all(b"MANFM\r").await.expect("write");
+            sleep(Duration::from_secs(5)).await;
+        });
+        assert_eq!(Some(true), probe_tuner("127.0.0.1", port).await);
     }
 }

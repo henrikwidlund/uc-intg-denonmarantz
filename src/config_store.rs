@@ -145,6 +145,14 @@ pub struct DeviceConfig {
         deserialize_with = "none_if_unknown"
     )]
     pub has_tuner: Option<bool>,
+    /// The setup option "Receiver has a tuner". It wins over `has_tuner`. `None` until the
+    /// receiver is set up with this driver.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "none_if_unknown"
+    )]
+    pub tuner: Option<bool>,
     /// The tuner presets are `A1` to `G8` (`true`) or `01` to `56` (`false`). The receiver shows it
     /// in its preset answers. `None` until it did.
     #[serde(
@@ -153,6 +161,13 @@ pub struct DeviceConfig {
         deserialize_with = "none_if_unknown"
     )]
     pub tuner_presets_lettered: Option<bool>,
+    /// The tuner presets as the select shows them: the name, or the frequency for a preset without
+    /// a name. The first is preset 1. Kept, so the select shows them before the receiver is asked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tuner_preset_names: Vec<String>,
+    /// The names of the network favorites. The first is favorite 1, empty if it has no name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub network_favorite_names: Vec<String>,
     /// What the library found at the last full connect. With it, the next connect sends no
     /// request. A value from another library version that does not load is `None`.
     #[serde(
@@ -301,6 +316,8 @@ pub enum Feature {
     SourceMenu,
     /// `NS` commands of network audio before HEOS.
     NetworkAudio,
+    /// The tuner: the setup option, else all but a receiver that reports no tuner.
+    Tuner,
     /// `SD7.1IN`: the 7.1 channel input.
     SevenOneIn,
 }
@@ -322,6 +339,7 @@ impl Feature {
             "source_menu" => Self::SourceMenu,
             "network_audio" => Self::NetworkAudio,
             "seven_one_in" => Self::SevenOneIn,
+            "tuner" => Self::Tuner,
             _ => return None,
         })
     }
@@ -477,6 +495,12 @@ impl DeviceConfig {
         use Generation::{
             Current, Denon2013 as D13, Denon2015 as D15, Marantz2013 as M13, Unknown,
         };
+        if matches!(feature, Feature::Tuner) {
+            return match self.tuner {
+                Some(tuner) => tuner,
+                None => !matches!(self.has_tuner, Some(false)),
+            };
+        }
         let generation = self.generation();
         if matches!(generation, Unknown) {
             return true;
@@ -497,6 +521,7 @@ impl DeviceConfig {
             Feature::EffectSpeakersOff => matches!(generation, D13 | M13),
             Feature::DialogLevel => matches!(generation, D15),
             Feature::SevenOneIn => !matches!(generation, D13),
+            Feature::Tuner => true,
         }
     }
 
@@ -518,8 +543,9 @@ impl DeviceConfig {
     }
 
     /// Take what a device actor found on the receiver: the address, the receiver kind, the ids,
-    /// the receiver values and the form of the tuner presets. The other fields are settings and
-    /// keep their values. `None` if nothing changed, else whether the receiver kind changed.
+    /// the receiver values, the form of the tuner presets and the names of the presets and
+    /// favorites. The other fields are settings and keep their values. `None` if nothing changed,
+    /// else whether the receiver kind changed.
     pub fn take_found(&mut self, found: Self) -> Option<bool> {
         let kind = found.kind();
         let new_kind = kind != self.kind();
@@ -527,8 +553,25 @@ impl DeviceConfig {
         let new_info = found.info.is_some() && self.info != found.info;
         let new_form = found.tuner_presets_lettered.is_some()
             && self.tuner_presets_lettered != found.tuner_presets_lettered;
-        if self.address == found.address && !new_kind && !new_ids && !new_info && !new_form {
+        let new_presets = !found.tuner_preset_names.is_empty()
+            && self.tuner_preset_names != found.tuner_preset_names;
+        let new_favorites = !found.network_favorite_names.is_empty()
+            && self.network_favorite_names != found.network_favorite_names;
+        if self.address == found.address
+            && !new_kind
+            && !new_ids
+            && !new_info
+            && !new_form
+            && !new_presets
+            && !new_favorites
+        {
             return None;
+        }
+        if new_presets {
+            self.tuner_preset_names = found.tuner_preset_names;
+        }
+        if new_favorites {
+            self.network_favorite_names = found.network_favorite_names;
         }
         if new_info {
             self.info = found.info;
@@ -996,6 +1039,9 @@ mod tests {
             comm_api_version: None,
             has_tuner: None,
             tuner_presets_lettered: None,
+            tuner: None,
+            tuner_preset_names: Vec::new(),
+            network_favorite_names: Vec::new(),
             info: None,
         }
     }
@@ -1127,6 +1173,21 @@ mod tests {
             "{text}"
         );
         assert_eq!(d, serde_json::from_str(&text).expect("json"));
+    }
+
+    #[test]
+    fn the_tuner_option_wins_over_deviceinfo() {
+        let with = |tuner, has_tuner| {
+            DeviceConfig {
+                has_tuner,
+                tuner,
+                ..device()
+            }
+            .offers(Feature::Tuner)
+        };
+        assert!(with(None, None) && with(None, Some(true)));
+        assert!(!with(None, Some(false)));
+        assert!(!with(Some(false), Some(true)) && with(Some(true), Some(false)));
     }
 
     #[test]

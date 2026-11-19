@@ -3,7 +3,7 @@
 
 //! Media player entity.
 
-use crate::config_store::DeviceConfig;
+use crate::config_store::{DeviceConfig, Feature};
 use crate::entities::sensor::{self, absolute_volume};
 use crate::entities::{View, is_off, select, simple_commands};
 use crate::errors::ServiceError;
@@ -48,7 +48,6 @@ const FEATURES: &[F] = &[
     F::Menu,
     F::ContextMenu,
     F::Info,
-    F::ChannelSwitcher,
 ];
 
 /// Commands that every receiver has, in the names of the Python integration.
@@ -81,6 +80,10 @@ pub fn definition(mut entity: AvailableIntgEntity, cfg: &DeviceConfig) -> Availa
     let mut features: Vec<String> = FEATURES.iter().map(|f| f.as_ref().to_string()).collect();
     if cfg.support_sound_mode {
         features.push(F::SelectSoundMode.as_ref().to_string());
+    }
+    // Channel up and down select the tuner presets.
+    if cfg.offers(Feature::Tuner) {
+        features.push(F::ChannelSwitcher.as_ref().to_string());
     }
     // HEOS stops on both brands.
     if cfg.is_denon || cfg.may_have_heos() {

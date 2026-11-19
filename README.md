@@ -7,10 +7,10 @@ The driver is an alternative to the Python integration that is part of the Remot
 driver id (`denonavr_rs`), because the Python integration cannot be stopped or uninstalled. The `config.json`,
 the entity names and the command names are the same, so receivers that are set up with the Python integration
 work without a new setup. The driver adds what it finds on the receiver to `config.json`: the serial number,
-the MAC address, the receiver type, the HTTP read method, if the HDMI output can be read over HTTP, the number of quick selects, the values
-that the receiver lists for HTTP, `CommApiVers` (the protocol generation), if the receiver has a tuner, the
-form of the tuner presets, and what the last full connect found (`info`). The
-Python integration ignores them.
+the MAC address, the receiver type, the HTTP read method, if the HDMI output can be read over HTTP, the
+number of quick selects, the values that the receiver lists for HTTP, `CommApiVers` (the protocol
+generation), if the receiver has a tuner, the form and names of the tuner presets, the names of the network
+favorites, and what the last full connect found (`info`). The Python integration ignores them.
 
 The device id in the entity ids is the MAC address of the receiver. Receivers from about 2011 and older do not
 give it: they use the serial number. Receivers that are set up with the Python integration keep the serial
@@ -50,8 +50,16 @@ Bluetooth or with zone 2. Please report problems as
   digital codec. Some signal sensors also exist with HTTP only.
 
 With telnet, all entities exist on every receiver, except the Dirac select and sensor, which need a
-receiver with Dirac, and the entities of [older receivers](#older-receivers). A value that the receiver does not have, for example the picture mode
-of a newer receiver or the Audyssey settings of a receiver without Audyssey, shows `--`. A setting that the
+receiver with Dirac, and the entities of [older receivers](#older-receivers). A receiver without an AM/FM
+tuner gets no tuner band and tuner preset selects, no tuner frequency sensor, no tuner commands and buttons,
+and no channel up and down. The setup option "Receiver has an AM/FM tuner" decides this. Its default comes
+from `Deviceinfo.xml`, else, if the receiver is on, from asking it for its tuner band and frequency over
+telnet (no answer means no tuner). If neither works, the setup asks: turn the receiver on before the setup to
+let the driver find it out. Many newer models have a tuner only in North America, and some have an analog input named
+`TUNER` without a tuner, so `Deviceinfo.xml` often cannot tell. A receiver taken over from the Python
+integration has the tuner parts until it is configured again. A value that the receiver does not have, for
+example the picture mode of a newer receiver or the Audyssey settings of a receiver without Audyssey, shows
+`--`. A setting that the
 receiver does not accept in its current state, for example the reference level without Dynamic EQ or the tone
 control with a Dirac filter, is ignored. The driver answers OK, so the Remote shows no error, and writes a line
 to the log that says why.
@@ -80,10 +88,13 @@ that it does not have, so a button can do nothing on some models.
   Dialog Level Adjust and dialog level, Audyssey DSX, stage width and height, height gain, InstaPrevue. The
   driver asks for these values after each connect.
 - Selects (telnet): network favorites on receivers without HEOS (36 on Denon 0250 and 0300, else 56), and the
-  tuner presets on receivers that may have a tuner. They show the names that the receiver reports. On older
-  receivers a tuner preset is selected only after the receiver has shown if its presets are `01` to `56` or
-  `A1` to `G8`; the driver saves this. Receivers with 0301 and higher use `01` to `56`. On some older US
-  models the receiver does not report the tuner frequency and preset.
+  tuner presets on receivers that may have a tuner. They show the names that the receiver reports, or the
+  frequency of a tuner preset without a name. The driver asks for the names once per connection, the first
+  time the receiver is on and the tuner or network audio plays, and keeps them in `config.json`. Until then the selects show
+  `Preset n` and `Favorite n`. On older receivers a tuner preset is selected only after the receiver has
+  shown if its presets are `01` to `56` or `A1` to `G8`; the driver saves this. Receivers with 0301 and
+  higher use `01` to `56`. On some older US models the receiver does not report the tuner frequency and
+  preset.
 
 Commands with a number are sent as raw text with the remote entity:
 

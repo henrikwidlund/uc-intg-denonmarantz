@@ -144,6 +144,11 @@ pub fn supported(cfg: &DeviceConfig) -> Vec<&'static str> {
         .collect()
 }
 
+/// The command is one of the tuner.
+pub fn needs_tuner(name: &str) -> bool {
+    get(name).is_some_and(|e| matches!(e.feature, Some(Feature::Tuner)))
+}
+
 pub fn get(name: &str) -> Option<&'static Entry> {
     INDEX.get(name).copied()
 }
@@ -241,6 +246,9 @@ mod tests {
             comm_api_version: None,
             has_tuner: None,
             tuner_presets_lettered: None,
+            tuner: None,
+            tuner_preset_names: Vec::new(),
+            network_favorite_names: Vec::new(),
             info: None,
         }
     }
@@ -265,7 +273,7 @@ mod tests {
         let python = |c: &DeviceConfig| {
             supported(c)
                 .into_iter()
-                .filter(|n| get(n).is_some_and(|e| e.feature.is_none()))
+                .filter(|n| get(n).is_some_and(|e| e.feature.is_none_or(|f| f == Feature::Tuner)))
                 .count()
         };
         assert_eq!(368, python(&cfg(true, true)));

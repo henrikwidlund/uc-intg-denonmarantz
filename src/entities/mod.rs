@@ -323,6 +323,15 @@ pub fn attributes(v: &View<'_>, kind: EntityKind, out: &mut Map<String, Value>) 
     }
 }
 
+/// Insert the attributes of an entity, but only the current option of a select with many
+/// options. See [`select::current_attributes`].
+pub fn current_attributes(v: &View<'_>, kind: EntityKind, out: &mut Map<String, Value>) {
+    match kind {
+        EntityKind::Select(k) => select::current_attributes(v, k, out),
+        _ => attributes(v, kind, out),
+    }
+}
+
 const fn entity_name_suffix(kind: EntityKind) -> &'static str {
     match kind {
         EntityKind::MediaPlayer => "",
@@ -387,6 +396,9 @@ pub(crate) mod tests {
             comm_api_version: None,
             has_tuner: None,
             tuner_presets_lettered: None,
+            tuner: None,
+            tuner_preset_names: Vec::new(),
+            network_favorite_names: Vec::new(),
             info: None,
         }
     }

@@ -36,6 +36,8 @@ const CONNECT_WAIT: Duration = Duration::from_secs(3);
 const STABLE_CONNECTION: Duration = Duration::from_secs(60);
 /// Changes come in bursts. Entity attributes are sent once after the last one.
 const EMIT_DELAY: Duration = Duration::from_millis(50);
+/// The wait after the last answer with a name before the names are saved.
+const NAMES_SAVE_DELAY: Duration = Duration::from_secs(1);
 /// A new speaker preset or Dirac filter changes values that the receiver does not send again.
 /// They are read after the burst of events is over.
 const RELOAD_DELAY: Duration = Duration::from_millis(1500);
@@ -165,6 +167,8 @@ struct Timers {
     telnet: Option<SpawnHandle>,
     /// The HEOS connect, or the wait before it is tried again.
     heos: Option<SpawnHandle>,
+    /// The save of the names of the tuner presets and network favorites, after their answers stop.
+    names: Option<SpawnHandle>,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -219,6 +223,10 @@ pub struct DenonActor {
     signal_polling: bool,
     /// A read after a telnet reconnect is running.
     refreshing: bool,
+    /// The names that were asked on this telnet connection, as bits of `Names::bit`.
+    names_asked: u8,
+    /// The names that changed and are not saved yet, as bits of `Names::bit`.
+    names_pending: u8,
     /// The connection was closed on request: the entities keep their state.
     keep_state: bool,
     attempts: u32,
@@ -239,8 +247,8 @@ pub struct DenonActor {
     dirty_full: bool,
     /// The entities that show the changed settings, as bits of `part_bit`.
     dirty_part: u8,
-    /// The network favorite and tuner preset selects must be sent at the next emit. They have up
-    /// to 56 options each, so they are built only when these change.
+    /// The options of the network favorite and tuner preset selects must be built at the next
+    /// emit. Without it, these selects give only their current option: they have up to 56 options.
     dirty_labels: bool,
     /// A read of the values that depend on the speaker preset and the filter is planned.
     reload_due: bool,
@@ -300,6 +308,8 @@ impl DenonActor {
             poll_failures: 0,
             signal_polling: false,
             refreshing: false,
+            names_asked: 0,
+            names_pending: 0,
             keep_state: false,
             attempts: 0,
             look_up: false,
@@ -328,16 +338,18 @@ impl DenonActor {
         self.emit_changed();
     }
 
-    /// Send the attributes of all entities, but the selects with many options only if they changed.
+    /// Send the attributes of all entities. The selects with many options give only their current
+    /// option, unless their options changed.
     fn emit_changed(&mut self) {
         self.dirty_full = false;
         self.dirty_part = 0;
         let labels = std::mem::take(&mut self.dirty_labels);
-        self.emit_kinds(|kind| labels || !has_many_options(kind));
+        self.emit_kinds(|_| true, labels);
     }
 
-    /// Send the attributes of the entities that `keep` takes.
-    fn emit_kinds(&mut self, keep: impl Fn(EntityKind) -> bool) {
+    /// Send the attributes of the entities that `keep` takes. Without `labels`, the selects with
+    /// many options give only their current option.
+    fn emit_kinds(&mut self, keep: impl Fn(EntityKind) -> bool, labels: bool) {
         if let Some(avr) = &self.avr {
             self.last_artwork = avr.artwork_url();
             if let Some(mode) = select::active_sound_mode(&avr.state().borrow(), self.sound_groups)
@@ -347,8 +359,8 @@ impl DenonActor {
             }
         }
         let changes = self.heos.as_ref().map_or_else(
-            || self.build(None, &keep),
-            |link| link.with_player(|player| self.build(player, &keep)),
+            || self.build(None, &keep, labels),
+            |link| link.with_player(|player| self.build(player, &keep, labels)),
         );
         self.controller.do_send(DeviceEvent::Changes {
             key: self.key.clone(),
@@ -361,6 +373,7 @@ impl DenonActor {
         &self,
         heos: Option<&PlayerState>,
         keep: impl Fn(EntityKind) -> bool,
+        labels: bool,
     ) -> Vec<(EntityKind, Map<String, serde_json::Value>)> {
         let connected = self.linked() || self.keep_state;
         let artwork = self.last_artwork.as_deref();
@@ -380,7 +393,7 @@ impl DenonActor {
                 heos,
                 position: self.heos_position.map(|p| p.shown),
             };
-            build_changes(&view, keep)
+            build_changes(&view, keep, labels)
         } else {
             let view = View {
                 state: &self.last,
@@ -393,7 +406,7 @@ impl DenonActor {
                 heos: None,
                 position: None,
             };
-            build_changes(&view, keep)
+            build_changes(&view, keep, labels)
         }
     }
 
@@ -405,7 +418,7 @@ impl DenonActor {
             return;
         }
         let part = std::mem::take(&mut self.dirty_part);
-        self.emit_kinds(|kind| part_bit(kind) & part != 0);
+        self.emit_kinds(|kind| part_bit(kind) & part != 0, false);
     }
 
     /// The receiver answers: telnet is connected, or the last read over HTTP worked.
@@ -459,7 +472,9 @@ impl DenonActor {
             Some(part) => self.dirty_part |= part,
             None => self.dirty_full = true,
         }
-        if matches!(setting, Setting::Tuner | Setting::NetworkPresetNames) {
+        // The selects with many options have no options while the receiver is off. New names
+        // come with `save_names`.
+        if setting == Setting::Power {
             self.dirty_labels = true;
         }
         self.arm_emit(ctx);
@@ -593,6 +608,7 @@ impl DenonActor {
         self.http_ok = true;
         self.telnet_up =
             self.cfg.use_telnet && *avr.telnet_status().borrow() == TelnetStatus::Connected;
+        self.names_asked = 0;
         self.early_tx.send_replace(None);
         self.paused = false;
         // The list of the receiver can be another one now. With telnet, the list can still come.
@@ -907,6 +923,71 @@ impl DenonActor {
         });
     }
 
+    /// Ask the names of the tuner presets or network favorites once per telnet connection, when the
+    /// main zone is on and plays the tuner or network audio. The names are not asked while they are
+    /// not used.
+    fn ask_names(&mut self) {
+        let Some(avr) = self.avr.clone().filter(|_| self.telnet_up) else {
+            return;
+        };
+        let reads = discovery::ExtraReads::new(&self.cfg);
+        let Some(names) = discovery::Names::in_use(reads, &avr.state().borrow()) else {
+            return;
+        };
+        if self.names_asked & names.bit() != 0 {
+            return;
+        }
+        self.names_asked |= names.bit();
+        actix::spawn(async move { names.read(&avr).await });
+    }
+
+    /// Save the names when no answer came for `NAMES_SAVE_DELAY`. The answers of all 56 presets
+    /// take about 6 seconds.
+    fn schedule_names_save(&mut self, names: discovery::Names, ctx: &mut Context<Self>) {
+        self.names_pending |= names.bit();
+        if let Some(handle) = self.timers.names.take() {
+            ctx.cancel_future(handle);
+        }
+        self.timers.names = Some(ctx.run_later(NAMES_SAVE_DELAY, |act, _| {
+            act.timers.names = None;
+            act.save_names();
+        }));
+    }
+
+    /// Store the new names that are pending. The controller saves them. The select shows the
+    /// stored names.
+    fn save_names(&mut self) {
+        let pending = std::mem::take(&mut self.names_pending);
+        let Some(avr) = &self.avr else { return };
+        let mut changed = false;
+        for names in [
+            discovery::Names::TunerPresets,
+            discovery::Names::NetworkFavorites,
+        ] {
+            if pending & names.bit() == 0 {
+                continue;
+            }
+            let Some(merged) = names.merged(&self.cfg, &avr.state().borrow()) else {
+                continue;
+            };
+            match names {
+                discovery::Names::TunerPresets => self.cfg.tuner_preset_names = merged,
+                discovery::Names::NetworkFavorites => self.cfg.network_favorite_names = merged,
+            }
+            changed = true;
+        }
+        if !changed {
+            return;
+        }
+        self.dirty_labels = true;
+        self.dirty_full = true;
+        self.flush_emit();
+        self.controller.do_send(DeviceEvent::Config {
+            key: self.key.clone(),
+            cfg: Box::new(self.cfg.clone()),
+        });
+    }
+
     /// Take what the configuration keeps of the receiver: the generation, the HTTP read method, the
     /// HDMI output over HTTP, the number of quick selects, the receiver values for the next connect,
     /// and the serial number and MAC address if they are not stored yet. A configuration of the
@@ -1097,6 +1178,11 @@ impl DenonActor {
 
     /// Close the connection and stop all tasks of it.
     fn close(&mut self, ctx: &mut Context<Self>) {
+        // Names that came before the close are saved now: the next connection may not ask again.
+        if let Some(handle) = self.timers.names.take() {
+            ctx.cancel_future(handle);
+            self.save_names();
+        }
         self.generation += 1;
         self.attempt.send_modify(|a| *a += 1);
         // A connection that drops at once keeps the reconnect delay growing.
@@ -1146,9 +1232,17 @@ impl DenonActor {
         let heos = self.timers.heos.take();
         let t = std::mem::take(&mut self.timers);
         self.timers.heos = heos;
-        for handle in [t.connect, t.reconnect, t.poll, t.signal, t.pages, t.telnet]
-            .into_iter()
-            .flatten()
+        for handle in [
+            t.connect,
+            t.reconnect,
+            t.poll,
+            t.signal,
+            t.pages,
+            t.telnet,
+            t.names,
+        ]
+        .into_iter()
+        .flatten()
         {
             ctx.cancel_future(handle);
         }
@@ -1464,8 +1558,7 @@ const fn part_bit(kind: EntityKind) -> u8 {
     }
 }
 
-/// The selects with many options: they change only with `Setting::Tuner` or
-/// `Setting::NetworkPresetNames`.
+/// The selects with many options: their options change only with the power or new stored names.
 const fn has_many_options(kind: EntityKind) -> bool {
     matches!(
         kind,
@@ -1477,12 +1570,17 @@ const fn has_many_options(kind: EntityKind) -> bool {
 fn build_changes(
     view: &View<'_>,
     keep: impl Fn(EntityKind) -> bool,
+    labels: bool,
 ) -> Vec<(EntityKind, Map<String, serde_json::Value>)> {
     EntityKind::all(view.cfg)
         .filter(|kind| keep(*kind))
         .map(|kind| {
             let mut attrs = Map::new();
-            entities::attributes(view, kind, &mut attrs);
+            if labels || !has_many_options(kind) {
+                entities::attributes(view, kind, &mut attrs);
+            } else {
+                entities::current_attributes(view, kind, &mut attrs);
+            }
             (kind, attrs)
         })
         .collect()
@@ -1572,8 +1670,20 @@ impl Handler<Changed> for DenonActor {
             if change.setting == Setting::SoundModes {
                 self.sound_mode = None;
             }
-            if change.setting == Setting::Tuner {
-                self.save_preset_form();
+            match change.setting {
+                Setting::Tuner => {
+                    self.save_preset_form();
+                    self.schedule_names_save(discovery::Names::TunerPresets, ctx);
+                }
+                Setting::NetworkPresetNames => {
+                    self.schedule_names_save(discovery::Names::NetworkFavorites, ctx);
+                }
+                Setting::Source | Setting::Power
+                    if change.zone.is_none_or(|z| z == denon_marantz::Zone::Main) =>
+                {
+                    self.ask_names();
+                }
+                _ => {}
             }
             self.schedule_emit_for(change.setting, ctx);
         } else {
@@ -1592,6 +1702,7 @@ impl Handler<StartSynced> for DenonActor {
         }
         // A receiver without a list has sent none until now: the groups are the choices.
         self.sound_groups = true;
+        self.ask_names();
         self.schedule_emit(ctx);
     }
 }
@@ -1630,6 +1741,10 @@ impl Handler<LinkChanged> for DenonActor {
             if msg.1 { "connected" } else { "disconnected" }
         );
         self.telnet_up = msg.1;
+        if msg.1 {
+            self.names_asked = 0;
+            self.ask_names();
+        }
         // After a reconnect, the library asks for its own groups again. The driver reads what only
         // HTTP gives and its extra values: asking for all groups again would repeat the queries.
         if msg.1
@@ -2044,6 +2159,9 @@ mod tests {
             comm_api_version: None,
             has_tuner: None,
             tuner_presets_lettered: None,
+            tuner: None,
+            tuner_preset_names: Vec::new(),
+            network_favorite_names: Vec::new(),
             info: None,
         }
     }
@@ -2074,7 +2192,7 @@ mod tests {
                 heos: None,
                 position: None,
             };
-            build_changes(&view, |_| true)
+            build_changes(&view, |_| true, true)
         };
         all(before)
             .into_iter()
