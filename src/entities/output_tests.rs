@@ -262,15 +262,13 @@ fn network_audio_without_text_shows_no_title() {
 }
 
 /// The state of the fake HEOS player.
-async fn heos_player(item: crate::test_support::HeosItem) -> denon_marantz_heos::PlayerState {
-    use crate::device::heos;
+async fn heos_player(item: crate::test_support::HeosItem) -> denon_marantz::heos::PlayerState {
     use crate::test_support::FakeHeos;
     let fake = FakeHeos::start("127.0.0.1", item).await;
-    heos::TEST_HEOS.with(|slot| slot.set(Some(fake.config())));
-    let heos::Connected::Player(link) = heos::connect("127.0.0.1").await.expect("connect") else {
-        panic!("no player");
-    };
-    link.with_player(|p| p.cloned()).expect("state")
+    let heos = denon_marantz::heos::Heos::connect_with("127.0.0.1", fake.config())
+        .await
+        .expect("connect");
+    heos.players().into_iter().next().expect("state")
 }
 
 #[tokio::test]

@@ -10,10 +10,10 @@ use crate::entities::{
     EntityKind, SelectKind, View, is_off, number, remote, select, simple_commands, switch,
 };
 use crate::errors::ServiceError;
+use denon_marantz::heos::PlayState;
 use denon_marantz::proto::Power;
 use denon_marantz::proto::telnet::Message;
 use denon_marantz::{Avr, Command, RemoteKey, State, Zone};
-use denon_marantz_heos::PlayState;
 use serde_json::{Map, Value};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -310,7 +310,8 @@ pub const fn is_heos_action(action: &Action) -> bool {
 
 /// The media player shows HEOS: the actions of [`is_heos_action`] go to HEOS.
 pub fn heos_in_use(heos: &heos::Link, state: &State) -> bool {
-    heos.with_player(|p| p.is_some_and(|p| media_player::uses_heos(state, p)))
+    heos.with_player(|p| media_player::uses_heos(state, p))
+        .unwrap_or(false)
 }
 
 /// Run an action of [`is_heos_action`] on HEOS, for at most [`HEOS_COMMAND_LIMIT`].

@@ -15,12 +15,11 @@ default = ["mdns-sd"]
 mdns-sd = ["dep:mdns-sd"]
 # Trace logs with the full telnet and HEOS lines. They can hold titles and account names: only
 # for tests, never in a release.
-sensitive-logs = ["denon-marantz/sensitive-logs", "denon-marantz-heos/sensitive-logs"]
+sensitive-logs = ["denon-marantz/sensitive-logs"]
 
 [dependencies]
 uc_api = { git = "https://github.com/unfoldedcircle/api-model-rs", rev = "336beb1" }
-denon-marantz = { git = "https://github.com/henrikwidlund/rusty-denon-marantz", rev = "a8dae9cd529080146a72617b8f0388144ab58f41", features = ["mdns", "serde"] }
-denon-marantz-heos = { git = "https://github.com/henrikwidlund/rusty-denon-marantz", rev = "a8dae9cd529080146a72617b8f0388144ab58f41" }
+denon-marantz = { git = "https://github.com/henrikwidlund/rusty-denon-marantz", rev = "a70ce1e71ce0161a03ede27a58f8193f93c70417", features = ["mdns", "serde", "heos"] }
 
 # WebSocket server
 actix = "0.13.6"

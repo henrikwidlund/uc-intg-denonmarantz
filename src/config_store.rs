@@ -263,13 +263,9 @@ impl CommApiVersion {
         text.parse().ok().map(Self)
     }
 
-    /// The receiver has HEOS. `None` if the receiver does not report a version.
-    pub const fn heos(self) -> Option<bool> {
-        if self.0 == Self::MISSING.0 {
-            None
-        } else {
-            Some(self.0 >= Self::HEOS.0)
-        }
+    /// The receiver has HEOS. A receiver that does not report a version has none.
+    pub const fn heos(self) -> bool {
+        self.0 >= Self::HEOS.0
     }
 }
 
@@ -468,10 +464,10 @@ impl DeviceConfig {
         }
     }
 
-    /// The receiver has HEOS, from `CommApiVers`. `None` if it is not known.
+    /// The receiver has HEOS, from `CommApiVers`. `None` before the version is read.
     const fn heos(&self) -> Option<bool> {
         match self.comm_api_version {
-            Some(v) => v.heos(),
+            Some(v) => Some(v.heos()),
             None => None,
         }
     }
@@ -1208,9 +1204,30 @@ mod tests {
                 serde_json::from_str::<CommApiVersion>(text).expect("json")
             );
         }
-        assert_eq!(None, CommApiVersion::MISSING.heos());
-        assert_eq!(Some(false), CommApiVersion(300).heos());
-        assert_eq!(Some(true), CommApiVersion(301).heos());
+        assert!(!CommApiVersion::MISSING.heos());
+        assert!(!CommApiVersion(300).heos());
+        assert!(CommApiVersion(301).heos());
+    }
+
+    #[test]
+    fn only_a_receiver_that_was_not_read_yet_may_have_heos() {
+        let may = |comm_api_version, receiver_type| {
+            DeviceConfig {
+                receiver_type,
+                comm_api_version,
+                ..device()
+            }
+            .may_have_heos()
+        };
+        assert!(may(None, None));
+        assert!(may(None, Some(ReceiverGeneration::AvrX)));
+        assert!(!may(None, Some(ReceiverGeneration::Avr)));
+        assert!(!may(
+            Some(CommApiVersion::MISSING),
+            Some(ReceiverGeneration::AvrX)
+        ));
+        assert!(!may(CommApiVersion::parse("0300"), None));
+        assert!(may(CommApiVersion::parse("0301"), None));
     }
 
     #[test]

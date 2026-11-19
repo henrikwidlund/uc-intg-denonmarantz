@@ -698,6 +698,11 @@ pub fn test_builder(
         // The fake answers the pages of the web interface with 404.
         .web_interface_port(http_port)
         .telnet_config(telnet_config)
+        .heos_config(
+            crate::device::heos::TEST_HEOS
+                .with(std::cell::Cell::get)
+                .unwrap_or_default(),
+        )
         .follow_up_read(None)
 }
 
@@ -765,7 +770,12 @@ pub struct FakeHeos {
 
 impl FakeHeos {
     pub async fn start(ip: &'static str, item: HeosItem) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        Self::start_at(0, ip, item).await
+    }
+
+    /// As [`FakeHeos::start`], on `port`. 0 picks a free port.
+    pub async fn start_at(port: u16, ip: &'static str, item: HeosItem) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", port))
             .await
             .expect("bind the fake HEOS port");
         let port = listener.local_addr().expect("address").port();
@@ -798,9 +808,12 @@ impl FakeHeos {
         }
     }
 
-    /// Give the player another address. The client sees it when it reads the players again.
+    /// Give the player another address, and tell the client that the players changed.
     pub fn move_player(&self, ip: &'static str) {
         *self.ip.lock().expect("lock") = ip;
+        let _ = self
+            .events
+            .send(r#"{"heos": {"command": "event/players_changed", "message": ""}}"#.to_owned());
     }
 
     /// From now on, commands that change the play state get no answer.
@@ -817,8 +830,8 @@ impl FakeHeos {
     }
 
     /// Settings of the HEOS client for this port, with short times.
-    pub const fn config(&self) -> denon_marantz_heos::HeosConfig {
-        denon_marantz_heos::HeosConfig {
+    pub const fn config(&self) -> denon_marantz::heos::HeosConfig {
+        denon_marantz::heos::HeosConfig {
             port: self.port,
             connect_timeout: Duration::from_millis(500),
             write_timeout: Duration::from_millis(500),

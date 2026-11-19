@@ -1558,8 +1558,7 @@ async fn heos_without_the_player_is_used_when_the_player_comes() {
     until("HEOS asked", 5, || heos.count("player/get_players") > 0).await;
     rig.telnet.send("PWON");
     rig.telnet.send("SINET");
-    let reads = heos.count("player/get_players");
-    until("read again", 5, || heos.count("player/get_players") > reads).await;
+    // The fake tells the client that the players changed.
     heos.move_player("127.0.0.1");
     let title = || entity_state(&rig.events, EntityKind::MediaPlayer, "media_title");
     until("the HEOS title", 5, || title() == Some("A Song".into())).await;
@@ -1569,7 +1568,7 @@ async fn heos_without_the_player_is_used_when_the_player_comes() {
 async fn a_heos_command_without_an_answer_does_not_hold_up_the_receiver_commands() {
     let heos = FakeHeos::start("127.0.0.1", HeosItem::song()).await;
     // The HEOS client waits longer than the driver.
-    let patient = denon_marantz_heos::HeosConfig {
+    let patient = denon_marantz::heos::HeosConfig {
         command_timeout: Duration::from_secs(20),
         slow_command_limit: Duration::from_secs(20),
         ..heos.config()
@@ -1609,7 +1608,7 @@ async fn a_heos_command_without_an_answer_does_not_hold_up_the_receiver_commands
 }
 
 #[actix::test]
-async fn the_heos_client_is_kept_while_the_receiver_connects_again() {
+async fn heos_is_opened_again_when_the_receiver_connects_again() {
     let heos = FakeHeos::start("127.0.0.1", HeosItem::song()).await;
     TEST_HEOS.with(|slot| slot.set(Some(heos.config())));
     let rig = rig(answers_all, QUICK).await;
@@ -1629,8 +1628,40 @@ async fn the_heos_client_is_kept_while_the_receiver_connects_again() {
         status_count(&rig.events, DeviceStatus::Connected) > connected
     })
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(reads, heos.count("player/get_players"));
+    // The `Avr` owns the HEOS connection: a new one opens HEOS again.
+    until("HEOS connected again", 5, || {
+        heos.count("player/get_players") > reads
+    })
+    .await;
+}
+
+#[actix::test]
+async fn a_failed_first_heos_connect_is_tried_again() {
+    // A closed port: HEOS refuses the first connects, then the fake opens on that port.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("address").port();
+    drop(listener);
+    let config = denon_marantz::heos::HeosConfig {
+        port,
+        ..FakeHeos::start("127.0.0.1", HeosItem::song())
+            .await
+            .config()
+    };
+    TEST_HEOS.with(|slot| slot.set(Some(config)));
+    let rig = rig(answers_all, QUICK).await;
+    until("connected", 5, || {
+        status_count(&rig.events, DeviceStatus::Connected) >= 1
+    })
+    .await;
+    rig.telnet.send("PWON");
+    rig.telnet.send("SINET");
+    // The connect of the start has failed by then, also where a refused connect ends only at the
+    // connect timeout (Windows).
+    tokio::time::sleep(config.connect_timeout + Duration::from_millis(200)).await;
+    let heos = FakeHeos::start_at(port, "127.0.0.1", HeosItem::song()).await;
+    let title = || entity_state(&rig.events, EntityKind::MediaPlayer, "media_title");
+    until("the HEOS title", 5, || title() == Some("A Song".into())).await;
+    assert!(heos.count("player/get_players") >= 1);
 }
 
 #[actix::test]

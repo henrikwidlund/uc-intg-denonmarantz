@@ -276,6 +276,9 @@ const TELNET_WAIT: Duration = Duration::from_secs(25);
 /// Start the receiver: read the zones, then telnet and the web pages follow in the background.
 pub async fn start(avr: &Arc<Avr>, telnet: bool) -> Result<Started, Error> {
     let options = StartOptions::new().telnet(telnet).telnet_wait(TELNET_WAIT);
+    // Tests open HEOS only with a fake.
+    #[cfg(test)]
+    let options = options.heos(super::heos::TEST_HEOS.with(std::cell::Cell::get).is_some());
     avr.start_with(options).await
 }
 

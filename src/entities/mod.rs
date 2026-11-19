@@ -23,7 +23,7 @@ mod output_tests;
 
 use crate::config_store::DeviceConfig;
 use denon_marantz::State;
-use denon_marantz_heos::PlayerState;
+use denon_marantz::heos::PlayerState;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use uc_api::EntityType;

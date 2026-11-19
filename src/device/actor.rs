@@ -3,7 +3,7 @@
 
 //! Actor for one receiver: connection, state updates and commands.
 
-use crate::config_store::{CommApiVersion, DeviceConfig};
+use crate::config_store::DeviceConfig;
 use crate::device::commands::{self, Expected};
 use crate::device::{
     Command, Connect, DeviceEvent, DeviceStatus, Disconnect, Stop, UpdateConfig, discovery, heos,
@@ -13,11 +13,11 @@ use crate::entities::{
 };
 use crate::errors::ServiceError;
 use actix::prelude::*;
+use denon_marantz::HeosPlayerStatus;
+use denon_marantz::heos::{Change as HeosChange, PlayState, PlayerState};
 use denon_marantz::{
-    Ask, Avr, Change, Error as AvrError, Info, Query, ReceiverType, Setting, Started, State,
-    TelnetStatus,
+    Ask, Avr, Change, Error as AvrError, Info, Query, Setting, Started, State, TelnetStatus,
 };
-use denon_marantz_heos::{Change as HeosChange, Heos, PlayState, PlayerState};
 use futures::StreamExt;
 use log::{debug, info, warn};
 use serde_json::Map;
@@ -53,20 +53,6 @@ const DISCONNECT_WAIT: Duration = Duration::from_secs(2);
 /// Time between reads of the state over HTTP, while telnet does not run. The Python integration
 /// reads every 10 seconds too.
 const HTTP_POLL_INTERVAL: Duration = Duration::from_secs(10);
-/// Waits before HEOS is asked again, while a receiver with HEOS does not answer or its player is
-/// not in the HEOS list. The last wait repeats. After a connect, the HEOS client connects again by
-/// itself.
-#[cfg(not(test))]
-const HEOS_WAITS: [Duration; 5] = [
-    Duration::from_secs(1),
-    Duration::from_secs(2),
-    Duration::from_secs(5),
-    Duration::from_secs(10),
-    Duration::from_secs(30),
-];
-#[cfg(test)]
-const HEOS_WAITS: [Duration; 5] = [Duration::from_millis(100); 5];
-
 /// A state change of the receiver. The generation tells which connection sent it.
 #[derive(Message)]
 #[rtype(result = "()")]
@@ -94,11 +80,17 @@ struct Early(u64, Arc<Avr>);
 #[rtype(result = "()")]
 struct InfoChanged(u64, u64, Info);
 
-/// The HEOS player or the HEOS connection changed. The generation tells which HEOS client sent it.
-/// The flag is set if only the position changed.
+/// A change of the HEOS players. The generation tells which connection sent it. `None` if changes
+/// were lost.
 #[derive(Message)]
 #[rtype(result = "()")]
-struct HeosChanged(u64, bool);
+struct HeosChanged(u64, Option<HeosChange>);
+
+/// The HEOS player of the receiver is ready, or not anymore. The generation tells which connection
+/// sent it.
+#[derive(Message)]
+#[rtype(result = "()")]
+struct HeosStatusChanged(u64, HeosPlayerStatus);
 
 /// A position that the media player shows, and when it was taken.
 #[derive(Debug, Clone, Copy)]
@@ -166,7 +158,7 @@ struct Timers {
     pages: Option<SpawnHandle>,
     /// The telnet connects after the start could not open telnet.
     telnet: Option<SpawnHandle>,
-    /// The HEOS connect, or the wait before it is tried again.
+    /// The HEOS connects after the first one failed.
     heos: Option<SpawnHandle>,
     /// The save of the names of the tuner presets and network favorites, after their answers stop.
     names: Option<SpawnHandle>,
@@ -180,16 +172,11 @@ pub struct DenonActor {
     key: Arc<str>,
     controller: Recipient<DeviceEvent>,
     avr: Option<Arc<Avr>>,
-    /// The HEOS player. It is kept while the receiver connects again and while the Remote sleeps:
-    /// the HEOS client connects again by itself. It changes only with the address.
+    /// The HEOS player, while the library has found it. The `Avr` owns the connection: each new
+    /// connection to the receiver opens HEOS again.
     heos: Option<heos::Link>,
-    /// Incremented when the HEOS client is dropped. Results and changes of an older one are
-    /// ignored.
+    /// Incremented when HEOS is dropped. Changes of an older connection are ignored.
     heos_generation: u64,
-    /// The address of the HEOS connect that runs or waits, or of the HEOS client.
-    heos_host: Option<String>,
-    /// How often HEOS was asked in a row without the player. Selects the wait in [`HEOS_WAITS`].
-    heos_attempt: usize,
     /// The position that the media player shows. See `View::position`.
     heos_position: Option<HeosPosition>,
     /// Last state of the receiver. Shown while there is no connection.
@@ -293,8 +280,6 @@ impl DenonActor {
             avr: None,
             heos: None,
             heos_generation: 0,
-            heos_host: None,
-            heos_attempt: 0,
             heos_position: None,
             last: State::new(true),
             last_artwork: None,
@@ -361,10 +346,17 @@ impl DenonActor {
                 self.sound_mode = Some(mode.to_owned());
             }
         }
-        let changes = self.heos.as_ref().map_or_else(
-            || self.build(None, &keep, labels),
-            |link| link.with_player(|player| self.build(player, &keep, labels)),
-        );
+        let player = |kind| kind == EntityKind::MediaPlayer;
+        let mut changes = self.build(None, |kind| !player(kind) && keep(kind), labels);
+        if keep(EntityKind::MediaPlayer) {
+            // Only the media player reads HEOS: the HEOS state is locked while it is built.
+            let shown = self
+                .heos
+                .as_ref()
+                .and_then(|link| link.with_player(|heos| self.build(Some(heos), player, labels)))
+                .unwrap_or_else(|| self.build(None, player, labels));
+            changes.splice(0..0, shown);
+        }
         self.controller.do_send(DeviceEvent::Changes {
             key: self.key.clone(),
             changes,
@@ -664,170 +656,47 @@ impl DenonActor {
         self.avr = Some(avr);
         self.set_status(DeviceStatus::Connected);
         self.emit();
-        self.connect_heos(ctx);
+        self.watch_heos(ctx);
     }
 
-    /// Connect to the HEOS player of the receiver, if it has one (`CommApiVers` 0301 or higher) or
-    /// if that is not known. The oldest receivers are not asked: they came before HEOS.
-    fn connect_heos(&mut self, ctx: &mut Context<Self>) {
+    /// Follow the HEOS player of the receiver, if it has one (`CommApiVers` 0301 or higher). The
+    /// start of the library opens HEOS and finds the player. Here a failed first connect is tried
+    /// again.
+    fn watch_heos(&mut self, ctx: &mut Context<Self>) {
         let Some(avr) = &self.avr else { return };
-        let host = &avr.info().host;
-        if self.heos_host.as_ref().is_some_and(|h| h != host) {
-            info!("[{}] new address, connecting HEOS again", self.cfg.name);
-            self.drop_heos(ctx);
-        }
-        // The client is there, or a connect or the wait before the next one runs.
-        if self.heos.is_some() || self.timers.heos.is_some() {
+        if !avr.info().has_heos() {
             return;
         }
-        let Some(avr) = &self.avr else { return };
-        let info = avr.info();
-        // HEOS is known from `CommApiVers`. Without it, all but the oldest receivers are tried.
-        let heos_known = info
-            .comm_api_version
-            .as_deref()
-            .and_then(CommApiVersion::parse)
-            .and_then(CommApiVersion::heos);
-        if !heos_known.unwrap_or(info.receiver_type != ReceiverType::Avr) {
-            return;
-        }
-        let known = heos_known.is_some();
-        let host = info.host.clone();
-        self.heos_host = Some(host.clone());
         let generation = self.heos_generation;
-        // Only the first try retries fast. The tries after a wait do not.
-        let fast = if self.heos_attempt == 0 {
-            discovery::NETWORK_RETRY_TIMEOUT
-        } else {
-            Duration::ZERO
-        };
-        let fast_until = Instant::now() + fast;
-        let handle = ctx.spawn(
-            async move { heos::connect_soon(&host, fast_until).await }
-                .into_actor(self)
-                .map(move |result, act, ctx| {
-                    if act.heos_generation != generation {
-                        return;
-                    }
-                    act.timers.heos = None;
-                    match result {
-                        Ok(heos::Connected::Player(link)) => act.use_heos(link, ctx),
-                        Ok(heos::Connected::NoPlayer(heos)) => act.wait_for_player(heos, ctx),
-                        // Not known if the receiver has HEOS: asked again at the next connect.
-                        Err(e) if !known => {
-                            if heos::is_absent(&e) {
-                                debug!("[{}] no HEOS", act.cfg.name);
-                            } else {
-                                act.warn_heos(&e);
-                            }
-                        }
-                        // The receiver has HEOS, but it does not answer now.
-                        Err(e) => {
-                            act.warn_heos(&e);
-                            let wait = act.next_heos_wait();
-                            act.timers.heos = Some(ctx.run_later(wait, move |act, ctx| {
-                                act.timers.heos = None;
-                                if act.heos_generation == generation {
-                                    act.connect_heos(ctx);
-                                }
-                            }));
-                        }
-                    }
-                }),
-        );
-        self.timers.heos = Some(handle);
+        let status = WatchStream::new(avr.watch_heos_status())
+            .map(move |status| HeosStatusChanged(generation, status));
+        ctx.add_message_stream(status);
+        // A lost change can be about this player.
+        let changes = BroadcastStream::new(avr.heos_changes())
+            .map(move |change| HeosChanged(generation, change.ok()));
+        ctx.add_message_stream(changes);
+        let keep = heos::keep_heos(Arc::clone(avr), self.cfg.name.clone());
+        self.timers.heos = Some(ctx.spawn(keep.into_actor(self)));
     }
 
-    /// Log a failed HEOS connect: a warning for the first failure after a connect to the receiver,
-    /// as cover art and the play buttons then do not use HEOS. Retries log at debug level.
-    fn warn_heos(&self, e: &denon_marantz_heos::Error) {
-        let name = &self.cfg.name;
-        if self.heos_attempt == 0 {
-            warn!("[{name}] HEOS not reachable, cover art and HEOS controls may not work: {e}");
-        } else {
-            debug!("[{name}] HEOS connect failed: {e}");
-        }
-    }
-
-    /// The wait before HEOS is asked again. Each call gives the next, longer wait.
-    fn next_heos_wait(&mut self) -> Duration {
-        let wait = HEOS_WAITS[self.heos_attempt.min(HEOS_WAITS.len() - 1)];
-        self.heos_attempt = self.heos_attempt.saturating_add(1);
-        wait
-    }
-
-    /// Keep the HEOS client, and read the HEOS players again after a wait until the player of the
-    /// receiver is there.
-    fn wait_for_player(&mut self, heos: Arc<Heos>, ctx: &mut Context<Self>) {
-        let generation = self.heos_generation;
-        let wait = self.next_heos_wait();
-        self.timers.heos = Some(ctx.run_later(wait, move |act, ctx| {
-            act.timers.heos = None;
-            if act.heos_generation != generation {
-                return;
-            }
-            let name = act.cfg.name.clone();
-            let find = async move {
-                if let Err(e) = heos.refresh().await {
-                    debug!("[{name}] HEOS players not read: {e}");
-                }
-                heos::find(heos).await
-            };
-            let handle = ctx.spawn(find.into_actor(act).map(move |found, act, ctx| {
-                if act.heos_generation != generation {
-                    return;
-                }
-                act.timers.heos = None;
-                match found {
-                    Ok(link) => act.use_heos(link, ctx),
-                    Err(heos) => {
-                        info!(
-                            "[{}] HEOS has no player with this address yet",
-                            act.cfg.name
-                        );
-                        act.wait_for_player(heos, ctx);
-                    }
-                }
-            }));
-            act.timers.heos = Some(handle);
-        }));
-    }
-
-    /// Drop the HEOS client. A command that runs keeps its copy until it ends.
+    /// Stop following HEOS. The `Avr` closes the connection. A command that runs keeps its copy
+    /// of the player until it ends.
     fn drop_heos(&mut self, ctx: &mut Context<Self>) {
         if let Some(handle) = self.timers.heos.take() {
             ctx.cancel_future(handle);
         }
         self.heos_generation += 1;
         self.heos = None;
-        self.heos_host = None;
-        self.heos_attempt = 0;
         self.heos_position = None;
     }
 
-    /// Show the HEOS player and follow its changes.
-    fn use_heos(&mut self, link: heos::Link, ctx: &mut Context<Self>) {
-        info!("[{}] HEOS connected", self.cfg.name);
-        self.heos_attempt = 0;
-        let generation = self.heos_generation;
-        let pid = link.pid();
-        // A lost change can be about this player.
-        let changes = BroadcastStream::new(link.heos().changes())
-            .filter(move |change| {
-                std::future::ready(
-                    change
-                        .as_ref()
-                        .map_or(true, |change| heos::concerns(pid, change)),
-                )
-            })
-            .map(move |change| {
-                HeosChanged(generation, matches!(change, Ok(HeosChange::Progress(_))))
-            });
-        ctx.add_message_stream(changes);
-        let status = WatchStream::from_changes(link.heos().watch_status())
-            .map(move |_| HeosChanged(generation, false));
-        ctx.add_message_stream(status);
-        self.heos = Some(link);
+    /// Show the HEOS player, or stop showing it.
+    fn set_heos(&mut self, link: Option<heos::Link>, ctx: &mut Context<Self>) {
+        if link.is_none() && self.heos.is_none() {
+            return;
+        }
+        self.heos = link;
+        self.heos_position = None;
         self.update_position();
         self.dirty_part |= PART_PLAYER;
         self.arm_emit(ctx);
@@ -838,7 +707,6 @@ impl DenonActor {
     fn update_position(&mut self) -> bool {
         let now = self.heos.as_ref().and_then(|link| {
             link.with_player(|player| {
-                let player = player?;
                 let (progress, at) = (player.progress?, player.progress_at?);
                 let playing = player.play_state == Some(PlayState::Play);
                 let since = if playing { at.elapsed().as_millis() } else { 0 };
@@ -854,6 +722,7 @@ impl DenonActor {
                     at: Instant::now(),
                 })
             })
+            .flatten()
         });
         let changed = position_moved(self.heos_position.as_ref(), now.as_ref());
         if changed {
@@ -1196,6 +1065,8 @@ impl DenonActor {
         {
             self.attempts = 0;
         }
+        // The `Avr` owns the HEOS connection.
+        self.drop_heos(ctx);
         self.telnet_up = false;
         self.http_ok = false;
         self.polling = false;
@@ -1223,18 +1094,9 @@ impl DenonActor {
         }
     }
 
-    /// Close the receiver and the HEOS connection, for example at standby. After a suspend of the
-    /// Remote, the HEOS connections can be broken without notice: the next connect opens new ones.
-    fn close_all(&mut self, ctx: &mut Context<Self>) {
-        self.close(ctx);
-        self.drop_heos(ctx);
-    }
-
-    /// Cancel the timers of the receiver connection. The HEOS connect runs on.
+    /// Cancel the timers of the receiver connection.
     fn cancel_timers(&mut self, ctx: &mut Context<Self>) {
-        let heos = self.timers.heos.take();
         let t = std::mem::take(&mut self.timers);
-        self.timers.heos = heos;
         for handle in [
             t.connect,
             t.reconnect,
@@ -1242,6 +1104,7 @@ impl DenonActor {
             t.signal,
             t.pages,
             t.telnet,
+            t.heos,
             t.names,
         ]
         .into_iter()
@@ -1577,7 +1440,6 @@ impl Actor for DenonActor {
 
     fn stopped(&mut self, ctx: &mut Self::Context) {
         self.close(ctx);
-        self.drop_heos(ctx);
     }
 }
 
@@ -1830,15 +1692,53 @@ impl Handler<HeosChanged> for DenonActor {
     type Result = ();
 
     fn handle(&mut self, msg: HeosChanged, ctx: &mut Self::Context) {
-        if msg.0 != self.heos_generation {
+        let Some(link) = self.heos.as_ref().filter(|_| msg.0 == self.heos_generation) else {
+            return;
+        };
+        if msg
+            .1
+            .as_ref()
+            .is_some_and(|change| !heos::concerns(link.pid(), change))
+        {
             return;
         }
         // A position that the Remote counts on by itself is not sent.
-        if !self.update_position() && msg.1 {
+        let progress = matches!(msg.1, Some(HeosChange::Progress(_)));
+        if !self.update_position() && progress {
             return;
         }
         self.dirty_part |= PART_PLAYER;
         self.arm_emit(ctx);
+    }
+}
+
+impl Handler<HeosStatusChanged> for DenonActor {
+    type Result = ();
+
+    fn handle(&mut self, msg: HeosStatusChanged, ctx: &mut Self::Context) {
+        if msg.0 != self.heos_generation {
+            return;
+        }
+        let name = &self.cfg.name;
+        let link = match msg.1 {
+            HeosPlayerStatus::Ready(_) => {
+                let link = self
+                    .avr
+                    .as_ref()
+                    .and_then(|avr| avr.heos())
+                    .and_then(|player| heos::Link::new(&player));
+                if link.is_some() {
+                    info!("[{name}] HEOS connected");
+                }
+                link
+            }
+            HeosPlayerStatus::WaitingForPlayer => {
+                info!("[{name}] HEOS has no player with this address yet");
+                None
+            }
+            _ => None,
+        };
+        self.set_heos(link, ctx);
     }
 }
 
@@ -1865,7 +1765,7 @@ impl Handler<Disconnect> for DenonActor {
         // connection makes them unavailable.
         self.keep_state = true;
         if self.avr.is_none() {
-            self.close_all(ctx);
+            self.close(ctx);
             self.set_status(DeviceStatus::Disconnected);
             return;
         }
@@ -1884,7 +1784,7 @@ impl Handler<Disconnect> for DenonActor {
                             act.schedule_emit(ctx);
                         }
                     } else {
-                        act.close_all(ctx);
+                        act.close(ctx);
                         act.set_status(DeviceStatus::Disconnected);
                     }
                 }),

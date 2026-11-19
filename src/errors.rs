@@ -103,9 +103,9 @@ impl From<denon_marantz::Error> for ServiceError {
     }
 }
 
-impl From<denon_marantz_heos::Error> for ServiceError {
-    fn from(e: denon_marantz_heos::Error) -> Self {
-        use denon_marantz_heos::Error;
+impl From<denon_marantz::heos::Error> for ServiceError {
+    fn from(e: denon_marantz::heos::Error) -> Self {
+        use denon_marantz::heos::Error;
         match e {
             Error::NotConnected => Self::NotConnected,
             Error::Timeout { .. } => Self::Timeout,
