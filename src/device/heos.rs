@@ -233,10 +233,11 @@ mod tests {
         drop(listener);
         use_port(port);
         let start = Instant::now();
-        let result = connect_soon("127.0.0.1", start + Duration::from_secs(3)).await;
+        // A refused connect takes about 2 s on Windows; a second try would run until the deadline.
+        let result = connect_soon("127.0.0.1", start + Duration::from_secs(10)).await;
         assert!(result.is_err());
         assert!(
-            start.elapsed() < Duration::from_secs(1),
+            start.elapsed() < Duration::from_secs(3),
             "{:?}",
             start.elapsed()
         );
