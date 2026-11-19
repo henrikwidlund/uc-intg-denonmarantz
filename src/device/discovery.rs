@@ -878,13 +878,15 @@ const fn update_method(info: &Info) -> Option<config_store::HttpReadMethod> {
 mod page_tests {
     use super::*;
     use denon_marantz::proto::SettingsGroup;
-    use denon_marantz::{PageResults, StartPages, TelnetStart};
+    use denon_marantz::{HeosStart, PageResults, StartPages, TelnetStart};
 
     fn report(availability: PageStatus, video: PageStatus, channels: PageStatus) -> StartReport {
         StartReport {
             telnet: TelnetStart::Unknown,
             signal: PageStatus::Read,
             telnet_sync: TelnetSync::NotWaited,
+            heos: HeosStart::Disabled,
+            telnet_not_answered: Vec::new(),
             web_interface: Ok(StartPages {
                 availability: PageResults {
                     pages: vec![
@@ -931,6 +933,8 @@ mod page_tests {
             telnet: TelnetStart::Unknown,
             signal: PageStatus::NoAnswer,
             telnet_sync: TelnetSync::NotWaited,
+            heos: HeosStart::Disabled,
+            telnet_not_answered: Vec::new(),
             web_interface: Err(Error::Stopped),
         };
         assert_eq!(

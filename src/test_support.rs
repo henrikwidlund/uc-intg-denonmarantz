@@ -686,6 +686,8 @@ pub fn test_builder(
         command_interval: Duration::from_millis(5),
         query_interval: Duration::from_millis(5),
         query_quiet: Duration::from_millis(5),
+        // The fakes answer at once. A query that a fake leaves out does not slow the test.
+        answer_quiet: Duration::from_millis(300),
         ..TelnetConfig::default()
     };
     builder

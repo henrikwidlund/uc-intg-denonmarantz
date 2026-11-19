@@ -1280,12 +1280,17 @@ async fn identify_host(host: &str) -> Result<discovery::Identified, IntegrationS
     })
 }
 
-/// Address of a setup page. An empty text is no address.
+/// Address of a setup page. An empty text is no address. An IPv6 address is stored without
+/// brackets: the telnet check of the tuner and the HEOS player search do not accept them.
 fn parse_address(value: Option<&str>) -> Result<Option<String>, String> {
     match value.map(str::trim) {
         None | Some("") => Ok(None),
         Some(v) if v.contains(char::is_whitespace) => Err(format!("Invalid address: {v}")),
-        Some(v) => Ok(Some(v.to_owned())),
+        Some(v) => match v.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+            Some("") => Err(format!("Invalid address: {v}")),
+            Some(bare) => Ok(Some(bare.to_owned())),
+            None => Ok(Some(v.to_owned())),
+        },
     }
 }
 
@@ -1320,6 +1325,15 @@ mod tests {
             parse_address(Some("avr.local")).expect("ok")
         );
         assert!(parse_address(Some("a b")).is_err());
+        assert_eq!(
+            Some("fe80::1".to_owned()),
+            parse_address(Some("[fe80::1]")).expect("ok")
+        );
+        assert_eq!(
+            Some("fe80::1".to_owned()),
+            parse_address(Some("fe80::1")).expect("ok")
+        );
+        assert!(parse_address(Some("[]")).is_err());
     }
 
     fn options() -> Options {

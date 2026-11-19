@@ -16,6 +16,7 @@ use crate::entities::{EntityKind, SelectKind, SensorKind, SwitchKind};
 use crate::errors::ServiceError;
 use crate::test_support::{Fake, FakeHeos, FakeTelnet, HeosItem, quick_http, test_builder};
 use actix::{Actor, Addr, Context, Handler};
+use denon_marantz::proto::telnet::answer_prefix;
 use denon_marantz::{Brand, DiscoveredReceiver, Info, ReceiverType, TypeProof, UpdateMethod};
 use serde_json::Value;
 use std::rc::Rc;
@@ -174,17 +175,23 @@ fn toggles(line: &str) -> Vec<String> {
     }
 }
 
-/// A receiver that answers every query. The library waits for the answer of a query before it
-/// sends the next one: a receiver that stays silent makes the start very slow.
+/// A receiver that answers every query: a list with its `END` line, any other query with a line
+/// that starts like its answer. The start waits for the answers: a query without one counts as not
+/// answered only after `answer_quiet` of `test_builder`.
 fn answers_all(line: &str) -> Vec<String> {
     let answer = toggles(line);
-    // The library ends the wait for the answers of the start with a query for the power.
-    if line == "PW?" {
-        vec!["PWON".into()]
-    } else if answer.is_empty() && line.ends_with('?') {
-        vec!["MSSTEREO".into()]
-    } else {
-        answer
+    if !answer.is_empty() || !line.ends_with('?') {
+        return answer;
+    }
+    let prefix = answer_prefix(line);
+    match prefix {
+        "PW" => vec!["PWON".into()],
+        "MS" => vec!["MSSTEREO".into()],
+        "CV" | "SSAEQLRS" => vec![format!("{prefix}END")],
+        "OPSMLALL" | "OPDLS" | "SSFUN" | "SSSOD" | "SSTTR" | "SSCFR" | "SSLEV" | "SSQSNZMA" => {
+            vec![format!("{prefix} END")]
+        }
+        _ => vec![prefix.to_owned()],
     }
 }
 
