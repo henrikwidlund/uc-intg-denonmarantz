@@ -1176,19 +1176,36 @@ async fn a_connect_without_a_short_last_time_has_no_limit() {
     }
 }
 
+#[test]
+fn a_slow_connect_does_not_raise_the_limit_of_the_next_one() {
+    let ms = Duration::from_millis;
+    let mut times = discovery::ConnectTimes::default();
+    assert_eq!(None, times.fastest());
+    times.add(ms(20));
+    // Slow wake-ups.
+    times.add(ms(450));
+    times.add(ms(640));
+    assert_eq!(Some(ms(20)), times.fastest());
+    // The fast time is replaced after 5 newer ones.
+    for _ in 0..4 {
+        times.add(ms(300));
+    }
+    assert_eq!(Some(ms(300)), times.fastest());
+}
+
 #[actix::test]
-async fn a_stalled_connect_is_started_again_twice_at_most() {
+async fn a_stalled_connect_is_started_again_four_times_at_most() {
     let http = Fake::start(true).await;
-    let (port, connections) = hang_first_n(http.port(), 3).await;
+    let (port, connections) = hang_first_n(http.port(), 5).await;
     stalling_builder(port);
     let mut stall = discovery::Stall::new(Some(Duration::from_millis(10)));
     let deadline = Instant::now() + discovery::NETWORK_RETRY_TIMEOUT;
     let identify = discovery::identify_retry("127.0.0.1", None, deadline, &mut stall);
-    // Two restarts after 0.2 s each, then the third try has no limit and waits.
+    // Four restarts after 0.2 s each, then the fifth try has no limit and waits.
     let waited = tokio::time::timeout(Duration::from_secs(2), identify).await;
     assert!(waited.is_err());
-    // The first try and two restarts.
-    assert_eq!(3, connections.load(Ordering::Relaxed));
+    // The first try and four restarts.
+    assert_eq!(5, connections.load(Ordering::Relaxed));
 }
 
 #[actix::test]

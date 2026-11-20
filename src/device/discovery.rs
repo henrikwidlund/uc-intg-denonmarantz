@@ -24,7 +24,9 @@ const STALL_FACTOR: u32 = 3;
 /// A longer time limit is not used: the receiver is slow, and its tries are not started again.
 const STALL_MAX: Duration = Duration::from_secs(2);
 /// How often a stalled try is started again in one connect.
-const STALL_RESTARTS: u8 = 2;
+const STALL_RESTARTS: u8 = 4;
+/// How many connect times [`ConnectTimes`] keeps.
+const CONNECT_TIMES: usize = 5;
 /// Time allowed to open an HTTP connection to the receiver. On the local network it takes a few
 /// milliseconds. After wake-up, a lost connect packet is sent again only after 1 s: a new try after
 /// this time is faster.
@@ -193,8 +195,9 @@ pub struct Stall {
 }
 
 impl Stall {
-    /// The limit is [`STALL_FACTOR`] times `last`, the time of the last connect, and at least
-    /// [`STALL_MIN`]. Without `last`, or if the limit is over [`STALL_MAX`], there is no limit.
+    /// The limit is [`STALL_FACTOR`] times `last`, a normal connect time (see
+    /// [`ConnectTimes::fastest`]), and at least [`STALL_MIN`]. Without `last`, or if the limit is
+    /// over [`STALL_MAX`], there is no limit.
     pub fn new(last: Option<Duration>) -> Self {
         let limit = last
             .map(|last| last.saturating_mul(STALL_FACTOR).max(STALL_MIN))
@@ -206,6 +209,27 @@ impl Stall {
     }
 }
 
+/// The times of the last connects. A slow connect after wake-up must not raise the limit of
+/// [`Stall`]: the next wake-up would then wait for a lost packet (1 s) instead of starting again.
+#[derive(Debug, Default)]
+pub struct ConnectTimes {
+    times: [Option<Duration>; CONNECT_TIMES],
+    next: usize,
+}
+
+impl ConnectTimes {
+    /// Keep `took`. It replaces the oldest time.
+    pub const fn add(&mut self, took: Duration) {
+        self.times[self.next] = Some(took);
+        self.next = (self.next + 1) % CONNECT_TIMES;
+    }
+
+    /// The fastest of the kept times.
+    pub fn fastest(&self) -> Option<Duration> {
+        self.times.iter().flatten().min().copied()
+    }
+}
+
 /// Identify a receiver, see [`retry`].
 pub async fn identify_retry(
     host: &str,
@@ -213,7 +237,7 @@ pub async fn identify_retry(
     deadline: Instant,
     stall: &mut Stall,
 ) -> Result<Avr, Error> {
-    let (avr, _) = retry(host, deadline, stall, || identify(host, known)).await?;
+    let (avr, _) = retry("identify", host, deadline, stall, || identify(host, known)).await?;
     Ok(avr)
 }
 
@@ -225,34 +249,17 @@ pub async fn start_retry(
     deadline: Instant,
     stall: &mut Stall,
 ) -> Result<(Started, Duration), Error> {
-    // Test build only, not for main: every second connect opens no HEOS, to compare the connect
-    // times in one log.
-    #[cfg(not(test))]
-    {
-        static HEOS_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        let off = HEOS_OFF.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
-        let host = &avr.info().host;
-        debug!(
-            "[{host}] start with HEOS {}",
-            if off { "off" } else { "on" }
-        );
-        retry(host, deadline, stall, || {
-            let options = StartOptions::new()
-                .telnet(telnet)
-                .telnet_wait(TELNET_WAIT)
-                .heos(!off);
-            avr.start_with(options)
-        })
-        .await
-    }
-    #[cfg(test)]
-    retry(&avr.info().host, deadline, stall, || start(avr, telnet)).await
+    retry("start", &avr.info().host, deadline, stall, || {
+        start(avr, telnet)
+    })
+    .await
 }
 
 /// Run `step` until it works. A try that takes longer than the limit of `stall` is started again.
 /// After a network error, `step` runs again after a short delay, until `deadline`. Also gives the
-/// time of the try that worked.
+/// time of the try that worked. `step_name` names the step in the log.
 async fn retry<T, F: Future<Output = Result<T, Error>>>(
+    step_name: &str,
     host: &str,
     deadline: Instant,
     stall: &mut Stall,
@@ -263,8 +270,8 @@ async fn retry<T, F: Future<Output = Result<T, Error>>>(
     let mut network_errors = 0u16;
     let tries = |ok: bool, last: Duration, stalls: u8, network_errors: u16| {
         debug!(
-            "[{host}] connect {} after {} ms: {stalls} stalled, {network_errors} network errors, \
-             last try {} ms",
+            "[{host}] {step_name} {} after {} ms: {stalls} stalled, {network_errors} network \
+             errors, last try {} ms",
             if ok { "done" } else { "failed" },
             begin.elapsed().as_millis(),
             last.as_millis()
@@ -279,7 +286,7 @@ async fn retry<T, F: Future<Output = Result<T, Error>>>(
                     stall.restarts -= 1;
                     stalls += 1;
                     debug!(
-                        "[{host}] connect stalled after {} ms, starting again",
+                        "[{host}] {step_name} stalled after {} ms, starting again",
                         limit.as_millis()
                     );
                     continue;
@@ -315,7 +322,6 @@ async fn retry<T, F: Future<Output = Result<T, Error>>>(
 const TELNET_WAIT: Duration = Duration::from_secs(25);
 
 /// Start the receiver: read the zones, then telnet and the web pages follow in the background.
-#[cfg_attr(not(test), expect(dead_code, reason = "test build only"))]
 pub async fn start(avr: &Arc<Avr>, telnet: bool) -> Result<Started, Error> {
     let options = StartOptions::new().telnet(telnet).telnet_wait(TELNET_WAIT);
     // Tests open HEOS only with a fake.
