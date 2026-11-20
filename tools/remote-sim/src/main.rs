@@ -95,6 +95,8 @@ pub struct Ctx {
     pub key: String,
     /// The receiver was on at the start.
     pub was_on: bool,
+    /// The driver shows the tuner entities: the setup option, else what `Deviceinfo.xml` says.
+    pub tuner: bool,
     report: Vec<String>,
     failed: usize,
     skipped: usize,
@@ -258,6 +260,7 @@ async fn main() {
         oracle: None,
         key: String::new(),
         was_on: true,
+        tuner: true,
         report: Vec::new(),
         failed: 0,
         skipped: 0,

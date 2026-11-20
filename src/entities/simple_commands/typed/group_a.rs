@@ -118,6 +118,10 @@ pub const TABLE: &[(&str, Run)] = &[
     call!("BASS_SYNC_DOWN", |avr, cx| avr.sound().bass_sync_down()),
     call!("BASS_SYNC_UP", |avr, cx| avr.sound().bass_sync_up()),
     call!("BASS_UP", |avr, cx| avr.tone().bass_up()),
+    call!("BT_LEVEL_DOWN", |avr, cx| avr
+        .device()
+        .bluetooth_level_down()),
+    call!("BT_LEVEL_UP", |avr, cx| avr.device().bluetooth_level_up()),
     call!("BT_OUTPUT_MODE_BT_ONLY", |avr, cx| avr
         .device()
         .set_bluetooth_output(BluetoothOutputMode::BluetoothOnly)),

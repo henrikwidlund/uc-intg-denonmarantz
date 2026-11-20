@@ -208,6 +208,18 @@ fn all_zone_stereo_follows_the_receiver() {
 }
 
 #[test]
+fn bluetooth_level_is_shown_in_db() {
+    let cfg = cfg();
+    let level = |lines: &[&str]| sensor(&view(&state(lines), &cfg), SensorKind::BluetoothLevel);
+    let zero = level(&["PWON", "BTLEV 80"]);
+    assert_eq!(json!(0), zero["value"]);
+    assert_eq!(json!("dB"), zero["unit"]);
+    assert_eq!(json!(-50), level(&["PWON", "BTLEV 30"])["value"]);
+    assert_eq!(json!(10), level(&["PWON", "BTLEV 90"])["value"]);
+    assert_eq!(json!(super::sensor::EMPTY), level(&["PWON"])["value"]);
+}
+
+#[test]
 fn media_is_cleared_when_the_source_changes() {
     let cfg = cfg();
     let playing = state(&["PWON", "SINET", "NSE0Now Playing", "NSE1A Title"]);

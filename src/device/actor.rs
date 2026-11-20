@@ -445,8 +445,14 @@ impl DenonActor {
                 let asks: Vec<Ask<'_>> = RELOAD_QUERIES
                     .iter()
                     .filter(|(bit, _)| parts & bit != 0)
-                    .flat_map(|(_, queries)| queries.iter().copied().map(Ask::from))
+                    .flat_map(|(_, queries)| queries.iter().copied())
+                    .filter(|&query| discovery::listed(avr.info().features, query))
+                    .map(Ask::from)
                     .collect();
+                // An empty ask clears the filter of repeated events in the library.
+                if asks.is_empty() {
+                    return;
+                }
                 if let Err(e) = avr.telnet_ask(&asks).await {
                     debug!("values not read: {e}");
                 }

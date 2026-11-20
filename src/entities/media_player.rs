@@ -11,7 +11,7 @@ use denon_marantz::heos::{MediaType, NowPlaying, PlayState, PlayerState, RepeatM
 use denon_marantz::proto::PlayingKind;
 use denon_marantz::proto::Power;
 use denon_marantz::proto::source::{is_playing_source, playing_kind};
-use denon_marantz::{State, Zone};
+use denon_marantz::{State, ValueRange, Zone};
 use serde_json::{Map, Value, json};
 use std::str::FromStr;
 use uc_api::intg::AvailableIntgEntity;
@@ -341,9 +341,13 @@ pub enum Action {
     Raw(String),
 }
 
-/// Volume in dB for a volume of the Remote.
-pub fn volume_db(volume: u8) -> f32 {
-    (f32::from(volume).min(MAX_VOLUME) + MIN_DB).max(MIN_DB)
+/// Volume in dB for a volume of the Remote. `scale` is the volume range that the receiver lists:
+/// its highest value is the top of the scale. The library refuses a volume above it.
+pub fn volume_db(volume: u8, scale: Option<ValueRange>) -> f32 {
+    let max = scale.map_or(MAX_VOLUME, |range| {
+        (f32::from(range.max_tenths) / 10.0).clamp(0.0, MAX_VOLUME)
+    });
+    (f32::from(volume).min(max) + MIN_DB).max(MIN_DB)
 }
 
 /// Map a media player command to an action.
@@ -447,10 +451,25 @@ mod tests {
 
     #[test]
     fn volume_maps_to_db() {
-        assert!((volume_db(0) - -80.0).abs() < f32::EPSILON);
-        assert!((volume_db(40) - -40.0).abs() < f32::EPSILON);
-        assert!((volume_db(98) - 18.0).abs() < f32::EPSILON);
-        assert!((volume_db(100) - 18.0).abs() < f32::EPSILON);
+        assert!((volume_db(0, None) - -80.0).abs() < f32::EPSILON);
+        assert!((volume_db(40, None) - -40.0).abs() < f32::EPSILON);
+        assert!((volume_db(98, None) - 18.0).abs() < f32::EPSILON);
+        assert!((volume_db(100, None) - 18.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn volume_stays_at_or_below_the_listed_scale() {
+        let scale = |max_tenths| {
+            Some(ValueRange {
+                min_tenths: 0,
+                max_tenths,
+                step_tenths: Some(5),
+            })
+        };
+        assert!((volume_db(100, scale(980)) - 18.0).abs() < f32::EPSILON);
+        assert!((volume_db(70, scale(600)) - -20.0).abs() < f32::EPSILON);
+        assert!((volume_db(50, scale(600)) - -30.0).abs() < f32::EPSILON);
+        assert!((volume_db(100, scale(-10)) - -80.0).abs() < f32::EPSILON);
     }
 
     #[test]

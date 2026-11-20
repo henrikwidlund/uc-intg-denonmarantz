@@ -31,10 +31,13 @@ Bluetooth or with zone 2. Please report problems as
   shows what HEOS plays, with position, length, repeat and shuffle, and play, pause, stop, next, previous,
   repeat and shuffle go to HEOS. Volume and mute stay on the receiver: HEOS shares one volume for all zones.
   The Remote must be able to reach the receiver on TCP port 1255 (HEOS) and 8015 (covers from AirPlay and
-  USB, seen on an AVC-A10H). Volume up and down use the step of the receiver (0.5 dB). The volume step of a Python integration configuration is not used.
-- **Remote**: the simple commands of the Python integration (about 370), commands of older receivers (see
-  [Older receivers](#older-receivers)), 15 UI pages, button mapping, repeat and button sequences. Text of up
-  to 28 characters is sent to the receiver as it is.
+  USB, seen on an AVC-A10H). Volume up and down use the step of the receiver (0.5 dB). The volume step of a
+  Python integration configuration is not used. A volume above the top of the scale that the receiver lists
+  is set to the top.
+- **Remote**: the simple commands of the Python integration (about 370), `BT_LEVEL_UP`/`DOWN`,
+  `TACTILE_CHANNEL_*` (the channel of the tactile transducer, `CVTTR`), commands of older receivers (see
+  [Older receivers](#older-receivers)), up to 15 UI pages, button mapping, repeat and button sequences. Text
+  of up to 28 characters is sent to the receiver as it is.
 - **Selects**: sound mode, input source, reference level, dynamic volume, dimmer, eco mode. With telnet also
   monitor output, speaker preset, picture mode, digital codec and, if the receiver has Dirac, the Dirac filter
   (only the slots that have a filter).
@@ -42,27 +45,28 @@ Bluetooth or with zone 2. Please report problems as
 - **More entities** (with telnet, some also with HTTP only, see [Requirements](#requirements)): switches for
   tone control, Dynamic EQ, the three trigger outputs and the Bluetooth transmitter; numbers for bass and
   treble; selects for the Audyssey MultEQ mode, the quick select (smart select on Marantz), the tuner band and
-  the Bluetooth output; a sensor for the active Dirac filter. A quick select can change the volume. The quick
-  select, its simple commands and its UI page offer only the slots that the receiver has.
+  the Bluetooth output; sensors for the active Dirac filter and the Bluetooth level. A quick select can
+  change the volume. The quick select, its simple commands and its UI page offer only the slots that the
+  receiver has.
 - **Sensors**: volume, sound mode, input, mute, dimmer and eco mode. With telnet also sleep timer, audio delay,
   audio and video signal, channels, resolution and bandwidth, video output port, HDR, pixel depth, FRL,
   color space (with BT.2020, for example `4:2:2/BT.2020`), picture mode, tuner frequency, all zone stereo and
   digital codec. Some signal sensors also exist with HTTP only.
 
-With telnet, all entities exist on every receiver, except the Dirac select and sensor, which need a
-receiver with Dirac, and the entities of [older receivers](#older-receivers). A receiver without an AM/FM
-tuner gets no tuner band and tuner preset selects, no tuner frequency sensor, no tuner commands and buttons,
-and no channel up and down. The setup option "Receiver has an AM/FM tuner" decides this. Its default comes
-from `Deviceinfo.xml`, else, if the receiver is on, from asking it for its tuner band and frequency over
-telnet (no answer means no tuner). If neither works, the setup asks: turn the receiver on before the setup to
-let the driver find it out. Many newer models have a tuner only in North America, and some have an analog input named
-`TUNER` without a tuner, so `Deviceinfo.xml` often cannot tell. A receiver taken over from the Python
-integration has the tuner parts until it is configured again. A value that the receiver does not have, for
-example the picture mode of a newer receiver or the Audyssey settings of a receiver without Audyssey, shows
-`--`. A setting that the
-receiver does not accept in its current state, for example the reference level without Dynamic EQ or the tone
-control with a Dirac filter, is ignored. The driver answers OK, so the Remote shows no error, and writes a line
-to the log that says why.
+With telnet, all entities exist on every receiver, except the Dirac select, sensor, commands
+(`DIRAC_LIVE_FILTER_*`) and buttons, which need a receiver with Dirac, and the entities of [older
+receivers](#older-receivers). A receiver without an AM/FM tuner gets no tuner band and tuner preset selects,
+no tuner frequency sensor, no tuner commands and buttons, and no channel up and down. The setup option
+"Receiver has an AM/FM tuner" decides this. Its default comes from `Deviceinfo.xml`, else, if the receiver is
+on, from asking it for its tuner band and frequency over telnet (no answer means no tuner). If neither works,
+the setup asks: turn the receiver on before the setup to let the driver find it out. Many newer models have a
+tuner only in North America, and some have an analog input named `TUNER` without a tuner, so `Deviceinfo.xml`
+often cannot tell. A receiver taken over from the Python integration has the tuner parts until it is
+configured again. A value that the receiver does not have, for example the picture mode of a newer receiver or
+the Audyssey settings of a receiver without Audyssey, shows `--`. A setting that the receiver does not accept
+in its current state, for example the reference level without Dynamic EQ or the tone control with a Dirac
+filter, is ignored. The driver answers OK, so the Remote shows no error, and writes a line to the log that
+says why.
 
 ## Older receivers
 
@@ -82,8 +86,8 @@ that it does not have, so a button can do nothing on some models.
 - Simple commands: `PRO_LOGIC_MODE_*`, `SURROUND_BACK_MODE_*`, `FRONT_HEIGHT_*`, `DYNAMIC_COMPRESSION_*`,
   `AUTO_FLAG_DETECT_*`, `DIALOG_LEVEL_ADJUST_*`, `DIALOG_LEVEL_UP`/`DOWN`, `AUDYSSEY_DSX_*`,
   `STAGE_WIDTH_UP`/`DOWN`, `STAGE_HEIGHT_UP`/`DOWN`, `HEIGHT_GAIN_*`, `EFFECT_SPEAKER_SELECTION_OFF`,
-  `INSTA_PREVUE_*`, `SOURCE_MENU_*`, `INPUT_MODE_7_1_IN`, and `NETWORK_*` (repeat, random, next, previous, page)
-  for network audio on receivers without HEOS. Toggles need telnet.
+  `INSTA_PREVUE_*`, `SOURCE_MENU_*`, `INPUT_MODE_7_1_IN`, `LFE_7_1_IN_*`, and `NETWORK_*` (repeat, random,
+  next, previous, page) for network audio on receivers without HEOS. Toggles need telnet.
 - Sensors (telnet): Pro Logic mode, surround back mode, front height, dynamic compression, auto flag detect,
   Dialog Level Adjust and dialog level, Audyssey DSX, stage width and height, height gain, InstaPrevue. The
   driver asks for these values after each connect.
@@ -248,14 +252,14 @@ the entity lists, the buttons, the sleep of the Remote and a real signal. It sav
 
 `tools/remote-sim` is a program that acts as the Remote and runs most of these tests by itself with a real
 receiver. It opens a second connection to the receiver and checks that every select and sensor shows what the
-receiver has, after each change. It also sends the simple commands of the remote entity, but not the
-triggers and the remote lock. It starts the driver without mDNS, so it needs no root rights. The checks switch
-the receiver on and off and change source, sound mode and some settings, and restore them. While the simple
-commands are sent, the sound can stop for some seconds, for example when HDMI audio goes to the TV. The
-settings that they change are saved in `remote-sim-restore.txt` first. If a run stops before they are set
-back, the next run sets them back at its start. While the file is still there, the checks that change these
-settings are skipped. A source change stops HEOS and AirPlay, and they do not start
-again. The volume never goes above -40 dB. The `heos` check compares
+receiver has, after each change. It also sends the simple commands of the remote entity, but not the triggers,
+the remote lock and the LFE level of the 7.1 input. It starts the driver without mDNS, so it needs no root
+rights. The checks switch the receiver on and off and change source, sound mode and some settings, and restore
+them. While the simple commands are sent, the sound can stop for some seconds, for example when HDMI audio
+goes to the TV. The settings that they change are saved in `remote-sim-restore.txt` first. If a run stops
+before they are set back, the next run sets them back at its start. While the file is still there, the checks
+that change these settings are skipped. A source change stops HEOS and AirPlay, and they do not start again.
+The volume never goes above -40 dB. The `heos` check compares
 the media player with a second HEOS connection, pauses and plays once. Start HEOS Music on the main zone
 before the run, else the check is skipped.
 

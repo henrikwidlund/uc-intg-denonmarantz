@@ -37,7 +37,10 @@ pub fn definition(mut entity: AvailableIntgEntity, kind: SensorKind) -> Availabl
         SensorKind::AudioSamplingRate => {
             options.insert("custom_unit".into(), "kHz".into());
         }
-        SensorKind::DialogLevel | SensorKind::StageWidth | SensorKind::StageHeight => {
+        SensorKind::DialogLevel
+        | SensorKind::StageWidth
+        | SensorKind::StageHeight
+        | SensorKind::BluetoothLevel => {
             options.insert("custom_unit".into(), "dB".into());
             options.insert("decimals".into(), 0.into());
         }
@@ -91,11 +94,12 @@ pub const fn name(kind: SensorKind) -> &'static str {
         SensorKind::StageHeight => "Stage Height",
         SensorKind::HeightGain => "Height Gain",
         SensorKind::InstaPrevue => "InstaPrevue",
+        SensorKind::BluetoothLevel => "Bluetooth Level",
     }
 }
 
 /// The feature that a sensor of older receivers shows.
-const fn feature(kind: SensorKind) -> Option<Feature> {
+pub(super) const fn feature(kind: SensorKind) -> Option<Feature> {
     Some(match kind {
         SensorKind::ProLogicMode => Feature::ProLogicMode,
         SensorKind::SurroundBackMode => Feature::SurroundBackMode,
@@ -270,12 +274,17 @@ fn value(v: &View<'_>, kind: SensorKind) -> (Value, Option<&'static str>) {
         SensorKind::StageHeight => decibels(sound.stage_height),
         SensorKind::HeightGain => text(sound.height_gain.map(|x| x.label())),
         SensorKind::InstaPrevue => on_off(device.insta_prevue),
+        // The level is 80 at 0 dB.
+        SensorKind::BluetoothLevel => {
+            decibels(device.bluetooth_level.map(|level| level.cast_signed() - 80))
+        }
     };
     let unit = match kind {
         SensorKind::VolumeDb
         | SensorKind::DialogLevel
         | SensorKind::StageWidth
-        | SensorKind::StageHeight => Some("dB"),
+        | SensorKind::StageHeight
+        | SensorKind::BluetoothLevel => Some("dB"),
         SensorKind::AudioDelay => Some("ms"),
         _ => None,
     };

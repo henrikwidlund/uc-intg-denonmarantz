@@ -288,8 +288,9 @@ step "Setup: entities" \
 "Setup is done." \
 "Add all entities of the receiver. Open the media player and the remote." \
 "All entities are available. The media player shows the source, the sound mode and the volume.
-With telnet there are 15 selects (14 without Dirac), 30 sensors (29 without Dirac), 6 switches and
-2 numbers, besides the media player and the remote." \
+With telnet the AVC-A10H (Dirac, no tuner) has 14 selects, 30 sensors, 6 switches and 2 numbers, besides
+the media player and the remote. A tuner adds 2 selects and 1 sensor. Without Dirac there is 1 select and
+1 sensor less." \
 "recent_log 'connected|WARN|ERROR'"
 
 # ---------------------------------------------------------------- control

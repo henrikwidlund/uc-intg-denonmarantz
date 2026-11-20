@@ -314,8 +314,10 @@ pub enum Feature {
     NetworkAudio,
     /// The tuner: the setup option, else all but a receiver that reports no tuner.
     Tuner,
-    /// `SD7.1IN`: the 7.1 channel input.
+    /// `SD7.1IN` and `PSLFL`: the 7.1 channel input and its LFE level.
     SevenOneIn,
+    /// `PSDIRAC`: Dirac Live filters, from the setup.
+    Dirac,
 }
 
 impl Feature {
@@ -336,6 +338,7 @@ impl Feature {
             "network_audio" => Self::NetworkAudio,
             "seven_one_in" => Self::SevenOneIn,
             "tuner" => Self::Tuner,
+            "dirac" => Self::Dirac,
             _ => return None,
         })
     }
@@ -487,6 +490,7 @@ impl DeviceConfig {
     }
 
     /// The receiver may have the feature: a spec of its generation has it, or no spec is known.
+    /// Tuner and Dirac come from the setup.
     pub const fn offers(&self, feature: Feature) -> bool {
         use Generation::{
             Current, Denon2013 as D13, Denon2015 as D15, Marantz2013 as M13, Unknown,
@@ -496,6 +500,9 @@ impl DeviceConfig {
                 Some(tuner) => tuner,
                 None => !matches!(self.has_tuner, Some(false)),
             };
+        }
+        if matches!(feature, Feature::Dirac) {
+            return self.has_dirac();
         }
         let generation = self.generation();
         if matches!(generation, Unknown) {
@@ -517,7 +524,7 @@ impl DeviceConfig {
             Feature::EffectSpeakersOff => matches!(generation, D13 | M13),
             Feature::DialogLevel => matches!(generation, D15),
             Feature::SevenOneIn => !matches!(generation, D13),
-            Feature::Tuner => true,
+            Feature::Tuner | Feature::Dirac => true,
         }
     }
 

@@ -162,6 +162,7 @@ pub enum SensorKind {
     StageHeight,
     HeightGain,
     InstaPrevue,
+    BluetoothLevel,
 }
 
 #[cfg(test)]
@@ -428,7 +429,7 @@ pub(crate) mod tests {
             };
             EntityKind::all(&c)
                 .filter_map(|k| match k {
-                    EntityKind::Sensor(s) if !s.python() && s != SensorKind::DiracFilter => Some(s),
+                    EntityKind::Sensor(s) if sensor::feature(s).is_some() => Some(s),
                     _ => None,
                 })
                 .collect::<Vec<_>>()

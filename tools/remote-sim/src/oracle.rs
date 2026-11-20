@@ -7,7 +7,9 @@
 use crate::Fail;
 use denon_marantz::proto::Sleep;
 use denon_marantz::proto::source::telnet_to_display_source;
-use denon_marantz::{Avr, Feature, QueryGroup, SettingStatus, StartOptions, State, Zone};
+use denon_marantz::{
+    Ask, Avr, Feature, Query, QueryGroup, SettingStatus, StartOptions, State, Zone,
+};
 use std::sync::Arc;
 
 pub struct Oracle {
@@ -21,8 +23,9 @@ impl Oracle {
     pub async fn connect(host: &str) -> Result<Self, Fail> {
         let avr = Arc::new(Avr::builder(host).connect().await?);
         avr.start_with(StartOptions::new()).await?;
-        // The sound group is not in the default groups.
+        // The sound group and the Bluetooth level are not in the default groups.
         avr.telnet_refresh_group(QueryGroup::Sound).await?;
+        avr.telnet_ask(&[Ask::Query(Query::BluetoothLevel)]).await?;
         Ok(Self { avr })
     }
 
@@ -30,6 +33,9 @@ impl Oracle {
     pub async fn refresh(&self) -> Result<(), Fail> {
         self.avr.telnet_refresh().await?;
         self.avr.telnet_refresh_group(QueryGroup::Sound).await?;
+        self.avr
+            .telnet_ask(&[Ask::Query(Query::BluetoothLevel)])
+            .await?;
         Ok(())
     }
 
@@ -177,6 +183,13 @@ pub fn expected(state: &State) -> Vec<Expected> {
             device
                 .all_zone_stereo
                 .map(|on| if on { "ON" } else { "OFF" }.to_owned()),
+        ),
+        // The level is 80 at 0 dB.
+        (
+            "sensor.bluetooth_level",
+            device
+                .bluetooth_level
+                .map(|level| (i16::from(level) - 80).to_string()),
         ),
     ]
 }

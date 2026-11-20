@@ -4,7 +4,7 @@
 //! Remote entity: buttons, UI pages and commands. The commands, the pages and the button mapping
 //! are the ones of the Python integration. Commands use the media player mapping.
 
-use crate::config_store::{DeviceConfig, Feature};
+use crate::config_store::DeviceConfig;
 use crate::entities::View;
 use crate::entities::media_player::{self, Action};
 use crate::entities::{is_off, simple_commands};
@@ -75,22 +75,20 @@ pub fn definition(mut entity: AvailableIntgEntity, cfg: &DeviceConfig) -> Availa
     entity
 }
 
-/// The UI pages without the buttons of quick select slots and tuner commands that the receiver
-/// does not have. A page without buttons is left out.
+/// The UI pages without the buttons of quick select slots and of features that the receiver does
+/// not have. A page without buttons is left out.
 fn pages_for(pages: &Value, cfg: &DeviceConfig) -> Value {
-    let tuner = cfg.offers(Feature::Tuner);
     let has = |item: &Value| {
         let cmd = item["command"]["cmd_id"].as_str();
         cmd.and_then(simple_commands::quick_select_slot)
             .is_none_or(|slot| cfg.has_quick_select(slot))
-            && (tuner || !cmd.is_some_and(simple_commands::needs_tuner))
+            && cmd
+                .and_then(simple_commands::feature)
+                .is_none_or(|feature| cfg.offers(feature))
     };
     let Some(pages) = pages.as_array() else {
         return Value::Null;
     };
-    if cfg.quick_select_count.is_none() && tuner {
-        return Value::Array(pages.clone());
-    }
     Value::Array(
         pages
             .iter()
@@ -279,6 +277,7 @@ mod tests {
         let pages = |count| {
             let mut cfg = crate::entities::tests::cfg(true, true);
             cfg.quick_select_count = count;
+            cfg.is_dirac_supported = Some(true);
             pages_for(&UI.denon, &cfg)
         };
         assert_eq!(6, quick(&pages(None)).len());
@@ -290,6 +289,22 @@ mod tests {
         assert_eq!(all, pages(Some(2)).as_array().map_or(0, Vec::len));
         // A page without buttons is left out.
         assert_eq!(all - 1, pages(Some(0)).as_array().map_or(0, Vec::len));
+    }
+
+    #[test]
+    fn the_dirac_page_needs_a_receiver_with_dirac() {
+        let has_dirac_page = |dirac| {
+            let mut cfg = crate::entities::tests::cfg(true, true);
+            cfg.is_dirac_supported = dirac;
+            pages_for(&UI.denon, &cfg).as_array().is_some_and(|pages| {
+                pages
+                    .iter()
+                    .any(|p| p["page_id"] == "denon_avr_commands_dirac")
+            })
+        };
+        assert!(has_dirac_page(Some(true)));
+        assert!(!has_dirac_page(Some(false)));
+        assert!(!has_dirac_page(None));
     }
 
     #[test]

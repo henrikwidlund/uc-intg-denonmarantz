@@ -7,6 +7,7 @@ use crate::oracle::{self, Oracle};
 use crate::restore;
 use crate::ws::{field_ids, field_value};
 use crate::{Check, Ctx, Fail};
+use denon_marantz::proto::DiracFilter;
 use denon_marantz::{Command, Zone};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -64,6 +65,54 @@ async fn subscribe_all(ctx: &mut Ctx) -> Result<usize, Fail> {
         .await?;
     ctx.client.refresh_states().await?;
     Ok(ids.len())
+}
+
+/// Sets [`Ctx::tuner`] from `config.json`. The driver checks the tuner again at each connect.
+async fn read_tuner(ctx: &mut Ctx) -> Result<(), Fail> {
+    let config = read_config(ctx).await?;
+    let device = config_device(ctx, &config)?;
+    // The same rule as the driver: without the setup option, only a receiver that says it has
+    // no tuner gets no tuner entities.
+    ctx.tuner = device["tuner"]
+        .as_bool()
+        .unwrap_or(device["has_tuner"] != false);
+    Ok(())
+}
+
+/// The Dirac filter that a `DIRAC_LIVE_FILTER_*` command selects.
+fn dirac_filter(name: &str) -> Option<DiracFilter> {
+    Some(match name.strip_prefix("DIRAC_LIVE_FILTER_")? {
+        "SLOT1" => DiracFilter::Slot1,
+        "SLOT2" => DiracFilter::Slot2,
+        "SLOT3" => DiracFilter::Slot3,
+        "OFF" => DiracFilter::Off,
+        _ => return None,
+    })
+}
+
+/// The second connection says that the slot of the filter has no filter. The receiver ignores
+/// such a slot.
+fn empty_slot(ctx: &Ctx, filter: DiracFilter) -> bool {
+    let slot = match filter {
+        DiracFilter::Slot1 => 0,
+        DiracFilter::Slot2 => 1,
+        DiracFilter::Slot3 => 2,
+        _ => return false,
+    };
+    ctx.oracle.as_ref().is_some_and(|oracle| {
+        oracle
+            .state()
+            .device()
+            .dirac_slots
+            .get(slot)
+            .and_then(|s| s.imported)
+            == Some(false)
+    })
+}
+
+/// The Dirac filter that the second connection has. `None` without that connection.
+fn oracle_dirac(ctx: &Ctx) -> Option<DiracFilter> {
+    ctx.oracle.as_ref()?.state().device().dirac_filter
 }
 
 /// Wait for a state of the media player that is not `UNAVAILABLE`.
@@ -143,6 +192,10 @@ fn mismatches(ctx: &Ctx) -> Vec<String> {
         // The web pages of the receiver sometimes answer with an error. The second connection
         // then has no value: that is not a difference of the driver.
         if (expected.is_none() && WEB_PAGE_VALUES.contains(&name)) || NOT_REPORTED.contains(&name) {
+            continue;
+        }
+        // The driver hides the tuner entities on a receiver without a tuner.
+        if !ctx.tuner && rest.starts_with("tuner_") {
             continue;
         }
         let empty = if kind == "switch" { "UNKNOWN" } else { "--" };
@@ -336,6 +389,7 @@ pub async fn entities(ctx: &mut Ctx) -> Check {
         .find(|id| id.starts_with("media_player."))
         .ok_or_else(|| Fail::new("no media player entity"))?;
     ctx.key = mp.trim_start_matches("media_player.").to_owned();
+    read_tuner(ctx).await?;
     let count = |ty: &str| list.iter().filter(|e| e["entity_type"] == ty).count();
     let (selects, sensors) = (count("select"), count("sensor"));
     ensure!(count("remote") == 1, "remote entities: {}", count("remote"));
@@ -370,6 +424,7 @@ pub async fn states(ctx: &mut Ctx) -> Check {
     let state = wait_available(ctx, 20).await?;
     ctx.was_on = is_on(&state);
     ctx.client.listen(2).await?;
+    read_tuner(ctx).await?;
     let mp = ctx.mp();
     let address = ctx.opt.address.clone();
     let connect = async {
@@ -468,9 +523,13 @@ pub async fn remote_ui(ctx: &mut Ctx) -> Check {
         .as_array()
         .map_or(0, Vec::len);
     // The quick select page has a button for each slot of the receiver, and is left out without
-    // slots.
+    // slots. The tuner and Dirac pages are left out without a tuner or Dirac.
     let config = read_config(ctx).await?;
-    let slots = config_device(ctx, &config)?["quick_select_count"].as_u64();
+    let device = config_device(ctx, &config)?;
+    let slots = device["quick_select_count"].as_u64();
+    let left_out = usize::from(slots == Some(0))
+        + usize::from(!ctx.tuner)
+        + usize::from(device["is_dirac_supported"] != true);
     let quick = options["user_interface"]["pages"]
         .as_array()
         .into_iter()
@@ -480,10 +539,7 @@ pub async fn remote_ui(ctx: &mut Ctx) -> Check {
         .filter(|c| c.starts_with("QUICK_SELECT_") || c.starts_with("SMART_SELECT_"))
         .count();
     ensure!(simple > 300, "{simple} simple commands");
-    ensure!(
-        pages == 15 - usize::from(slots == Some(0)),
-        "{pages} UI pages"
-    );
+    ensure!(pages == 15 - left_out, "{pages} UI pages");
     ensure!(
         slots.is_none_or(|n| usize::try_from(n).is_ok_and(|n| n.min(6) == quick)),
         "{quick} quick select buttons, the receiver has {slots:?}"
@@ -1853,7 +1909,8 @@ async fn sweep_one(ctx: &mut Ctx, kind: &str, option: &Value) -> Result<Outcome,
 
 /// Names that the sweep does not send: they recall settings with a volume, store settings or
 /// reset them. Triggers can switch other equipment, and the remote lock has no query, so it
-/// cannot be set back.
+/// cannot be set back. The receiver answers the LFE level of the 7.1 input only while that input
+/// is used, so it cannot be set back either.
 fn skipped(name: &str) -> bool {
     [
         "ZONE_FAVORITE",
@@ -1865,6 +1922,7 @@ fn skipped(name: &str) -> bool {
         "NETWORK_RESTART",
         "TRIGGER",
         "REMOTE_CONTROL_LOCK",
+        "LFE_7_1_IN",
     ]
     .iter()
     .any(|p| name.contains(p))
@@ -2010,6 +2068,21 @@ async fn send_simple_commands(ctx: &mut Ctx) -> Check {
             problems.push(format!("{name}: took {} ms", took.as_millis()));
         }
         ctx.client.listen_ms(300).await?;
+        // The driver refuses tone control commands until it sees the new filter.
+        if let Some(filter) = dirac_filter(name)
+            && response["code"] == 200
+            && oracle_dirac(ctx).is_some()
+            && !empty_slot(ctx, filter)
+        {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while oracle_dirac(ctx) != Some(filter) && Instant::now() < deadline {
+                ctx.client.listen_ms(200).await?;
+            }
+            if oracle_dirac(ctx) != Some(filter) {
+                problems.push(format!("{name}: the receiver did not select the filter"));
+            }
+            ctx.client.listen_ms(300).await?;
+        }
         if let Some(v) = current_volume(ctx).filter(|v| *v > MAX_VOLUME) {
             ctx.client
                 .command_ok(

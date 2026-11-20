@@ -149,9 +149,9 @@ pub fn supported(cfg: &DeviceConfig) -> Vec<&'static str> {
         .collect()
 }
 
-/// The command is one of the tuner.
-pub fn needs_tuner(name: &str) -> bool {
-    get(name).is_some_and(|e| matches!(e.feature, Some(Feature::Tuner)))
+/// The feature that the command needs.
+pub fn feature(name: &str) -> Option<Feature> {
+    get(name)?.feature
 }
 
 pub fn get(name: &str) -> Option<&'static Entry> {
@@ -192,6 +192,7 @@ fn toggle_current(name: &str, state: &State) -> Option<&'static str> {
             _ => "BT",
         }),
         "TACTILE_TRANSDUCER_TOGGLE" => on_off(sound.tactile_transducer),
+        "TACTILE_CHANNEL_TOGGLE" => on_off(sound.tactile_channel),
         "GRAPHIC_EQ_TOGGLE" => on_off(sound.graphic_eq),
         "HEADPHONE_EQ_TOGGLE" => on_off(sound.headphone_eq),
         "SOUND_MODE_NEURAL_X_TOGGLE" => on_off(sound.neural_x),
@@ -275,25 +276,118 @@ mod tests {
 
     #[test]
     fn the_counts_are_the_ones_of_the_python_integration_plus_older_receivers() {
+        // Commands without a feature that the Python integration does not have.
+        const NOT_PYTHON: [&str; 7] = [
+            "BT_LEVEL_UP",
+            "BT_LEVEL_DOWN",
+            "TACTILE_CHANNEL_ON",
+            "TACTILE_CHANNEL_OFF",
+            "TACTILE_CHANNEL_TOGGLE",
+            "TACTILE_CHANNEL_LEVEL_UP",
+            "TACTILE_CHANNEL_LEVEL_DOWN",
+        ];
+        // The Python integration offers the Dirac commands on all receivers.
+        let dirac = |is_denon| DeviceConfig {
+            is_dirac_supported: Some(true),
+            ..cfg(true, is_denon)
+        };
         let python = |c: &DeviceConfig| {
             supported(c)
                 .into_iter()
-                .filter(|n| get(n).is_some_and(|e| e.feature.is_none_or(|f| f == Feature::Tuner)))
+                .filter(|n| !NOT_PYTHON.contains(n))
+                .filter(|n| {
+                    get(n).is_some_and(|e| {
+                        e.feature
+                            .is_none_or(|f| matches!(f, Feature::Tuner | Feature::Dirac))
+                    })
+                })
                 .count()
         };
-        assert_eq!(368, python(&cfg(true, true)));
-        assert_eq!(380, python(&cfg(true, false)));
+        assert_eq!(368, python(&dirac(true)));
+        assert_eq!(380, python(&dirac(false)));
+        assert_eq!(
+            4 + supported(&cfg(true, true)).len(),
+            supported(&dirac(true)).len()
+        );
         // Before the receiver is read, and without `CommApiVers`, the commands of older receivers
         // are offered too.
-        assert_eq!(423, supported(&cfg(true, true)).len());
+        assert_eq!(430, supported(&cfg(true, true)).len());
         let missing = |is_denon| DeviceConfig {
             comm_api_version: Some(crate::config_store::CommApiVersion::MISSING),
             ..cfg(true, is_denon)
         };
-        assert_eq!(423, supported(&missing(true)).len());
-        assert_eq!(435, supported(&missing(false)).len());
-        assert_eq!(ENTRIES.len(), 448);
-        assert!(supported(&cfg(false, true)).len() < 423);
+        assert_eq!(430, supported(&missing(true)).len());
+        assert_eq!(442, supported(&missing(false)).len());
+        assert_eq!(ENTRIES.len(), 459);
+        assert!(supported(&cfg(false, true)).len() < 430);
+    }
+
+    /// A toggle sends the opposite of the current value, so the driver must ask for that value
+    /// after the connect: in the start groups of the library or in its own extra queries.
+    #[test]
+    fn the_value_of_each_toggle_is_asked_after_the_connect() {
+        use crate::device::discovery::{EXTRA_QUERIES, OLDER_QUERIES};
+        use denon_marantz::Brand;
+        use denon_marantz::proto::telnet::{Query, QueryGroup, queries};
+        let prefix = |query: &'static str| query.trim_end_matches('?').trim_end();
+        let known_of = |brand| -> Vec<&str> {
+            Query::ALL
+                .iter()
+                .filter_map(|query| query.text(brand))
+                .map(prefix)
+                .collect()
+        };
+        for (brand, other, other_brand) in [
+            (Brand::Denon, "marantz", Brand::Marantz),
+            (Brand::Marantz, "denon", Brand::Denon),
+        ] {
+            let driver = EXTRA_QUERIES
+                .iter()
+                .chain(OLDER_QUERIES.iter().map(|(_, query)| query))
+                .filter_map(|query| query.text(brand));
+            let asked: Vec<&str> = queries(brand, QueryGroup::START_ORDER)
+                .chain(driver)
+                .map(prefix)
+                .collect();
+            let known = known_of(brand);
+            let other_known = known_of(other_brand);
+            for line in TABLE.lines() {
+                let fields: Vec<&str> = line.split('\t').collect();
+                let (name, text) = (fields[0], fields[3]);
+                // A text with " / " has a Denon and a Marantz key code: it sends no value.
+                if !name.ends_with("_TOGGLE")
+                    || !text.contains('/')
+                    || text.contains(" / ")
+                    || fields[2] == other
+                {
+                    continue;
+                }
+                // The command part ends at the last space or `:` before the values, for example
+                // `PSFH:` of `PSFH:ON/OFF`. A query must cover it: `MS?` does not cover `MSXYZ`.
+                let values = text.find('/').unwrap_or(text.len());
+                let head = text[..values]
+                    .rfind([' ', ':'])
+                    .map_or(&text[..values], |i| text[..=i].trim_end());
+                let covers = |query: &str| text.starts_with(query) && query.len() >= head.len();
+                // The query of the toggle is the longest one that covers it. The library has no
+                // query for some toggles of the other brand.
+                let Some(query) = known
+                    .iter()
+                    .filter(|query| covers(query))
+                    .max_by_key(|query| query.len())
+                else {
+                    assert!(
+                        other_known.iter().any(|query| covers(query)),
+                        "{brand:?} {name}: the library has no query"
+                    );
+                    continue;
+                };
+                assert!(
+                    asked.contains(query),
+                    "{brand:?} {name}: {query} is not asked"
+                );
+            }
+        }
     }
 
     #[test]

@@ -269,6 +269,18 @@ pub const TABLE: &[(&str, Run)] = &[
     call!("INPUT_SAT_CBL/CBL", |avr, cx| avr
         .zone(Zone::Main)?
         .select_source("SAT/CBL")),
+    call!("LFE_7_1_IN_0DB", |avr, cx| avr
+        .sound()
+        .set_lfe_external_input(0)),
+    call!("LFE_7_1_IN_10DB", |avr, cx| avr
+        .sound()
+        .set_lfe_external_input(10)),
+    call!("LFE_7_1_IN_15DB", |avr, cx| avr
+        .sound()
+        .set_lfe_external_input(15)),
+    call!("LFE_7_1_IN_5DB", |avr, cx| avr
+        .sound()
+        .set_lfe_external_input(5)),
     call!("LFE_DOWN", |avr, cx| avr.sound().lfe_level_down()),
     call!("LFE_UP", |avr, cx| avr.sound().lfe_level_up()),
     call!("LOUDNESS_MANAGEMENT_OFF", |avr, cx| avr

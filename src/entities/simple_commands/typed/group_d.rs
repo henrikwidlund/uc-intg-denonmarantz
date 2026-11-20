@@ -125,6 +125,27 @@ pub const TABLE: &[(&str, Run)] = &[
     call!("SURROUND_RIGHT_UP", |avr, cx| avr
         .sound()
         .channel_volume_up(Channel::SurroundRight)),
+    call!("TACTILE_CHANNEL_LEVEL_DOWN", |avr, cx| avr
+        .sound()
+        .tactile_channel_down()),
+    call!("TACTILE_CHANNEL_LEVEL_UP", |avr, cx| avr
+        .sound()
+        .tactile_channel_up()),
+    call!("TACTILE_CHANNEL_OFF", |avr, cx| avr
+        .sound()
+        .set_tactile_channel(false)),
+    call!("TACTILE_CHANNEL_ON", |avr, cx| avr
+        .sound()
+        .set_tactile_channel(true)),
+    call!("TACTILE_CHANNEL_TOGGLE", |avr, cx| avr
+        .sound()
+        .set_tactile_channel(
+            !cx.state
+                .device()
+                .sound_settings
+                .tactile_channel
+                .unwrap_or(false)
+        )),
     call!("TACTILE_TRANSDUCER_LEVEL_DOWN", |avr, cx| avr
         .sound()
         .tactile_level_down()),

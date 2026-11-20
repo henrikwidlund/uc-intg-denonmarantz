@@ -7,9 +7,9 @@ use crate::config_store::{self, DeviceConfig, Feature};
 use denon_marantz::proto::source::playing_kind;
 use denon_marantz::proto::{NetworkAudioCommand, PlayingKind, Power};
 use denon_marantz::{
-    Ask, Avr, AvrBuilder, Brand, Command, DiscoveredReceiver, DiscoveryConfig, Error, HttpConfig,
-    Info, InfoCheck, PageStatus, Query, ReceiverType, StartOptions, StartReport, Started, State,
-    TelnetSync, TunerInfo, UpdateMethod, Zone, discover_all,
+    Ask, Avr, AvrBuilder, Brand, Command, DeviceFeatures, DiscoveredReceiver, DiscoveryConfig,
+    Error, HttpConfig, Info, InfoCheck, PageStatus, Query, ReceiverType, StartOptions, StartReport,
+    Started, State, TelnetSync, TunerInfo, UpdateMethod, Zone, discover_all,
 };
 use log::debug;
 use std::borrow::Cow;
@@ -402,7 +402,7 @@ impl Missing {
 
 /// Values that the driver reads after the connect, in addition to the ones of the library. The
 /// entities need them. The picture mode is last.
-const EXTRA_QUERIES: [Query; 12] = [
+pub(crate) const EXTRA_QUERIES: [Query; 15] = [
     Query::Sleep,
     Query::HdmiOutput,
     Query::SpeakerPreset,
@@ -414,13 +414,18 @@ const EXTRA_QUERIES: [Query; 12] = [
     Query::Bass,
     Query::Treble,
     Query::MultEq,
+    Query::BluetoothLevel,
+    // The toggles of these need the current value.
+    Query::Imax,
+    Query::TactileChannel,
     Query::PictureMode,
 ];
 
 /// The values of older receivers, with the feature that they need.
-const OLDER_QUERIES: [(Feature, Query); 10] = [
+pub(crate) const OLDER_QUERIES: [(Feature, Query); 11] = [
     (Feature::ProLogicMode, Query::ProLogicMode),
     (Feature::SurroundBackMode, Query::SurroundBackMode),
+    (Feature::FrontHeight, Query::FrontHeight),
     (Feature::DynamicCompression, Query::DynamicCompression),
     (Feature::AutoFlagDetect, Query::AutoFlagDetect),
     (Feature::DialogLevel, Query::DialogLevel),
@@ -457,6 +462,16 @@ impl ExtraReads {
     }
 }
 
+/// Returns false for a query of a feature that `Deviceinfo.xml` does not list. The library skips
+/// such queries too. Receivers without a feature list are asked all.
+pub fn listed(features: Option<DeviceFeatures>, query: Query) -> bool {
+    features.is_none_or(|features| {
+        query
+            .device_feature()
+            .is_none_or(|feature| features.has(feature))
+    })
+}
+
 /// Queue the extra values and the values of older receivers that the receiver may have. It does
 /// not wait for the answers.
 pub async fn read_extra_values(avr: &Avr, reads: ExtraReads) {
@@ -469,8 +484,13 @@ pub async fn read_extra_values(avr: &Avr, reads: ExtraReads) {
     let asks: Vec<Ask<'_>> = EXTRA_QUERIES
         .into_iter()
         .chain(older)
+        .filter(|&query| listed(avr.info().features, query))
         .map(Ask::from)
         .collect();
+    // An empty ask clears the filter of repeated events in the library.
+    if asks.is_empty() {
+        return;
+    }
     if let Err(e) = avr.telnet_ask(&asks).await {
         debug!("extra values not read: {e}");
     }
@@ -916,6 +936,22 @@ const fn update_method(info: &Info) -> Option<config_store::HttpReadMethod> {
         UpdateMethod::AppCommand => Some(config_store::HttpReadMethod::AppCommand),
         UpdateMethod::StatusPages => Some(config_store::HttpReadMethod::StatusPages),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+    use denon_marantz::DeviceFeature;
+
+    #[test]
+    fn a_query_of_a_feature_that_is_not_listed_is_left_out() {
+        let listed_picture = DeviceFeatures::default().with(DeviceFeature::PictureMode);
+        assert!(listed(None, Query::PictureMode));
+        assert!(listed(Some(listed_picture), Query::PictureMode));
+        assert!(!listed(Some(DeviceFeatures::default()), Query::PictureMode));
+        // A query that needs no feature is always asked.
+        assert!(listed(Some(DeviceFeatures::default()), Query::Sleep));
     }
 }
 

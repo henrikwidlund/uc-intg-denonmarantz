@@ -409,7 +409,11 @@ async fn action_run(
         Action::Stop => send(avr, Command::Stop).await?,
         Action::Next => zone.press(RemoteKey::NextTrack).await?,
         Action::Previous => zone.press(RemoteKey::PreviousTrack).await?,
-        Action::Volume(volume) => zone.set_volume_db(media_player::volume_db(volume)).await?,
+        Action::Volume(volume) => {
+            let scale = avr.info().ranges.zone(Zone::Main).volume;
+            zone.set_volume_db(media_player::volume_db(volume, scale))
+                .await?;
+        }
         // The receiver steps from its own volume, so the state is not needed.
         Action::VolumeUp => zone.volume_up().await?,
         Action::VolumeDown => zone.volume_down().await?,

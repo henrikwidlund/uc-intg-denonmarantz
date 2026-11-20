@@ -1580,7 +1580,7 @@ mod tests {
                 .expect("send")
                 .expect("setup started");
             settle().await;
-            assert_eq!(69, entity_ids(&controller).await.len());
+            assert_eq!(70, entity_ids(&controller).await.len());
         }
 
         #[actix::test]
@@ -1601,7 +1601,7 @@ mod tests {
                 .await
                 .expect("send");
             settle().await;
-            assert_eq!(69, entity_ids(&controller).await.len());
+            assert_eq!(70, entity_ids(&controller).await.len());
         }
 
         #[actix::test]
@@ -1658,10 +1658,10 @@ mod tests {
             connect(&controller, "a").await;
             let ids = entity_ids(&controller).await;
             // The 42 entities of the Python integration (media player, remote, 11 selects and 29
-            // sensors), and 27 more: 6 selects, 6 switches, 2 numbers and 13 sensors. Before the
+            // sensors), and 28 more: 6 selects, 6 switches, 2 numbers and 14 sensors. Before the
             // first connect `CommApiVers` and the tuner are not known, so the 12 sensors of older
             // receivers and the network favorite and tuner preset selects are there too.
-            assert_eq!(69, ids.len());
+            assert_eq!(70, ids.len());
             for id in [
                 "media_player.SERIAL0000001",
                 "remote.SERIAL0000001",
@@ -1803,7 +1803,7 @@ mod tests {
                 .expect("send")
                 .expect("ok");
             wait_state(&events, "OK").await;
-            assert_eq!(69, entity_ids(&controller).await.len());
+            assert_eq!(70, entity_ids(&controller).await.len());
         }
 
         /// The states that a Remote gets when it asks for them.
@@ -1835,7 +1835,7 @@ mod tests {
             let controller = controller("purge", Some(PYTHON_CONFIG));
             let events = connect(&controller, "a").await;
             settle().await;
-            assert_eq!(69, entity_states(&controller).await.len());
+            assert_eq!(70, entity_states(&controller).await.len());
             controller
                 .send(start_setup("a", true))
                 .await
