@@ -243,7 +243,7 @@ pub struct DenonActor {
     reload_parts: u8,
     /// Network audio was paused with the pause command. See `View::paused`.
     paused: bool,
-    /// Time before a page or a toggle that failed is read again.
+    /// Time before a page or a telnet query that failed is tried again.
     page_retry_delay: Duration,
     /// Time between reads over HTTP while telnet is down.
     poll_interval: Duration,
@@ -256,7 +256,7 @@ pub struct DenonActor {
 }
 
 impl DenonActor {
-    /// Set the time before a page or a toggle that failed is read again. For tests.
+    /// Set the time before a page or a telnet query that failed is tried again. For tests.
     #[cfg(test)]
     pub const fn with_retry_delay(mut self, delay: Duration) -> Self {
         self.page_retry_delay = delay;

@@ -8,10 +8,11 @@ use denon_marantz::proto::source::playing_kind;
 use denon_marantz::proto::{NetworkAudioCommand, PlayingKind, Power};
 use denon_marantz::{
     Ask, Avr, AvrBuilder, Brand, Command, DiscoveredReceiver, DiscoveryConfig, Error, HttpConfig,
-    Info, InfoCheck, PageStatus, Query, QueryGroup, ReceiverType, StartOptions, StartReport,
-    Started, State, TelnetSync, TunerInfo, UpdateMethod, Zone, discover_all,
+    Info, InfoCheck, PageStatus, Query, ReceiverType, StartOptions, StartReport, Started, State,
+    TelnetSync, TunerInfo, UpdateMethod, Zone, discover_all,
 };
 use log::debug;
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::{sleep, timeout};
@@ -312,7 +313,7 @@ pub async fn keep_telnet(avr: Arc<Avr>, fast_until: Instant, name: String) {
     }
 }
 
-/// Time before a web page that failed is read again.
+/// Time before a web page or a telnet query that failed is tried again.
 pub const PAGE_RETRY_DELAY: Duration = Duration::from_secs(4);
 /// How often a web page that failed is read again.
 const PAGE_RETRIES: usize = 3;
@@ -428,21 +429,6 @@ pub async fn read_extra_values(avr: &Avr, reads: ExtraReads) {
     }
 }
 
-/// How often the toggle queries are sent again when a value is missing. Once: the receiver can
-/// drop a query now and then, and one more try is enough.
-const TOGGLE_RETRIES: usize = 1;
-
-/// A switch of the entities has no value. A receiver that is busy does not answer every query.
-fn toggles_missing(avr: &Avr) -> bool {
-    let state = avr.state();
-    let state = state.borrow();
-    let device = state.device();
-    device.tone_control.is_none()
-        || device.dynamic_eq.is_none()
-        || device.bluetooth_transmitter.is_none()
-        || device.triggers.iter().any(Option::is_none)
-}
-
 /// Pass other receiver values than the stored ones to `changed` as soon as the start has checked
 /// them. Then wait for the end of the start and, with telnet, for the answers of its telnet
 /// queries, and run [`read_missing_pages`]. Runs in the background: commands do not wait for it.
@@ -473,18 +459,21 @@ pub async fn after_start(
         debug!("[{name}] no answer to the telnet queries of the start");
     }
     let missing = Missing::of(report);
+    let unanswered = report.telnet_not_answered.clone();
     // `Started` holds the receiver, so the reads would not stop after a reconnect.
     drop(started);
-    read_missing_pages(avr, missing, name, delay, synced).await;
+    read_missing_pages(avr, missing, unanswered, name, delay, synced).await;
 }
 
 /// The receiver sometimes answers a web page with an error (HTTP status 500) and does not answer
 /// every telnet query when it is busy. The library asks once more at once. This reads the pages
-/// and the toggles again after a pause, so that their values do not stay empty until the next
-/// connect. Call it when the answers of the start are in. It calls `synced` first.
+/// again after a pause, and asks the `unanswered` telnet queries once more, so that their values
+/// do not stay empty until the next connect. Call it when the answers of the start are in. It
+/// calls `synced` first.
 async fn read_missing_pages(
     avr: Arc<Avr>,
     mut missing: Missing,
+    unanswered: Vec<Cow<'static, str>>,
     name: String,
     delay: Duration,
     synced: impl FnOnce(),
@@ -513,15 +502,21 @@ async fn read_missing_pages(
             }
         }
     }
-    for attempt in 1..=TOGGLE_RETRIES {
-        if Arc::strong_count(&avr) <= 1 || !toggles_missing(&avr) {
-            return;
-        }
-        sleep(delay).await;
-        debug!("[{name}] asking for the toggles again, try {attempt}");
-        if let Err(e) = avr.telnet_refresh_group(QueryGroup::Toggles).await {
-            debug!("[{name}] toggles not read: {e}");
-        }
+    // Once: the receiver can drop a query now and then, and one more try is enough.
+    if unanswered.is_empty() {
+        return;
+    }
+    sleep(delay).await;
+    if Arc::strong_count(&avr) <= 1 {
+        return;
+    }
+    debug!(
+        "[{name}] asking {} telnet queries again: {unanswered:?}",
+        unanswered.len()
+    );
+    let asks: Vec<Ask<'_>> = unanswered.iter().map(|query| Ask::Raw(query)).collect();
+    if let Err(e) = avr.telnet_ask(&asks).await {
+        debug!("[{name}] telnet queries not asked again: {e}");
     }
 }
 
@@ -971,7 +966,15 @@ mod page_tests {
         let held = avr.clone();
         let missing = Missing::of(started.basic_synced().await);
         drop(started);
-        read_missing_pages(avr, missing, "AVR".into(), Duration::from_millis(10), || ()).await;
+        read_missing_pages(
+            avr,
+            missing,
+            Vec::new(),
+            "AVR".into(),
+            Duration::from_millis(10),
+            || (),
+        )
+        .await;
         drop(held);
         // Two requests at the start and two for each of the three tries: the library asks twice.
         assert_eq!(2 + 3 * 2, web.requests(AUDIO_PAGE));
@@ -982,7 +985,15 @@ mod page_tests {
         let (web, avr, mut started) = started_with_web_status(500).await;
         let missing = Missing::of(started.basic_synced().await);
         drop(started);
-        read_missing_pages(avr, missing, "AVR".into(), Duration::from_millis(10), || ()).await;
+        read_missing_pages(
+            avr,
+            missing,
+            Vec::new(),
+            "AVR".into(),
+            Duration::from_millis(10),
+            || (),
+        )
+        .await;
         assert_eq!(2, web.requests(AUDIO_PAGE));
     }
 
@@ -992,7 +1003,15 @@ mod page_tests {
         let held = avr.clone();
         let missing = Missing::of(started.basic_synced().await);
         drop(started);
-        read_missing_pages(avr, missing, "AVR".into(), Duration::from_millis(10), || ()).await;
+        read_missing_pages(
+            avr,
+            missing,
+            Vec::new(),
+            "AVR".into(),
+            Duration::from_millis(10),
+            || (),
+        )
+        .await;
         drop(held);
         assert_eq!(1, web.requests(AUDIO_PAGE));
     }

@@ -435,9 +435,9 @@ async fn a_dynamic_eq_change_reads_only_the_reference_level() {
     assert_eq!(volume, rig.telnet.count("PSDYNVOL ?"));
 }
 
-/// The number of toggle queries once the start has sent its own queries: the number does not
+/// The number of dynamic EQ queries once the start has sent its own queries: the number does not
 /// change for a while.
-async fn toggle_queries_after_the_start(rig: &Rig) -> usize {
+async fn dynamic_eq_queries_after_the_start(rig: &Rig) -> usize {
     until("the first query", 5, || rig.telnet.count("PSDYNEQ ?") >= 1).await;
     let mut last = rig.telnet.count("PSDYNEQ ?");
     let mut since = Instant::now();
@@ -453,11 +453,11 @@ async fn toggle_queries_after_the_start(rig: &Rig) -> usize {
 }
 
 #[actix::test]
-async fn toggles_that_the_receiver_does_not_answer_are_asked_for_again_once() {
+async fn queries_that_the_receiver_does_not_answer_are_asked_for_again_once() {
     // The retry comes 3 s after the answers of the start are in: the count of the start is stable
     // before.
     let rig = rig(leaves_out_the_dynamic_eq, Duration::from_secs(3)).await;
-    let base = toggle_queries_after_the_start(&rig).await;
+    let base = dynamic_eq_queries_after_the_start(&rig).await;
     until("the retry", 20, || rig.telnet.count("PSDYNEQ ?") > base).await;
     // Not more than one try.
     tokio::time::sleep(Duration::from_secs(4)).await;
@@ -466,9 +466,9 @@ async fn toggles_that_the_receiver_does_not_answer_are_asked_for_again_once() {
 
 #[actix::test]
 async fn a_disconnect_drops_the_receiver_at_once() {
-    // A toggle has no answer: the start waits 60 s before it asks again.
+    // A query has no answer: the start waits 60 s before it asks again.
     let rig = rig(leaves_out_the_dynamic_eq, Duration::from_secs(60)).await;
-    toggle_queries_after_the_start(&rig).await;
+    dynamic_eq_queries_after_the_start(&rig).await;
     let avr = rig
         .actor
         .send(CurrentAvr)
@@ -480,9 +480,9 @@ async fn a_disconnect_drops_the_receiver_at_once() {
 }
 
 #[actix::test]
-async fn toggles_that_the_receiver_answers_are_not_asked_for_again() {
+async fn queries_that_the_receiver_answers_are_not_asked_for_again() {
     let rig = rig(answers_all, Duration::from_secs(3)).await;
-    let base = toggle_queries_after_the_start(&rig).await;
+    let base = dynamic_eq_queries_after_the_start(&rig).await;
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert_eq!(base, rig.telnet.count("PSDYNEQ ?"));
 }
@@ -682,7 +682,7 @@ async fn a_command_that_the_state_of_the_receiver_does_not_allow_is_answered_wit
 async fn the_start_asks_for_each_toggle_once() {
     // A long retry delay: only the queries of the start are counted.
     let rig = rig(answers_all, Duration::from_secs(60)).await;
-    let count = toggle_queries_after_the_start(&rig).await;
+    let count = dynamic_eq_queries_after_the_start(&rig).await;
     assert_eq!(
         1,
         count,
@@ -696,7 +696,7 @@ async fn the_start_asks_for_each_toggle_once() {
 #[actix::test]
 async fn a_reconnect_asks_for_each_group_of_the_start_once() {
     let rig = rig(answers_all, Duration::from_secs(60)).await;
-    let first = toggle_queries_after_the_start(&rig).await;
+    let first = dynamic_eq_queries_after_the_start(&rig).await;
     assert_eq!(1, first);
     rig.telnet.close();
     until("a new connection", 5, || rig.telnet.connections() >= 2).await;
@@ -926,7 +926,7 @@ async fn audyssey_values_stay_known_after_a_blank_http_answer() {
     TEST_BUILDER.with(|slot| *slot.borrow_mut() = Some(setup));
     let events = Arc::new(Mutex::new(Vec::new()));
     let collector = Collector(events.clone()).start();
-    // No second query for the toggles during the test.
+    // No second query during the test.
     let actor = DenonActor::new("SERIAL0000001".into(), cfg(), collector.recipient())
         .with_retry_delay(Duration::from_secs(60))
         .start();
