@@ -563,7 +563,7 @@ async fn read_missing_pages(
             }
         }
         if missing.signal {
-            match avr.refresh_signal().await {
+            match avr.refresh_signal_pages().await {
                 Ok(()) => missing.signal = false,
                 Err(e) => debug!("[{name}] signal pages not read: {e}"),
             }
