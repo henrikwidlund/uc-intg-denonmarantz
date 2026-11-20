@@ -53,10 +53,16 @@ impl Log for SwitchLogger {
 
 /// Start the logger. Call it once, before anything is logged.
 pub fn init(debug: bool) {
-    let normal = Builder::from_env(Env::default().default_filter_or(DEFAULT_FILTER)).build();
-    let debug_logger = std::env::var_os("RUST_LOG")
-        .is_none()
-        .then(|| Builder::new().parse_filters(DEBUG_FILTER).build());
+    // Milliseconds: the Remote log writes lines that come together with the same time.
+    let normal = Builder::from_env(Env::default().default_filter_or(DEFAULT_FILTER))
+        .format_timestamp_millis()
+        .build();
+    let debug_logger = std::env::var_os("RUST_LOG").is_none().then(|| {
+        Builder::new()
+            .parse_filters(DEBUG_FILTER)
+            .format_timestamp_millis()
+            .build()
+    });
     let logger = LOGGER.get_or_init(|| SwitchLogger {
         normal,
         debug: debug_logger,

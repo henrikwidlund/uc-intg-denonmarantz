@@ -225,6 +225,27 @@ pub async fn start_retry(
     deadline: Instant,
     stall: &mut Stall,
 ) -> Result<(Started, Duration), Error> {
+    // Test build only, not for main: every second connect opens no HEOS, to compare the connect
+    // times in one log.
+    #[cfg(not(test))]
+    {
+        static HEOS_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let off = HEOS_OFF.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
+        let host = &avr.info().host;
+        debug!(
+            "[{host}] start with HEOS {}",
+            if off { "off" } else { "on" }
+        );
+        retry(host, deadline, stall, || {
+            let options = StartOptions::new()
+                .telnet(telnet)
+                .telnet_wait(TELNET_WAIT)
+                .heos(!off);
+            avr.start_with(options)
+        })
+        .await
+    }
+    #[cfg(test)]
     retry(&avr.info().host, deadline, stall, || start(avr, telnet)).await
 }
 
@@ -237,7 +258,18 @@ async fn retry<T, F: Future<Output = Result<T, Error>>>(
     stall: &mut Stall,
     mut step: impl FnMut() -> F,
 ) -> Result<(T, Duration), Error> {
-    let mut first = true;
+    let begin = Instant::now();
+    let mut stalls = 0u8;
+    let mut network_errors = 0u16;
+    let tries = |ok: bool, last: Duration, stalls: u8, network_errors: u16| {
+        debug!(
+            "[{host}] connect {} after {} ms: {stalls} stalled, {network_errors} network errors, \
+             last try {} ms",
+            if ok { "done" } else { "failed" },
+            begin.elapsed().as_millis(),
+            last.as_millis()
+        );
+    };
     loop {
         let started = Instant::now();
         let result = match stall.limit.filter(|_| stall.restarts > 0) {
@@ -245,6 +277,7 @@ async fn retry<T, F: Future<Output = Result<T, Error>>>(
             Some(limit) => {
                 let Ok(result) = timeout(limit, step()).await else {
                     stall.restarts -= 1;
+                    stalls += 1;
                     debug!(
                         "[{host}] connect stalled after {} ms, starting again",
                         limit.as_millis()
@@ -255,18 +288,25 @@ async fn retry<T, F: Future<Output = Result<T, Error>>>(
             }
         };
         match result {
-            Ok(value) => return Ok((value, started.elapsed())),
+            Ok(value) => {
+                let took = started.elapsed();
+                tries(true, took, stalls, network_errors);
+                return Ok((value, took));
+            }
             // The library tries again while the connection cannot be built. A connection that
             // closed before the answer is tried again here.
             Err(e) if e.is_network() && Instant::now() + NETWORK_RETRY_INTERVAL < deadline => {
                 // One line for the first failure only: wake-up can need many tries.
-                if first {
+                if network_errors == 0 {
                     debug!("[{host}] network not ready: {e}");
-                    first = false;
                 }
+                network_errors = network_errors.saturating_add(1);
                 sleep(NETWORK_RETRY_INTERVAL).await;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                tries(false, started.elapsed(), stalls, network_errors);
+                return Err(e);
+            }
         }
     }
 }
@@ -275,6 +315,7 @@ async fn retry<T, F: Future<Output = Result<T, Error>>>(
 const TELNET_WAIT: Duration = Duration::from_secs(25);
 
 /// Start the receiver: read the zones, then telnet and the web pages follow in the background.
+#[cfg_attr(not(test), expect(dead_code, reason = "test build only"))]
 pub async fn start(avr: &Arc<Avr>, telnet: bool) -> Result<Started, Error> {
     let options = StartOptions::new().telnet(telnet).telnet_wait(TELNET_WAIT);
     // Tests open HEOS only with a fake.
