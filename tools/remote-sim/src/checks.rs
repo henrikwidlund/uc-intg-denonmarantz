@@ -1376,6 +1376,81 @@ pub async fn python_config(ctx: &mut Ctx) -> Check {
     result
 }
 
+/// Name and address of the receiver that is added but not used. 192.0.2.1 is a documentation
+/// address: nothing answers there.
+const UNUSED_NAME: &str = "Unused receiver";
+const UNUSED_ADDRESS: &str = "192.0.2.1";
+
+/// A second receiver without subscribed entities is not connected. It connects once an entity
+/// is subscribed, and disconnects when the last one is unsubscribed.
+pub async fn unused_receiver(ctx: &mut Ctx) -> Check {
+    let good = tokio::fs::read_to_string(ctx.driver.config_file()).await?;
+    let mut config = read_config(ctx).await?;
+    let mut unused = config_device(ctx, &config)?.clone();
+    unused["id"] = json!("0000000000F1");
+    unused["id_kind"] = json!("mac");
+    unused["mac"] = json!("0000000000F1");
+    unused["serial"] = json!("UNUSED000001");
+    unused["name"] = json!(UNUSED_NAME);
+    unused["address"] = json!(UNUSED_ADDRESS);
+    config
+        .as_array_mut()
+        .ok_or_else(|| Fail::new("config.json is not a list"))?
+        .push(unused);
+    ctx.driver.stop().await;
+    tokio::fs::write(ctx.driver.config_file(), config.to_string()).await?;
+    let result = async {
+        ctx.driver.start().await?;
+        ctx.client = crate::ws::Client::connect(ctx.driver.port).await?;
+        let ids = entity_ids(ctx).await?;
+        let (used, other): (Vec<String>, Vec<String>) =
+            ids.into_iter().partition(|id| id.ends_with(ctx.key.as_str()));
+        ensure!(!other.is_empty(), "no entities of the unused receiver");
+        ctx.client
+            .request_ok("subscribe_events", json!({ "entity_ids": used }))
+            .await?;
+        ctx.client.send_event("connect").await?;
+        ctx.client.refresh_states().await?;
+        wait_available(ctx, 20).await?;
+        ctx.client.listen(3).await?;
+        // The name in brackets starts the lines of its actor. The entity list holds the name
+        // without brackets.
+        let name = format!("[{UNUSED_NAME}]");
+        let tried = |log: &str| log.contains(UNUSED_ADDRESS) || log.contains(&name);
+        ensure!(
+            !tried(&ctx.driver.log_text().await),
+            "the unused receiver was connected"
+        );
+        // A subscribed entity makes it used.
+        let one = other[0].clone();
+        ctx.client
+            .request_ok("subscribe_events", json!({ "entity_ids": [one] }))
+            .await?;
+        ctx.client.listen(2).await?;
+        ensure!(
+            tried(&ctx.driver.log_text().await),
+            "no connect after the subscribe"
+        );
+        ctx.client
+            .request_ok("unsubscribe_events", json!({ "entity_ids": [one] }))
+            .await?;
+        ctx.client.listen(1).await?;
+        let log = ctx.driver.log_text().await;
+        ensure!(
+            log.contains(&format!("[{UNUSED_NAME}] not in use, disconnecting")),
+            "no disconnect after the unsubscribe"
+        );
+        Ok("not connected without subscriptions; connected after a subscribe, disconnected after the unsubscribe".to_owned())
+    }
+    .await;
+    ctx.driver.stop().await;
+    tokio::fs::write(ctx.driver.config_file(), good).await?;
+    restart(ctx).await?;
+    subscribe_all(ctx).await?;
+    wait_available(ctx, 20).await?;
+    result
+}
+
 pub async fn broken_config(ctx: &mut Ctx) -> Check {
     let good = tokio::fs::read_to_string(ctx.driver.config_file()).await?;
     ctx.driver.stop().await;

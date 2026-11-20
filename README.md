@@ -113,9 +113,14 @@ Commands with a number are sent as raw text with the remote entity:
 - With telnet, values come from the receiver as events. The signal info is not read on a timer. The setup has
   an option to read it every N seconds for receivers that do not report it.
 - Entities keep their state while the Remote sleeps.
+- Only receivers with entities in use are connected. The Python integration connects all of them.
 
 ## Network and wake-up
 
+- The driver connects only to receivers that are in use: a Remote that is awake subscribed at least one of
+  their entities. A receiver that no awake Remote uses is disconnected. A command to a receiver that is not in
+  use connects it (the driver logs a warning), and the next change of the subscriptions or of a Remote
+  disconnects it again.
 - The driver connects with the address and the values (`info`) of the last full connect. This sends no request:
   the start checks them. If the values changed, the driver saves them; if the type, the port or the read method
   changed, it connects again. If the start fails, or another receiver answers, the driver looks the receiver up:
@@ -123,10 +128,10 @@ Commands with a number are sent as raw text with the remote entity:
   address.
 - After the Remote wakes up, the network of the Remote can be down for a short time. The driver tries again
   for up to 3 seconds. A connection to the receiver that does not open in 0.25 seconds is tried again. A start or
-  lookup of the receiver that takes more than 3 times as long as the last start (at least 0.2 seconds) is started
-  again, at most 2 times. There is no such limit for the first connect, or if the last start took more than about
-  0.7 seconds. If telnet or HEOS cannot connect after wake-up, they are tried again every 0.05 seconds for 3
-  seconds, then less often (HEOS only if the receiver has it).
+  lookup of the receiver that takes more than 3 times as long as the fastest of the last 5 starts (at least 0.2
+  seconds) is started again, at most 4 times. There is no such limit for the first connect, or if that start took
+  more than about 0.7 seconds. If telnet or HEOS cannot connect after wake-up, they are tried again every 0.05
+  seconds for 3 seconds, then less often (HEOS only if the receiver has it).
 - A command that comes while the first connect runs waits for it, at most 3 seconds. Commands that do not need the
   state of the receiver (power, volume, mute, cursor keys, back, info, channel up and down, raw text, and next,
   previous and stop on receivers without HEOS) are sent when the receiver is known, before the start ends.

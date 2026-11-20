@@ -57,11 +57,17 @@ impl Handler<R2RequestMsg> for Controller {
     #[allow(clippy::too_many_lines)]
     fn handle(&mut self, msg: R2RequestMsg, ctx: &mut Self::Context) -> Self::Result {
         debug!("R2RequestMsg: {:?}", msg.request);
-        // A Remote that sends a request is not in standby.
+        // A Remote that sends a request is not in standby. The core can send a command before
+        // `exit_standby`: the receivers it uses connect now.
         let Some(session) = self.sessions.get_mut(&msg.ws_id) else {
             return_fut_err!(ServiceError::NotFound("No session found".into()));
         };
+        let woke = !session.awake();
         session.standby = false;
+        session.paused = false;
+        if woke {
+            self.update_connections(false);
+        }
 
         let req_id = msg.req_id;
         // Answered with an event, so it has no response message.

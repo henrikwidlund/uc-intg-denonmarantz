@@ -117,9 +117,21 @@ impl Ctx {
         format!("sensor.{kind}.{}", self.key)
     }
 
-    /// Connect a new Remote, like a Remote that wakes up.
+    /// Connect a new Remote, like a Remote that wakes up. Like the core, it subscribes the
+    /// entities before `connect`: the driver connects only receivers with subscribed entities.
     pub async fn reconnect(&mut self) -> Result<(), Fail> {
         self.client = Client::connect(self.driver.port).await?;
+        let data = self
+            .client
+            .request_ok("get_available_entities", serde_json::Value::Null)
+            .await?;
+        let ids: Vec<&str> = data["available_entities"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|e| e["entity_id"].as_str()).collect())
+            .unwrap_or_default();
+        self.client
+            .request_ok("subscribe_events", serde_json::json!({ "entity_ids": ids }))
+            .await?;
         self.client.send_event("connect").await
     }
 
@@ -283,6 +295,7 @@ async fn run(ctx: &mut Ctx) {
     ctx.step("remote_ui", checks::remote_ui).await;
     ctx.step("standby", checks::standby).await;
     ctx.step("remote_wake", checks::remote_wake).await;
+    ctx.step("unused_receiver", checks::unused_receiver).await;
     ctx.step("selects", checks::selects).await;
     ctx.step("remote_commands", checks::remote_commands).await;
     ctx.step("mute", checks::mute).await;

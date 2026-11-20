@@ -406,7 +406,7 @@ impl Controller {
         }
         if !self.devices.is_empty() {
             let _ = self.sm_consume(ws_id, &operation_mode::Input::ConfigurationAvailable, ctx);
-            self.connect_devices();
+            self.update_connections(true);
         }
     }
 
@@ -1019,7 +1019,7 @@ impl Controller {
             let _ = self.sm_consume(ws_id, &operation_mode::Input::ConfigurationAvailable, ctx);
         }
         if matches!(self.machine.state(), operation_mode::State::Running) {
-            self.connect_devices();
+            self.update_connections(true);
         }
         let state = if error.is_none() {
             IntegrationSetupState::Ok

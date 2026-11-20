@@ -15,6 +15,7 @@ use crate::config_store::{ConfigStore, DriverSettings};
 use crate::configuration::{DEF_SETUP_TIMEOUT_SEC, ENV_SETUP_TIMEOUT, Settings};
 use crate::controller::devices::Device;
 use crate::controller::handler::{AbortDriverSetup, SetupState};
+use crate::entities::EntityKind;
 use crate::errors::ServiceError;
 use actix::prelude::{Actor, Context, Recipient};
 use actix::{AsyncContext, SpawnHandle};
@@ -66,11 +67,14 @@ state_machine! {
 }
 
 /// One connected Remote.
+#[allow(clippy::struct_excessive_bools)]
 struct R2Session {
     recipient: Recipient<SendWsMessage>,
     /// Id of the last request message from the driver to the Remote.
     ws_id: u32,
     standby: bool,
+    /// The Remote sent `disconnect`: it does not use the receivers until `connect`.
+    paused: bool,
     subscribed_entities: HashSet<String>,
     /// The Remote read the entity states with `get_entity_states` in this session.
     read_states: bool,
@@ -89,12 +93,25 @@ impl R2Session {
             recipient,
             ws_id: 0,
             standby: false,
+            paused: false,
             subscribed_entities: HashSet::default(),
             read_states: false,
             read_all: false,
             missed: HashSet::default(),
             reconfiguring: None,
         }
+    }
+
+    /// The Remote uses the receivers: not in standby, and no `disconnect` since `connect`.
+    const fn awake(&self) -> bool {
+        !self.standby && !self.paused
+    }
+
+    /// True if the Remote subscribed an entity of the device `key`.
+    fn uses(&self, key: &str) -> bool {
+        self.subscribed_entities
+            .iter()
+            .any(|id| EntityKind::parse(id).is_some_and(|(k, _)| k == key))
     }
 
     const fn new_msg_id(&mut self) -> u32 {

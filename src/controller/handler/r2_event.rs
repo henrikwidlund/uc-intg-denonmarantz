@@ -21,30 +21,24 @@ impl Handler<R2EventMsg> for Controller {
 
         match msg.event {
             R2Event::Connect => {
-                self.connect_devices();
+                session.paused = false;
+                self.update_connections(true);
                 // The Remote might be out of sync.
                 self.send_device_state(&msg.ws_id);
             }
+            // The receivers stay connected while another awake Remote uses them.
             R2Event::Disconnect => {
-                // Keep the connections while another Remote is still awake.
-                if self
-                    .sessions
-                    .iter()
-                    .all(|(id, s)| *id == msg.ws_id || s.standby)
-                {
-                    self.disconnect_devices();
-                }
+                session.paused = true;
+                self.update_connections(false);
             }
             R2Event::EnterStandby => {
                 session.standby = true;
-                // Keep the connections while another Remote is still awake.
-                if self.sessions.values().all(|s| s.standby) {
-                    self.disconnect_devices();
-                }
+                self.update_connections(false);
             }
             R2Event::ExitStandby => {
                 session.standby = false;
-                self.connect_devices();
+                session.paused = false;
+                self.update_connections(true);
                 self.send_device_state(&msg.ws_id);
                 self.send_missed_states(&msg.ws_id);
             }

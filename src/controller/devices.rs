@@ -82,6 +82,8 @@ pub(super) struct Device {
     pub cfg: DeviceConfig,
     pub addr: Addr<DenonActor>,
     pub status: DeviceStatus,
+    /// An awake Remote uses the device, see [`Controller::update_connections`].
+    pub wanted: bool,
 }
 
 impl Controller {
@@ -99,6 +101,7 @@ impl Controller {
                 cfg,
                 addr,
                 status: DeviceStatus::Disconnected,
+                wanted: false,
             },
         );
     }
@@ -233,13 +236,8 @@ impl Controller {
                 self.send_entity_change(ws_id, &change);
             }
         }
-        // Connect the devices.
-        for id in &new {
-            if let Some((key, _)) = EntityKind::parse(id)
-                && let Some(device) = self.devices.get(key)
-            {
-                device.addr.do_send(Connect);
-            }
+        if !new.is_empty() {
+            self.update_connections(false);
         }
     }
 
@@ -275,26 +273,28 @@ impl Controller {
         for id in entity_ids {
             session.subscribed_entities.remove(id);
         }
-        // Disconnect devices without subscribed entities.
-        for (key, device) in &self.devices {
-            let used = self.sessions.values().any(|s| {
-                s.subscribed_entities
-                    .iter()
-                    .any(|id| EntityKind::parse(id).is_some_and(|(k, _)| k == &**key))
-            });
-            if !used {
-                debug!(
-                    "[{}] no subscribed entities, disconnecting",
-                    device.cfg.name
-                );
-                device.addr.do_send(Disconnect);
-            }
-        }
+        self.update_connections(false);
     }
 
-    pub(super) fn connect_devices(&self) {
-        for device in self.devices.values() {
-            device.addr.do_send(Connect);
+    /// Connect the devices that an awake Remote uses, and disconnect the others. A device is used
+    /// if the Remote subscribed one of its entities.
+    ///
+    /// With `force`, a used device is asked to connect even if it was used before. After
+    /// wake-up, this starts a connect that waits for its next try at once.
+    pub(super) fn update_connections(&mut self, force: bool) {
+        let sessions = &self.sessions;
+        for (key, device) in &mut self.devices {
+            let wanted = sessions.values().any(|s| s.awake() && s.uses(key));
+            if wanted {
+                if force || !device.wanted {
+                    device.addr.do_send(Connect);
+                }
+            } else if device.wanted || device.status != DeviceStatus::Disconnected {
+                // A command can connect a device that is not used, see `entity_command`.
+                debug!("[{}] not in use, disconnecting", device.cfg.name);
+                device.addr.do_send(Disconnect);
+            }
+            device.wanted = wanted;
         }
     }
 
@@ -313,20 +313,7 @@ impl Controller {
         for session in self.sessions.values_mut() {
             session.subscribed_entities.retain(|id| keep(id));
         }
-    }
-
-    /// Disconnect from the receivers if no Remote that is awake listens: all are in standby, or
-    /// none is connected.
-    pub(super) fn disconnect_if_idle(&self) {
-        if self.sessions.values().all(|s| s.standby) {
-            self.disconnect_devices();
-        }
-    }
-
-    pub(super) fn disconnect_devices(&self) {
-        for device in self.devices.values() {
-            device.addr.do_send(Disconnect);
-        }
+        self.update_connections(false);
     }
 
     pub(super) fn entity_command(
@@ -343,6 +330,16 @@ impl Controller {
             Ok(v) => v,
             Err(e) => return_fut_err!(e),
         };
+        // The Remote subscribes the entities it uses. The command still runs: the receiver
+        // connects for it.
+        if let Some((key, _)) = EntityKind::parse(&command.entity_id)
+            && !self.sessions.values().any(|s| s.uses(key))
+        {
+            warn!(
+                "command for {}, but no Remote subscribed an entity of this receiver",
+                command.entity_id
+            );
+        }
         let (addr, kind) = addr;
         if kind.entity_type() != command.entity_type {
             return_fut_err!(ServiceError::BadRequest(format!(
@@ -729,6 +726,91 @@ mod tests {
         controller.send_missed_states("a");
         settle().await;
         assert_eq!(1, sent(&a).len());
+    }
+
+    /// A device whose actor never runs: the messages to it stay in its queue.
+    fn add_idle_device(controller: &mut Controller, key: &str) {
+        let cfg: DeviceConfig =
+            serde_json::from_value(json!({ "id": key, "name": key, "address": "192.0.2.1" }))
+                .expect("config");
+        let addr = Context::<DenonActor>::new().address();
+        controller.devices.insert(
+            key.into(),
+            Device {
+                cfg,
+                addr,
+                status: DeviceStatus::Disconnected,
+                wanted: false,
+            },
+        );
+    }
+
+    fn add_session(controller: &mut Controller, ws_id: &str) {
+        let session = R2Session::new(Remote(Arc::default()).start().recipient());
+        controller.sessions.insert(ws_id.into(), session);
+    }
+
+    fn session<'a>(controller: &'a mut Controller, ws_id: &str) -> &'a mut R2Session {
+        controller.sessions.get_mut(ws_id).expect("session")
+    }
+
+    fn wanted(controller: &Controller) -> Vec<&str> {
+        let mut keys: Vec<&str> = controller
+            .devices
+            .iter()
+            .filter(|(_, d)| d.wanted)
+            .map(|(k, _)| &**k)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    #[actix::test]
+    async fn only_the_receivers_with_subscribed_entities_are_connected() {
+        let mut controller = new_controller();
+        add_idle_device(&mut controller, "A");
+        add_idle_device(&mut controller, "B");
+        add_session(&mut controller, "a");
+        // `connect` before `subscribe_events`, for example after a driver start.
+        controller.update_connections(true);
+        assert_eq!(Vec::<&str>::new(), wanted(&controller));
+        controller.subscribe("a", vec!["media_player.A".into(), "remote.A".into()]);
+        assert_eq!(vec!["A"], wanted(&controller));
+        controller.unsubscribe("a", &["media_player.A".into()]);
+        assert_eq!(vec!["A"], wanted(&controller));
+        controller.unsubscribe("a", &["remote.A".into()]);
+        assert_eq!(Vec::<&str>::new(), wanted(&controller));
+        // No ids means all entities.
+        controller.subscribe("a", vec!["media_player.B".into()]);
+        controller.unsubscribe("a", &[]);
+        assert_eq!(Vec::<&str>::new(), wanted(&controller));
+    }
+
+    #[actix::test]
+    async fn a_receiver_stays_connected_while_an_awake_remote_uses_it() {
+        let mut controller = new_controller();
+        add_idle_device(&mut controller, "A");
+        add_idle_device(&mut controller, "B");
+        for ws_id in ["a", "b"] {
+            add_session(&mut controller, ws_id);
+            controller.subscribe(ws_id, vec!["media_player.A".into()]);
+        }
+        controller.subscribe("b", vec!["media_player.B".into()]);
+        assert_eq!(vec!["A", "B"], wanted(&controller));
+        session(&mut controller, "b").standby = true;
+        controller.update_connections(false);
+        assert_eq!(vec!["A"], wanted(&controller));
+        // `disconnect` of the last awake Remote.
+        session(&mut controller, "a").paused = true;
+        controller.update_connections(false);
+        assert_eq!(Vec::<&str>::new(), wanted(&controller));
+        session(&mut controller, "b").standby = false;
+        controller.update_connections(true);
+        assert_eq!(vec!["A", "B"], wanted(&controller));
+        // A Remote that ends takes its subscriptions with it.
+        controller.sessions.remove("b");
+        controller.update_connections(false);
+        assert_eq!(Vec::<&str>::new(), wanted(&controller));
     }
 
     fn map(v: Value) -> Map<String, Value> {

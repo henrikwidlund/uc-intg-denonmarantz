@@ -36,7 +36,7 @@ impl Handler<R2SessionDisconnect> for Controller {
         }
         self.sessions.remove(&msg.id);
         // A Remote that restarted can leave an old connection. When it ends, the receivers are not
-        // needed if no other Remote is awake.
-        self.disconnect_if_idle();
+        // needed if no other awake Remote uses them.
+        self.update_connections(false);
     }
 }
