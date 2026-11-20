@@ -222,9 +222,9 @@ pub struct DenonActor {
     /// Incremented on each connect attempt and on close. Results of older attempts are ignored, and
     /// commands of an older attempt are not sent again.
     attempt: watch::Sender<u64>,
-    /// Time of the start of the last connect. It sets the time limit of the connect tries, see
+    /// How long the last connects took. They set the time limit of the connect tries, see
     /// [`discovery::Stall`].
-    last_connect: Option<Duration>,
+    connect_times: discovery::ConnectTimes,
     /// Incremented on each connect and disconnect. Results of older connections are ignored.
     generation: u64,
     connected_at: Option<Instant>,
@@ -301,7 +301,7 @@ impl DenonActor {
             attempts: 0,
             look_up: false,
             attempt: watch::Sender::new(0),
-            last_connect: None,
+            connect_times: discovery::ConnectTimes::default(),
             generation: 0,
             connected_at: None,
             emit_due: false,
@@ -536,7 +536,7 @@ impl DenonActor {
             .flatten();
 
         let addr = ctx.address();
-        let last = self.last_connect;
+        let last = self.connect_times.fastest();
         let fut = connect_avr(cfg, known, last, move |avr| {
             addr.do_send(Early(attempt, avr));
         });
@@ -591,7 +591,6 @@ impl DenonActor {
             started,
             took,
         } = connected;
-        self.last_connect = Some(took);
         info!(
             "[{}] connected in {} ms",
             self.cfg.name,
@@ -610,6 +609,8 @@ impl DenonActor {
         self.sound_mode = None;
         self.sound_groups = !self.cfg.use_telnet;
         self.update_address(address, version);
+        // After `update_address`: `took` is a time of the new address.
+        self.connect_times.add(took);
         self.update_receiver_info(avr.info(), version);
 
         ctx.add_message_stream(
@@ -947,6 +948,8 @@ impl DenonActor {
             self.cfg.name, self.cfg.address
         );
         self.cfg.address = address;
+        // The times of the old address do not apply.
+        self.connect_times = discovery::ConnectTimes::default();
         self.controller.do_send(DeviceEvent::Config {
             key: self.key.clone(),
             cfg: Box::new(self.cfg.clone()),
@@ -1262,8 +1265,8 @@ impl DenonActor {
 /// checks them, also that it is the same receiver. If that start fails, the receiver is looked up
 /// at once.
 ///
-/// The tries of the identify and the start have a time limit from `last`, the time of the last
-/// start, see [`discovery::Stall`]. The search on the network has none.
+/// The tries of the identify and the start have a time limit from `last`, the fastest of the last
+/// starts, see [`discovery::Stall`]. The search on the network has none.
 ///
 /// `early` gets the receiver before its start: commands that do not read the state can use it.
 async fn connect_avr(
@@ -1815,9 +1818,13 @@ impl Handler<UpdateConfig> for DenonActor {
 
     fn handle(&mut self, msg: UpdateConfig, ctx: &mut Self::Context) {
         let cfg = msg.0;
-        let reconnect = cfg.address != self.cfg.address
+        let new_address = cfg.address != self.cfg.address;
+        let reconnect = new_address
             || cfg.use_telnet != self.cfg.use_telnet
             || cfg.signal_poll_secs != self.cfg.signal_poll_secs;
+        if new_address {
+            self.connect_times = discovery::ConnectTimes::default();
+        }
         self.set_config(cfg);
         self.cfg_version += 1;
         if reconnect && self.want {

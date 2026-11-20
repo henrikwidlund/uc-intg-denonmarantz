@@ -24,7 +24,9 @@ const STALL_FACTOR: u32 = 3;
 /// A longer time limit is not used: the receiver is slow, and its tries are not started again.
 const STALL_MAX: Duration = Duration::from_secs(2);
 /// How often a stalled try is started again in one connect.
-const STALL_RESTARTS: u8 = 2;
+const STALL_RESTARTS: u8 = 4;
+/// How many connect times [`ConnectTimes`] keeps.
+const CONNECT_TIMES: usize = 5;
 /// Time allowed to open an HTTP connection to the receiver. On the local network it takes a few
 /// milliseconds. After wake-up, a lost connect packet is sent again only after 1 s: a new try after
 /// this time is faster.
@@ -193,8 +195,9 @@ pub struct Stall {
 }
 
 impl Stall {
-    /// The limit is [`STALL_FACTOR`] times `last`, the time of the last connect, and at least
-    /// [`STALL_MIN`]. Without `last`, or if the limit is over [`STALL_MAX`], there is no limit.
+    /// The limit is [`STALL_FACTOR`] times `last`, a normal connect time (see
+    /// [`ConnectTimes::fastest`]), and at least [`STALL_MIN`]. Without `last`, or if the limit is
+    /// over [`STALL_MAX`], there is no limit.
     pub fn new(last: Option<Duration>) -> Self {
         let limit = last
             .map(|last| last.saturating_mul(STALL_FACTOR).max(STALL_MIN))
@@ -206,6 +209,27 @@ impl Stall {
     }
 }
 
+/// The times of the last connects. A slow connect after wake-up must not raise the limit of
+/// [`Stall`]: the next wake-up would then wait for a lost packet (1 s) instead of starting again.
+#[derive(Debug, Default)]
+pub struct ConnectTimes {
+    times: [Option<Duration>; CONNECT_TIMES],
+    next: usize,
+}
+
+impl ConnectTimes {
+    /// Keep `took`. It replaces the oldest time.
+    pub const fn add(&mut self, took: Duration) {
+        self.times[self.next] = Some(took);
+        self.next = (self.next + 1) % CONNECT_TIMES;
+    }
+
+    /// The fastest of the kept times.
+    pub fn fastest(&self) -> Option<Duration> {
+        self.times.iter().flatten().min().copied()
+    }
+}
+
 /// Identify a receiver, see [`retry`].
 pub async fn identify_retry(
     host: &str,
@@ -213,7 +237,7 @@ pub async fn identify_retry(
     deadline: Instant,
     stall: &mut Stall,
 ) -> Result<Avr, Error> {
-    let (avr, _) = retry(host, deadline, stall, || identify(host, known)).await?;
+    let (avr, _) = retry("identify", host, deadline, stall, || identify(host, known)).await?;
     Ok(avr)
 }
 
@@ -225,19 +249,34 @@ pub async fn start_retry(
     deadline: Instant,
     stall: &mut Stall,
 ) -> Result<(Started, Duration), Error> {
-    retry(&avr.info().host, deadline, stall, || start(avr, telnet)).await
+    retry("start", &avr.info().host, deadline, stall, || {
+        start(avr, telnet)
+    })
+    .await
 }
 
 /// Run `step` until it works. A try that takes longer than the limit of `stall` is started again.
 /// After a network error, `step` runs again after a short delay, until `deadline`. Also gives the
-/// time of the try that worked.
+/// time of the try that worked. `step_name` names the step in the log.
 async fn retry<T, F: Future<Output = Result<T, Error>>>(
+    step_name: &str,
     host: &str,
     deadline: Instant,
     stall: &mut Stall,
     mut step: impl FnMut() -> F,
 ) -> Result<(T, Duration), Error> {
-    let mut first = true;
+    let begin = Instant::now();
+    let mut stalls = 0u8;
+    let mut network_errors = 0u16;
+    let tries = |ok: bool, last: Duration, stalls: u8, network_errors: u16| {
+        debug!(
+            "[{host}] {step_name} {} after {} ms: {stalls} stalled, {network_errors} network \
+             errors, last try {} ms",
+            if ok { "done" } else { "failed" },
+            begin.elapsed().as_millis(),
+            last.as_millis()
+        );
+    };
     loop {
         let started = Instant::now();
         let result = match stall.limit.filter(|_| stall.restarts > 0) {
@@ -245,8 +284,9 @@ async fn retry<T, F: Future<Output = Result<T, Error>>>(
             Some(limit) => {
                 let Ok(result) = timeout(limit, step()).await else {
                     stall.restarts -= 1;
+                    stalls += 1;
                     debug!(
-                        "[{host}] connect stalled after {} ms, starting again",
+                        "[{host}] {step_name} stalled after {} ms, starting again",
                         limit.as_millis()
                     );
                     continue;
@@ -255,18 +295,25 @@ async fn retry<T, F: Future<Output = Result<T, Error>>>(
             }
         };
         match result {
-            Ok(value) => return Ok((value, started.elapsed())),
+            Ok(value) => {
+                let took = started.elapsed();
+                tries(true, took, stalls, network_errors);
+                return Ok((value, took));
+            }
             // The library tries again while the connection cannot be built. A connection that
             // closed before the answer is tried again here.
             Err(e) if e.is_network() && Instant::now() + NETWORK_RETRY_INTERVAL < deadline => {
                 // One line for the first failure only: wake-up can need many tries.
-                if first {
+                if network_errors == 0 {
                     debug!("[{host}] network not ready: {e}");
-                    first = false;
                 }
+                network_errors = network_errors.saturating_add(1);
                 sleep(NETWORK_RETRY_INTERVAL).await;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                tries(false, started.elapsed(), stalls, network_errors);
+                return Err(e);
+            }
         }
     }
 }
