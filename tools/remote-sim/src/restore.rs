@@ -159,23 +159,31 @@ pub async fn write(avr: &Avr, queries: &[&str], lines: &[String]) -> Result<Vec<
     }
     // A busy receiver can answer too late, or ignore a line while it applies the sound mode. Send
     // the missed lines again and ask for them only. The Dirac and tone control lines are checked
-    // again too, because the retry changes them.
-    let mut missed = with_detour(lines, missed);
+    // again too, because the retry changes them. A Dirac change can change MultEQ and Dynamic EQ.
+    let missed = with_detour(lines, missed);
     send(avr, &missed).await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
     let mut again: Vec<&str> = Vec::new();
-    for query in missed
+    let mut queries: Vec<&str> = missed
         .iter()
         .filter_map(|line| position(line))
         .map(|i| QUERIES[i])
-    {
+        .collect();
+    if missed.iter().any(|line| line.starts_with(DIRAC)) {
+        queries.extend(DIRAC_DEPENDENT);
+    }
+    for query in queries {
         if !again.contains(&query) {
             again.push(query);
         }
     }
     let now = read(avr, &again).await?;
-    missed.retain(|line| !now.contains(line));
-    Ok(missed)
+    Ok(lines
+        .iter()
+        .filter(|line| position(line).is_some_and(|i| again.contains(&QUERIES[i])))
+        .filter(|line| !now.contains(line))
+        .cloned()
+        .collect())
 }
 
 fn differing(lines: &[String], now: &[String]) -> Vec<String> {
@@ -206,8 +214,17 @@ async fn send(avr: &Avr, lines: &[String]) -> Result<(), Fail> {
     let order = send_order(lines);
     for (i, line) in order.iter().enumerate() {
         avr.telnet_send(Zone::Main, Command::Raw(line)).await?;
+        let rest = &order[i + 1..];
+        // The receiver may reset the sound settings while it applies a sound mode.
+        if line.starts_with(SOUND_MODE) && !rest.is_empty() {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
         // The receiver may ignore tone control while it changes the Dirac filter.
-        if line.starts_with(DIRAC) && order[i + 1..].iter().any(|line| is_tone_level(line)) {
+        if line.starts_with(DIRAC)
+            && rest
+                .iter()
+                .any(|line| is_tone_level(line) || line.starts_with(TONE))
+        {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
@@ -242,7 +259,10 @@ fn is_tone_level(line: &str) -> bool {
     line.starts_with("PSBAS") || line.starts_with("PSTRE")
 }
 
+const SOUND_MODE: &str = "MS";
 const DIRAC: &str = "PSDIRAC";
+/// Queries of the values that a Dirac change can change.
+const DIRAC_DEPENDENT: &[&str] = &["PSMULTEQ: ?", "PSDYNEQ ?"];
 const DIRAC_OFF: &str = "PSDIRAC OFF";
 const TONE: &str = "PSTONE CTRL";
 const TONE_ON: &str = "PSTONE CTRL ON";

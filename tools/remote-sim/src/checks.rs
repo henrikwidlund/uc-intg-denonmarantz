@@ -71,12 +71,16 @@ async fn subscribe_all(ctx: &mut Ctx) -> Result<usize, Fail> {
 async fn read_tuner(ctx: &mut Ctx) -> Result<(), Fail> {
     let config = read_config(ctx).await?;
     let device = config_device(ctx, &config)?;
-    // The same rule as the driver: without the setup option, only a receiver that says it has
-    // no tuner gets no tuner entities.
-    ctx.tuner = device["tuner"]
-        .as_bool()
-        .unwrap_or(device["has_tuner"] != false);
+    ctx.tuner = has_tuner(device);
     Ok(())
+}
+
+/// The same rule as the driver: without the setup option, only a receiver that says it has no
+/// tuner gets no tuner entities.
+fn has_tuner(device: &Value) -> bool {
+    device["tuner"]
+        .as_bool()
+        .unwrap_or(device["has_tuner"] != false)
 }
 
 /// The Dirac filter that a `DIRAC_LIVE_FILTER_*` command selects.
@@ -528,7 +532,7 @@ pub async fn remote_ui(ctx: &mut Ctx) -> Check {
     let device = config_device(ctx, &config)?;
     let slots = device["quick_select_count"].as_u64();
     let left_out = usize::from(slots == Some(0))
-        + usize::from(!ctx.tuner)
+        + usize::from(!has_tuner(device))
         + usize::from(device["is_dirac_supported"] != true);
     let quick = options["user_interface"]["pages"]
         .as_array()
@@ -2003,6 +2007,11 @@ pub async fn simple_commands(ctx: &mut Ctx) -> Check {
     let late: Vec<String> = missed
         .extract_if(.., |line| line.starts_with("PSRSTR"))
         .collect();
+    let late_note = if late.is_empty() {
+        String::new()
+    } else {
+        format!(". Not taken: {late:?}. The next run sets them back")
+    };
     match (result, missed.is_empty()) {
         (Ok(note), true) if late.is_empty() => {
             Ok(format!("{note}, {} settings set back", saved.len()))
@@ -2012,11 +2021,14 @@ pub async fn simple_commands(ctx: &mut Ctx) -> Check {
             saved.len() - late.len()
         )),
         (Ok(note), false) => Err(Fail::new(format!(
-            "{note}. Settings not set back: {missed:?}"
+            "{note}. Settings not set back: {missed:?}{late_note}"
         ))),
-        (Err(e), true) => Err(e),
+        (Err(mut e), true) => {
+            e.msg.push_str(&late_note);
+            Err(e)
+        }
         (Err(e), false) => Err(Fail::new(format!(
-            "{}. Settings not set back: {missed:?}",
+            "{}. Settings not set back: {missed:?}{late_note}",
             e.msg
         ))),
     }
