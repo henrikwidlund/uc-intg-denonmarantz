@@ -19,7 +19,7 @@ sensitive-logs = ["denon-marantz/sensitive-logs"]
 
 [dependencies]
 uc_api = { git = "https://github.com/unfoldedcircle/api-model-rs", rev = "336beb1" }
-denon-marantz = { git = "https://github.com/henrikwidlund/rusty-denon-marantz", rev = "f838fd5abd798b4b407b1c4ed5d32fee44061d77", features = ["mdns", "serde", "heos"] }
+denon-marantz = { git = "https://github.com/henrikwidlund/rusty-denon-marantz", rev = "156f232ced37f62c741b3b8a2398352d1330a54c", features = ["mdns", "serde", "heos"] }
 
 # WebSocket server
 actix = "0.13.6"
