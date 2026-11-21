@@ -322,8 +322,12 @@ async fn retry<T, F: Future<Output = Result<T, Error>>>(
 const TELNET_WAIT: Duration = Duration::from_secs(25);
 
 /// Start the receiver: read the zones, then telnet and the web pages follow in the background.
+/// In HTTP mode the settings that otherwise only telnet gives are not read: no entity shows them.
 pub async fn start(avr: &Arc<Avr>, telnet: bool) -> Result<Started, Error> {
-    let options = StartOptions::new().telnet(telnet).telnet_wait(TELNET_WAIT);
+    let options = StartOptions::new()
+        .telnet(telnet)
+        .telnet_wait(TELNET_WAIT)
+        .settings(telnet);
     // Tests open HEOS only with a fake.
     #[cfg(test)]
     let options = options.heos(super::heos::TEST_HEOS.with(std::cell::Cell::get).is_some());
@@ -402,7 +406,7 @@ impl Missing {
 
 /// Values that the driver reads after the connect, in addition to the ones of the library. The
 /// entities need them. The picture mode is last.
-pub(crate) const EXTRA_QUERIES: [Query; 15] = [
+pub(crate) const EXTRA_QUERIES: [Query; 16] = [
     Query::Sleep,
     Query::HdmiOutput,
     Query::SpeakerPreset,
@@ -415,6 +419,7 @@ pub(crate) const EXTRA_QUERIES: [Query; 15] = [
     Query::Treble,
     Query::MultEq,
     Query::BluetoothLevel,
+    Query::SoundModeCategory,
     // The toggles of these need the current value.
     Query::Imax,
     Query::TactileChannel,

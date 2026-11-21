@@ -163,6 +163,7 @@ pub enum SensorKind {
     HeightGain,
     InstaPrevue,
     BluetoothLevel,
+    SoundModeCategory,
 }
 
 #[cfg(test)]

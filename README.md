@@ -45,7 +45,8 @@ Bluetooth or with zone 2. Please report problems as
 - **More entities** (with telnet, some also with HTTP only, see [Requirements](#requirements)): switches for
   tone control, Dynamic EQ, the three trigger outputs and the Bluetooth transmitter; numbers for bass and
   treble; selects for the Audyssey MultEQ mode, the quick select (smart select on Marantz), the tuner band and
-  the Bluetooth output; sensors for the active Dirac filter and the Bluetooth level. A quick select can
+  the Bluetooth output; sensors for the active Dirac filter, the Bluetooth level and the sound mode category
+  (movie, music, game or pure; only if the receiver lists it). A quick select can
   change the volume. The quick select, its simple commands and its UI page offer only the slots that the
   receiver has.
 - **Sensors**: volume, sound mode, input, mute, dimmer and eco mode. With telnet also sleep timer, audio delay,

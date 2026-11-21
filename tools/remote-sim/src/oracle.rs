@@ -191,5 +191,9 @@ pub fn expected(state: &State) -> Vec<Expected> {
                 .bluetooth_level
                 .map(|level| (i16::from(level) - 80).to_string()),
         ),
+        (
+            "sensor.sound_mode_category",
+            zone.sound_mode_category.map(|c| c.label().to_owned()),
+        ),
     ]
 }

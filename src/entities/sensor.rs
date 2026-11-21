@@ -4,9 +4,10 @@
 //! Sensor entities. Names, values and units are the ones of the Python integration.
 
 use crate::config_store::{DeviceConfig, Feature};
+use crate::device::discovery::listed;
 use crate::entities::{SelectKind, SensorKind, View, availability, is_off, select};
 use denon_marantz::proto::{InOut, Sleep};
-use denon_marantz::{Volume, Zone};
+use denon_marantz::{Query, Volume, Zone};
 use serde_json::{Map, Value, json};
 use uc_api::SensorDeviceClass;
 use uc_api::intg::AvailableIntgEntity;
@@ -95,6 +96,7 @@ pub const fn name(kind: SensorKind) -> &'static str {
         SensorKind::HeightGain => "Height Gain",
         SensorKind::InstaPrevue => "InstaPrevue",
         SensorKind::BluetoothLevel => "Bluetooth Level",
+        SensorKind::SoundModeCategory => "Sound Mode Category",
     }
 }
 
@@ -117,10 +119,14 @@ pub(super) const fn feature(kind: SensorKind) -> Option<Feature> {
 }
 
 /// The first seven sensors always exist, the others only with a telnet connection. The sensors of
-/// older receivers also need the feature. The signal
-/// sensors and the HDMI output that `Avr::update_signal_and_settings` reads also come over HTTP. The
-/// audio signal and the sampling rate need the receiver to list the query.
-pub const fn available(cfg: &DeviceConfig, kind: SensorKind) -> bool {
+/// older receivers also need the feature, and the sound mode category needs the receiver to list
+/// it. The signal sensors and the HDMI output that `Avr::update_signal_and_settings` reads also
+/// come over HTTP. The audio signal and the sampling rate need the receiver to list the query.
+pub fn available(cfg: &DeviceConfig, kind: SensorKind) -> bool {
+    if matches!(kind, SensorKind::SoundModeCategory) {
+        let features = cfg.info.as_ref().and_then(|info| info.features);
+        return cfg.use_telnet && listed(features, Query::SoundModeCategory);
+    }
     if matches!(kind, SensorKind::DiracFilter) {
         return cfg.use_telnet && cfg.has_dirac();
     }
@@ -278,6 +284,7 @@ fn value(v: &View<'_>, kind: SensorKind) -> (Value, Option<&'static str>) {
         SensorKind::BluetoothLevel => {
             decibels(device.bluetooth_level.map(|level| level.cast_signed() - 80))
         }
+        SensorKind::SoundModeCategory => text(zone.sound_mode_category.map(|x| x.label())),
     };
     let unit = match kind {
         SensorKind::VolumeDb

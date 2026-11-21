@@ -1733,6 +1733,34 @@ async fn fake_info() -> Info {
 }
 
 #[actix::test]
+async fn the_sound_mode_category_sensor_needs_the_receiver_to_list_it() {
+    use crate::entities::sensor;
+    use denon_marantz::{DeviceFeature, DeviceFeatures};
+    let info = fake_info().await;
+    let with = |features| DeviceConfig {
+        info: Some(Info {
+            features,
+            ..info.clone()
+        }),
+        ..cfg()
+    };
+    let kind = SensorKind::SoundModeCategory;
+    let listed = DeviceFeatures::default().with(DeviceFeature::SoundModeGenre);
+    assert!(sensor::available(&with(Some(listed)), kind));
+    assert!(!sensor::available(
+        &with(Some(DeviceFeatures::default())),
+        kind
+    ));
+    // A receiver without a feature list may have it.
+    assert!(sensor::available(&with(None), kind));
+    let http_only = DeviceConfig {
+        use_telnet: false,
+        ..with(Some(listed))
+    };
+    assert!(!sensor::available(&http_only, kind));
+}
+
+#[actix::test]
 async fn a_connect_stores_the_receiver_values_and_the_next_one_uses_them() {
     let rig = rig(answers_all, QUICK).await;
     until("the stored values", 5, || {

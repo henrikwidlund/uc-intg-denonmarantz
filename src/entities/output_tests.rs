@@ -220,6 +220,19 @@ fn bluetooth_level_is_shown_in_db() {
 }
 
 #[test]
+fn sound_mode_category_is_shown_with_its_name() {
+    let cfg = cfg();
+    let category =
+        |lines: &[&str]| sensor(&view(&state(lines), &cfg), SensorKind::SoundModeCategory);
+    assert_eq!(json!("Music"), category(&["PWON", "SSSMG MUS"])["value"]);
+    assert_eq!(
+        json!("Game"),
+        category(&["PWON", "SSSMG MUS", "SSSMG GAM"])["value"]
+    );
+    assert_eq!(json!(super::sensor::EMPTY), category(&["PWON"])["value"]);
+}
+
+#[test]
 fn media_is_cleared_when_the_source_changes() {
     let cfg = cfg();
     let playing = state(&["PWON", "SINET", "NSE0Now Playing", "NSE1A Title"]);
