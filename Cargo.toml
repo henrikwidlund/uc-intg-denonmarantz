@@ -40,19 +40,19 @@ rust-fsm = "0.8.0"
 const_format = "0.2.37"
 strum = { version = "0.28.0", features = ["derive"] }
 thiserror = "2.0.21"
-jiff = { version = "1.0.0", default-features = false, features = ["serde", "std"] }
+jiff = { version = "1.0.2", default-features = false, features = ["serde", "std"] }
 bytestring = "1.6.0"
 uuid = { version = "1.29.3", features = ["v4"] }
 
 # Logging. The library logs with tracing. The `log` feature forwards its events to env_logger. The
 # actix crates turn it on too, but the driver must not depend on that.
 tracing = { version = "0.1.44", default-features = false, features = ["log", "std"] }
-env_logger = "0.11.11"
+env_logger = "0.11.12"
 log = "0.4.35"
 mdns-sd = { version = "0.22.0", optional = true }
 
 [build-dependencies]
-built = { version = "0.8.1", features = ["cargo-lock"] }
+built = { version = "0.9.0", features = ["cargo-lock"] }
 
 [lints.rust]
 unsafe_code = "forbid"
