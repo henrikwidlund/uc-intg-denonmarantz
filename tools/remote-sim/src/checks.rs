@@ -1532,6 +1532,9 @@ pub async fn python_config(ctx: &mut Ctx) -> Check {
         .ok_or_else(|| Fail::new("config.json has no serial number"))?
         .to_owned();
     let mac = device["mac"].clone();
+    // The setup option "Receiver has a tuner" is not in the file of the Python integration. Without
+    // it, the receiver decides: the tuner entities can come or go.
+    let tuner_differs = has_tuner(device) != (device["has_tuner"] != false);
     let mut python = serde_json::Map::new();
     for field in PYTHON_FIELDS {
         if let Some(value) = device.get(field) {
@@ -1552,12 +1555,13 @@ pub async fn python_config(ctx: &mut Ctx) -> Check {
     tokio::fs::write(ctx.driver.config_file(), json!([python]).to_string()).await?;
     let result = async {
         restart(ctx).await?;
-        let after = entity_ids(ctx).await?;
+        // Right after the start the receiver may not be read yet: the driver can offer more
+        // entities.
+        let before = entity_ids(ctx).await?;
+        let missing: Vec<_> = expected.difference(&before).collect();
         ensure!(
-            after == expected,
-            "entities differ: {} expected with the key {serial}, {} after",
-            expected.len(),
-            after.len()
+            missing.is_empty(),
+            "entities missing with the key {serial}: {missing:?}"
         );
         subscribe_all(ctx).await?;
         let state = wait_available(ctx, 20).await?;
@@ -1582,9 +1586,33 @@ pub async fn python_config(ctx: &mut Ctx) -> Check {
             "id_kind {} written for a serial number key",
             saved["id_kind"]
         );
+        // After the read, the entities follow what the receiver lists.
+        let end = Instant::now() + Duration::from_secs(10);
+        let tuner = |id: &&String| tuner_differs && id.contains(".tuner_");
+        let after = loop {
+            let ids = entity_ids(ctx).await?;
+            let same = ids.symmetric_difference(&expected).all(|id| tuner(&id));
+            if same || Instant::now() > end {
+                break ids;
+            }
+            sleep(Duration::from_millis(200)).await;
+        };
+        let missing: Vec<_> = expected
+            .difference(&after)
+            .filter(|id| !tuner(id))
+            .collect();
+        let other: Vec<_> = after
+            .difference(&expected)
+            .filter(|id| !tuner(id))
+            .collect();
+        ensure!(
+            missing.is_empty() && other.is_empty(),
+            "entities differ after the read with the key {serial}: missing {missing:?}, not expected {other:?}"
+        );
         Ok(format!(
-            "same {} entities with the key {serial}, state {state}, mac {} added",
-            after.len(),
+            "same {} entities with the key {serial} ({} tuner entities differ), state {state}, mac {} added",
+            expected.len(),
+            after.symmetric_difference(&expected).count(),
             saved["mac"]
         ))
     }
@@ -1669,7 +1697,7 @@ pub async fn unused_receiver(ctx: &mut Ctx) -> Check {
     tokio::fs::write(ctx.driver.config_file(), good).await?;
     restart(ctx).await?;
     subscribe_all(ctx).await?;
-    wait_available(ctx, 20).await?;
+    settle(ctx).await?;
     result
 }
 
@@ -1678,7 +1706,9 @@ pub async fn broken_config(ctx: &mut Ctx) -> Check {
     ctx.driver.stop().await;
     tokio::fs::write(ctx.driver.config_file(), "[{\"broken\": ").await?;
     let result = async {
-        restart(ctx).await?;
+        // Without a receiver the driver needs a setup: it does not give entities.
+        ctx.driver.start().await?;
+        ctx.client = crate::ws::Client::connect(ctx.driver.port).await?;
         ctx.client
             .request_ok("get_driver_version", Value::Null)
             .await?;
@@ -1695,7 +1725,6 @@ pub async fn broken_config(ctx: &mut Ctx) -> Check {
     tokio::fs::write(ctx.driver.config_file(), good).await?;
     restart(ctx).await?;
     subscribe_all(ctx).await?;
-    wait_available(ctx, 20).await?;
     settle(ctx).await?;
     result
 }
