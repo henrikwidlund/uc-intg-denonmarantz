@@ -7,10 +7,9 @@ The driver is an alternative to the Python integration that is part of the Remot
 driver id (`denonavr_rs`), because the Python integration cannot be stopped or uninstalled. The `config.json`,
 the entity names and the command names are the same, so receivers that are set up with the Python integration
 work without a new setup. The driver adds what it finds on the receiver to `config.json`: the serial number,
-the MAC address, the receiver type, the HTTP read method, if the HDMI output can be read over HTTP, the
-number of quick selects, the values that the receiver lists for HTTP, `CommApiVers` (the protocol
-generation), if the receiver has a tuner, the form and names of the tuner presets, the names of the network
-favorites, and what the last full connect found (`info`). The Python integration ignores them.
+the MAC address, the receiver type, the HTTP read method, `CommApiVers` (the protocol generation), if the
+receiver has a tuner, the form and names of the tuner presets, the names of the network favorites, and what
+the last full connect found (`info`). The Python integration ignores them.
 
 The device id in the entity ids is the MAC address of the receiver. Receivers from about 2011 and older do not
 give it: they use the serial number. Receivers that are set up with the Python integration keep the serial

@@ -32,8 +32,6 @@ fn cfg() -> DeviceConfig {
         signal_poll_secs: 0,
         receiver_type: None,
         update_method: None,
-        hdmi_output_over_http: None,
-        listed_queries: None,
         comm_api_version: None,
         has_tuner: None,
         tuner_presets_lettered: None,

@@ -865,10 +865,10 @@ impl DenonActor {
         });
     }
 
-    /// Take what the configuration keeps of the receiver: the generation, the HTTP read method, the
-    /// HDMI output over HTTP, the number of quick selects, the receiver values for the next connect,
-    /// and the serial number and MAC address if they are not stored yet. A configuration of the
-    /// Python integration does not have them. The controller saves them.
+    /// Take what the configuration keeps of the receiver: the generation, the HTTP read method,
+    /// `CommApiVers`, the tuner, the receiver values for the next connect, and the serial number
+    /// and MAC address if they are not stored yet. A configuration of the Python integration does
+    /// not have them. The controller saves them.
     ///
     /// The receiver kind is not taken if the answers do not prove the type: it can be wrong, and
     /// a new kind removes entities.
@@ -2107,8 +2107,6 @@ mod tests {
             signal_poll_secs: 0,
             receiver_type: None,
             update_method: None,
-            hdmi_output_over_http: None,
-            listed_queries: None,
             comm_api_version: None,
             has_tuner: None,
             tuner_presets_lettered: None,

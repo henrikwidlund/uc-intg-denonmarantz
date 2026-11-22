@@ -119,23 +119,6 @@ pub struct DeviceConfig {
         deserialize_with = "none_if_unknown"
     )]
     pub update_method: Option<HttpReadMethod>,
-    /// The receiver reads and sets the HDMI output over HTTP. It is found at the setup and checked
-    /// at each connect. Kept in the file: the entities follow `info`.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "none_if_unknown"
-    )]
-    pub hdmi_output_over_http: Option<bool>,
-    /// The `AppCommand` queries that the receiver lists. `None` if it has no list: then it is asked
-    /// for all of them. It is found at the setup and checked at each connect. Kept in the file:
-    /// the entities follow `info`.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "none_if_unknown"
-    )]
-    pub listed_queries: Option<HttpQueries>,
     /// `CommApiVers` of `Deviceinfo.xml`: the protocol generation. It decides HEOS and the commands
     /// of older receivers. It is found at the setup and checked at each connect.
     #[serde(
@@ -203,28 +186,12 @@ impl IdKind {
     }
 }
 
-/// The `AppCommand` queries that the receiver lists in `Deviceinfo.xml`.
-#[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct HttpQueries {
-    pub tone_control: bool,
-    pub audyssey: bool,
-    pub video_info: bool,
-    pub audio_info: bool,
-    pub input_signal: bool,
-    pub active_speaker: bool,
-    pub output_settings: bool,
-}
-
 /// What the driver found on the receiver. A change makes the controller check the entities again.
 /// Which entities come follows `DeviceConfig::info`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ReceiverKind {
     pub receiver_type: Option<ReceiverGeneration>,
     pub update_method: Option<HttpReadMethod>,
-    pub hdmi_output_over_http: Option<bool>,
-    pub listed_queries: Option<HttpQueries>,
     pub comm_api_version: Option<CommApiVersion>,
     pub has_tuner: Option<bool>,
 }
@@ -499,8 +466,6 @@ impl DeviceConfig {
         ReceiverKind {
             receiver_type: self.receiver_type,
             update_method: self.update_method,
-            hdmi_output_over_http: self.hdmi_output_over_http,
-            listed_queries: self.listed_queries,
             comm_api_version: self.comm_api_version,
             has_tuner: self.has_tuner,
         }
@@ -509,8 +474,6 @@ impl DeviceConfig {
     pub const fn set_kind(&mut self, kind: ReceiverKind) {
         self.receiver_type = kind.receiver_type;
         self.update_method = kind.update_method;
-        self.hdmi_output_over_http = kind.hdmi_output_over_http;
-        self.listed_queries = kind.listed_queries;
         self.comm_api_version = kind.comm_api_version;
         self.has_tuner = kind.has_tuner;
     }
@@ -990,8 +953,6 @@ mod tests {
             signal_poll_secs: 10,
             receiver_type: None,
             update_method: None,
-            hdmi_output_over_http: None,
-            listed_queries: None,
             comm_api_version: None,
             has_tuner: None,
             tuner_presets_lettered: None,
@@ -1099,8 +1060,6 @@ mod tests {
         assert!(
             !text.contains("receiver_type")
                 && !text.contains("update_method")
-                && !text.contains("hdmi_output_over_http")
-                && !text.contains("listed_queries")
                 && !text.contains("comm_api_version"),
             "{text}"
         );
@@ -1108,11 +1067,6 @@ mod tests {
         let d = DeviceConfig {
             receiver_type: Some(ReceiverGeneration::AvrX2016),
             update_method: Some(HttpReadMethod::AppCommand),
-            hdmi_output_over_http: Some(true),
-            listed_queries: Some(HttpQueries {
-                audyssey: true,
-                ..HttpQueries::default()
-            }),
             comm_api_version: CommApiVersion::parse("0301"),
             ..device()
         };
@@ -1120,8 +1074,6 @@ mod tests {
         assert!(
             text.contains(r#""receiver_type":"avr_x2016""#)
                 && text.contains(r#""update_method":"app_command""#)
-                && text.contains(r#""hdmi_output_over_http":true"#)
-                && text.contains(r#""audyssey":true"#)
                 && text.contains(r#""comm_api_version":"0301""#),
             "{text}"
         );
@@ -1187,12 +1139,27 @@ mod tests {
 
     #[test]
     fn an_unknown_receiver_kind_reads_as_none() {
-        // `quick_select_count` is an old field: a file with it still loads.
+        // `quick_select_count`, `hdmi_output_over_http` and `listed_queries` are old fields: a file
+        // with them still loads.
         let d: DeviceConfig = serde_json::from_str(
             r#"{"id":"A","name":"C","address":"h","receiver_type":"avr_z","update_method":7,"hdmi_output_over_http":"yes","quick_select_count":4,"listed_queries":[1],"comm_api_version":"301"}"#,
         )
         .expect("json");
         assert_eq!(ReceiverKind::default(), d.kind());
+    }
+
+    #[test]
+    fn old_http_fields_load_and_are_not_saved() {
+        let d: DeviceConfig = serde_json::from_str(
+            r#"{"id":"A","name":"C","address":"h","receiver_type":"avr_x2016","hdmi_output_over_http":true,"listed_queries":{"audyssey":true}}"#,
+        )
+        .expect("json");
+        assert_eq!(Some(ReceiverGeneration::AvrX2016), d.receiver_type);
+        let text = serde_json::to_string(&d).expect("json");
+        assert!(
+            !text.contains("hdmi_output_over_http") && !text.contains("listed_queries"),
+            "{text}"
+        );
     }
 
     #[test]

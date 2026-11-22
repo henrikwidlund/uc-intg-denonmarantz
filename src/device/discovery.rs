@@ -877,16 +877,6 @@ pub fn receiver_kind(info: &Info) -> config_store::ReceiverKind {
     config_store::ReceiverKind {
         receiver_type: receiver_type(info),
         update_method: update_method(info),
-        hdmi_output_over_http: Some(info.hdmi_output_over_http()),
-        listed_queries: info.queries.as_ref().map(|q| config_store::HttpQueries {
-            tone_control: q.tone_control,
-            audyssey: q.audyssey,
-            video_info: q.video_info,
-            audio_info: q.audio_info,
-            input_signal: q.input_signal,
-            active_speaker: q.active_speaker,
-            output_settings: q.output_settings,
-        }),
         comm_api_version: info.comm_api_version.as_deref().map_or(
             Some(config_store::CommApiVersion::MISSING),
             config_store::CommApiVersion::parse,

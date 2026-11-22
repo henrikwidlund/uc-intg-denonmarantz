@@ -654,8 +654,6 @@ impl Controller {
                         signal_poll_secs: options.signal_poll_secs,
                         receiver_type: identified.kind.receiver_type,
                         update_method: identified.kind.update_method,
-                        hdmi_output_over_http: identified.kind.hdmi_output_over_http,
-                        listed_queries: identified.kind.listed_queries,
                         comm_api_version: identified.kind.comm_api_version,
                         has_tuner: identified.kind.has_tuner,
                         tuner: Some(options.has_tuner),

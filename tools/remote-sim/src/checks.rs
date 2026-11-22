@@ -1458,12 +1458,7 @@ pub async fn config_file(ctx: &mut Ctx) -> Check {
     );
     // `mac` is missing on receivers that do not give it. `id_kind` is missing for the serial
     // number.
-    let kind = [
-        "receiver_type",
-        "update_method",
-        "hdmi_output_over_http",
-        "serial",
-    ];
+    let kind = ["receiver_type", "update_method", "serial"];
     let missing: Vec<_> = kind.iter().filter(|f| device.get(**f).is_none()).collect();
     ensure!(
         missing.is_empty(),
@@ -1481,7 +1476,7 @@ pub async fn config_file(ctx: &mut Ctx) -> Check {
         device[id_field]
     );
     Ok(format!(
-        "id {} ({}), serial {}, mac {}, address {}, use_telnet {}, receiver_type {}, update_method {}, hdmi_output_over_http {}, quick_select_count {}",
+        "id {} ({}), serial {}, mac {}, address {}, use_telnet {}, receiver_type {}, update_method {}, quick_select_count {}",
         device["id"],
         device["id_kind"],
         device["serial"],
@@ -1490,7 +1485,6 @@ pub async fn config_file(ctx: &mut Ctx) -> Check {
         device["use_telnet"],
         device["receiver_type"],
         device["update_method"],
-        device["hdmi_output_over_http"],
         device["info"]["quick_select_count"]
     ))
 }
