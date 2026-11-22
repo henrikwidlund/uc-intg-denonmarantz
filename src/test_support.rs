@@ -451,7 +451,7 @@ async fn read_head(
 }
 
 /// A fake web interface (port 11080 of a receiver). It answers every page with one status and
-/// records the paths.
+/// records the paths. `start_slow` answers after a delay.
 pub struct FakeWeb {
     port: u16,
     paths: Arc<Mutex<Vec<String>>>,
@@ -459,6 +459,10 @@ pub struct FakeWeb {
 
 impl FakeWeb {
     pub async fn start(status: u16) -> Self {
+        Self::start_slow(status, Duration::ZERO).await
+    }
+
+    pub async fn start_slow(status: u16, delay: Duration) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind the fake web interface");
@@ -472,6 +476,9 @@ impl FakeWeb {
                     let mut buffer = Vec::new();
                     while let Some((_, path, _)) = read_head(&mut socket, &mut buffer).await {
                         seen.lock().expect("lock").push(path);
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
                         let head = format!("HTTP/1.1 {status} X\r\nContent-Length: 0\r\n\r\n");
                         if socket.write_all(head.as_bytes()).await.is_err() {
                             return;

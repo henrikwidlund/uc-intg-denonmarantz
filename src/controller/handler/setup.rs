@@ -224,7 +224,7 @@ impl Options {
             }),
             json!({
                 "id": "signal_poll_secs",
-                "label": { "en": "Read the signal info every N seconds (0: only when the receiver reports it)" },
+                "label": { "en": "Read the signal info every N seconds (0: no extra reads; without telnet it is read every 10 s)" },
                 "field": { "number": {
                     "value": self.signal_poll_secs, "min": 0, "max": MAX_SIGNAL_POLL_SECS,
                     "steps": 1, "decimals": 0, "unit": { "en": "s" }

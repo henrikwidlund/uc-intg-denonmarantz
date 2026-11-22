@@ -308,11 +308,12 @@ The tuner shows the frequency as the title and the band as the artist. The keys 
 step "Signal sensors and the signal read option" \
 "A source with a video and audio signal is playing." \
 "Look at the sensors for audio and video signal, channels, resolution, HDR, pixel depth, FRL and color space.
-Play an HDR10 or Dolby Vision source, then an SDR source. Then set 'Read the signal info every N seconds' to 10
-in the setup." \
+Play an HDR10 or Dolby Vision source, then an SDR source. On a receiver from before about 2016 with telnet, then
+set 'Read the signal info every N seconds' to 10 in the setup." \
 "The sensors show the signal of the receiver. With HDR the color space shows the BT.2020 part, for example
-4:2:2/BT.2020; with SDR it does not. They follow a change of source. With the option on, they follow also when
-the receiver does not report a change." \
+4:2:2/BT.2020; with SDR it does not. They follow a change of source within about 10 seconds, also when the
+receiver does not report it (newer receivers with telnet: 5 seconds; HTTP only: 10 seconds; older receivers
+with telnet: only with the option on)." \
 "recent_log 'signal|WARN|ERROR'"
 
 step "Simple commands and pages" \

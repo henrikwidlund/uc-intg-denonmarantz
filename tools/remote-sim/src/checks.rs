@@ -1429,8 +1429,8 @@ const QUERIED: [(&str, Query, bool); 65] = {
 
 /// The selects, sensors, switches and numbers in HTTP mode for the `info` of the receiver in
 /// `config.json`, as ids without the key. With `info`, an entity comes if the receiver may have
-/// the value and the HTTP poll (`Avr::update` and `Avr::update_signal_and_settings`) reads it, or,
-/// with the signal timer on, `Avr::refresh_signal_pages`. The sources in `missing` give no values.
+/// the value and the HTTP poll (`Avr::update` and `Avr::refresh_signal_pages`, which also does the
+/// read of `Avr::update_signal_and_settings`) reads it. The sources in `missing` give no values.
 /// Without `info`, the entities of the Python integration come. Dirac also needs the setup option,
 /// and the quick select its first slot. An `info` that does not load counts as none, as in the
 /// driver: the note says so.
@@ -1442,14 +1442,8 @@ fn http_entities(device: &Value) -> (BTreeSet<&'static str>, Option<String>) {
     };
     let missing: MissingSources =
         serde_json::from_value(device["missing"].clone()).unwrap_or_default();
-    // The poll, and the signal pages if the signal timer is on.
-    let mut poll = HttpReads::UPDATE | HttpReads::SIGNAL_AND_SETTINGS;
-    if device["signal_poll_secs"]
-        .as_u64()
-        .is_some_and(|secs| secs > 0)
-    {
-        poll |= HttpReads::SIGNAL_PAGES;
-    }
+    // The reads of the poll, `POLL_READS` in the driver.
+    let poll = HttpReads::UPDATE | HttpReads::SIGNAL_AND_SETTINGS | HttpReads::SIGNAL_PAGES;
     let dirac = device["is_dirac_supported"] == true;
     let entities = QUERIED
         .iter()

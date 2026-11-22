@@ -25,8 +25,10 @@ const CONFIG_FILE: &str = "config.json";
 const SETTINGS_FILE: &str = "settings.json";
 
 /// The `Avr` methods that the HTTP poll calls in HTTP mode: `update` and
-/// `update_signal_and_settings`.
-const POLL_READS: HttpReads = HttpReads::UPDATE.union(HttpReads::SIGNAL_AND_SETTINGS);
+/// `refresh_signal_pages` (it also does the read of `update_signal_and_settings`).
+const POLL_READS: HttpReads = HttpReads::UPDATE
+    .union(HttpReads::SIGNAL_AND_SETTINGS)
+    .union(HttpReads::SIGNAL_PAGES);
 
 /// What an entity gets in HTTP mode before the receiver is read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -339,7 +341,7 @@ impl DeviceConfig {
 
     /// The driver gets the value: telnet gives every value, and over HTTP a value comes if a
     /// repeated read gives it (see `Info::http_reads_without`, `Self::missing` and
-    /// `Self::http_reads`). Before the receiver is read, `before_read` decides.
+    /// `POLL_READS`). Before the receiver is read, `before_read` decides.
     pub fn reads_value(&self, query: Query, before_read: BeforeRead) -> bool {
         self.use_telnet
             || self
@@ -347,18 +349,8 @@ impl DeviceConfig {
                 .as_ref()
                 .map_or(before_read == BeforeRead::Shown, |info| {
                     info.http_reads_without(query, self.missing)
-                        .intersects(self.http_reads())
+                        .intersects(POLL_READS)
                 })
-    }
-
-    /// The reads that the driver repeats in HTTP mode: the poll (`POLL_READS`), and the signal
-    /// pages if the signal timer is on (`Avr::refresh_signal` reads them without telnet).
-    const fn http_reads(&self) -> HttpReads {
-        if self.signal_poll_secs > 0 {
-            POLL_READS.union(HttpReads::SIGNAL_PAGES)
-        } else {
-            POLL_READS
-        }
     }
 
     /// The receiver has a HEOS player.

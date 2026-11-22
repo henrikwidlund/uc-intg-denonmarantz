@@ -1003,10 +1003,14 @@ impl DenonActor {
     }
 
     /// Read the state over HTTP and show if the receiver answers. It does nothing while telnet
-    /// reports the changes, or while an earlier read runs. In HTTP mode Audyssey, the signal and
-    /// the HDMI output are read after the state: the library asks only receivers that use
-    /// `AppCommand`. In telnet mode they are not: while telnet is down, a blank answer would clear
-    /// the values of telnet. `POLL_READS` in `config_store` names these reads: keep them the same.
+    /// reports the changes, or while an earlier read runs. In HTTP mode a read of the state that
+    /// worked starts `poll_signal`: it reads Audyssey, the signal and the HDMI output
+    /// (`update_signal_and_settings`, only on receivers that use `AppCommand`) and the signal pages.
+    /// HDR, pixel depth, color space and FRL come only from the video page. It runs on its own, so
+    /// a web interface that does not answer does not delay the state. In telnet mode the poll does
+    /// not read them: while telnet is down, a blank answer would clear the values of telnet. Only the
+    /// signal timer reads the signal pages then. `POLL_READS` in `config_store` names these reads:
+    /// keep them the same.
     fn poll_http(&mut self, ctx: &mut Context<Self>) {
         if !self.needs_poll() || self.polling {
             return;
@@ -1015,26 +1019,14 @@ impl DenonActor {
         self.polling = true;
         let generation = self.generation;
         let settings = !self.cfg.use_telnet;
-        ctx.spawn(
-            async move {
-                let result = avr.update().await;
-                let extra = match &result {
-                    Ok(()) if settings => Some(avr.update_signal_and_settings().await),
-                    _ => None,
-                };
-                (result, extra)
-            }
-            .into_actor(self)
-            .map(move |(result, extra), act, ctx| {
+        ctx.spawn(async move { avr.update().await }.into_actor(self).map(
+            move |result, act, ctx| {
                 // A result of an older connection must not clear the flag of the new one.
                 if act.generation != generation {
                     return;
                 }
                 act.polling = false;
                 act.note_missing();
-                if let Some(Err(e)) = &extra {
-                    debug!("[{}] signal and settings not read: {e}", act.cfg.name);
-                }
                 let ok = result.is_ok();
                 if let Err(e) = &result {
                     debug!("[{}] read over HTTP failed: {e}", act.cfg.name);
@@ -1044,6 +1036,9 @@ impl DenonActor {
                 act.http_ok = ok;
                 if ok {
                     act.poll_failures = 0;
+                    if settings {
+                        act.poll_signal(ctx);
+                    }
                 } else {
                     act.poll_failures += 1;
                     // The receiver can have a new address. Connect again: this searches for its
@@ -1063,12 +1058,13 @@ impl DenonActor {
                 if flipped {
                     act.schedule_emit(ctx);
                 }
-            }),
-        );
+            },
+        ));
     }
 
-    /// Read the signal again. Without telnet this reads the signal pages:
-    /// `DeviceConfig::http_reads` counts them for the entities.
+    /// Read the signal again. While telnet is not open, also in telnet mode, this reads the signal
+    /// pages (`POLL_READS`). The HTTP poll and the signal timer both start it; one read runs at a
+    /// time.
     fn poll_signal(&mut self, ctx: &mut Context<Self>) {
         // A slow receiver must not get a new read before the old one is done.
         if self.signal_polling {
@@ -1078,18 +1074,20 @@ impl DenonActor {
         self.signal_polling = true;
         let generation = self.generation;
         ctx.spawn(
-            async move {
-                if let Err(e) = avr.refresh_signal().await {
-                    debug!("signal not read: {e}");
-                }
-            }
-            .into_actor(self)
-            .map(move |(), act, _| {
-                if act.generation == generation {
-                    act.signal_polling = false;
-                    act.note_missing();
-                }
-            }),
+            async move { avr.refresh_signal().await }
+                .into_actor(self)
+                .map(move |result, act, _| {
+                    // `NothingRead`: no page gave values, for example all answered 404.
+                    if let Err(e) = result
+                        && !matches!(e, AvrError::NothingRead)
+                    {
+                        debug!("[{}] signal not read: {e}", act.cfg.name);
+                    }
+                    if act.generation == generation {
+                        act.signal_polling = false;
+                        act.note_missing();
+                    }
+                }),
         );
     }
 

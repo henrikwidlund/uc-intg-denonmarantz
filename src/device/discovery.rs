@@ -503,7 +503,7 @@ pub async fn after_start(
         InfoCheck::Failed(e) => debug!("[{name}] stored receiver values not checked: {e}"),
         _ => {}
     }
-    // With HTTP only, a page read could delay a command: the pages are not read again.
+    // With HTTP only, the pages are not read again here: the HTTP poll reads the signal pages.
     if !telnet {
         return;
     }

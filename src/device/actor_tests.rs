@@ -2224,8 +2224,8 @@ async fn only_a_new_type_port_or_update_method_connects_again() {
 const VIDEO_PAGE: &str = "/ajax/info/get_config?type=3";
 const CHANNELS_PAGE: &str = "/ajax/info/get_config?type=2";
 
-/// An actor in HTTP mode with the signal timer, connected to a fake receiver whose web pages
-/// answer with 404. The HTTP poll runs every 100 ms.
+/// An actor in HTTP mode without the signal timer, connected to a fake receiver with the web
+/// interface `web`. The HTTP poll runs every 100 ms and reads the signal pages.
 async fn http_actor_with_web(
     cfg: DeviceConfig,
     web: &FakeWeb,
@@ -2240,7 +2240,7 @@ async fn http_actor_with_web(
     let collector = Collector(events.clone()).start();
     let cfg = DeviceConfig {
         use_telnet: false,
-        signal_poll_secs: 1,
+        signal_poll_secs: 0,
         ..cfg
     };
     let actor = DenonActor::new(cfg.id.as_str().into(), cfg, collector.recipient())
@@ -2287,6 +2287,30 @@ async fn learn_missing_pages(
         .find(pages_missing)
         .expect("saved");
     (actor, events, http, saved)
+}
+
+#[actix::test]
+async fn the_http_poll_reads_the_video_page_without_the_signal_timer() {
+    // A 500 does not mark the page as missing, so each poll reads it again. Each read asks twice
+    // (library retry), and the start reads it once.
+    let web = FakeWeb::start(500).await;
+    let (_actor, _events, _http) = http_actor_with_web(cfg(), &web).await;
+    until("more reads of the video page", 10, || {
+        web.requests(VIDEO_PAGE) > 6
+    })
+    .await;
+}
+
+#[actix::test]
+async fn a_web_interface_that_does_not_answer_does_not_delay_the_http_poll() {
+    // The pages time out after 500 ms; the state is read every 100 ms.
+    let web = FakeWeb::start_slow(200, Duration::from_secs(10)).await;
+    let (_actor, _events, http) = http_actor_with_web(cfg(), &web).await;
+    until("the first page reads", 10, || web.requests(VIDEO_PAGE) > 0).await;
+    let before = http.app_commands();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let reads = http.app_commands() - before;
+    assert!(reads >= 6, "{reads} reads of the state in 1.5 s");
 }
 
 #[actix::test]

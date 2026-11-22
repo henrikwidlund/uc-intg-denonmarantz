@@ -512,6 +512,15 @@ pub(crate) mod tests {
             SensorKind::VideoHdmiSignalOut,
             SensorKind::InputChannels,
             SensorKind::OutputChannels,
+            // From the video signal page.
+            SensorKind::HdrInput,
+            SensorKind::HdrOutput,
+            SensorKind::PixelDepthInput,
+            SensorKind::PixelDepthOutput,
+            SensorKind::MaxFrlInput,
+            SensorKind::MaxFrlOutput,
+            SensorKind::ColorspaceInput,
+            SensorKind::ColorspaceOutput,
         ]
         .map(EntityKind::Sensor);
 
@@ -519,16 +528,15 @@ pub(crate) mod tests {
         assert_eq!(app_command.len() + signal.len(), read.len(), "{read:?}");
         assert!(app_command.iter().chain(&signal).all(|k| read.contains(k)));
 
-        // Without the signal timer the signal pages are not read again. The status pages have no
+        // The poll reads the signal pages, also without the signal timer. The status pages have no
         // dimmer and no Audyssey values.
         let pages = http_read(UpdateMethod::StatusPages, None);
-        assert_eq!(Vec::<EntityKind>::new(), extra(&pages));
-        // With the signal timer, the values of the signal pages come.
         let timer = DeviceConfig {
             signal_poll_secs: 10,
             ..pages.clone()
         };
-        let with_timer = extra(&timer);
+        let read_pages = extra(&pages);
+        assert_eq!(read_pages, extra(&timer));
         for kind in [
             SensorKind::VideoHdmiSignalIn,
             SensorKind::InputChannels,
@@ -536,15 +544,15 @@ pub(crate) mod tests {
             SensorKind::ColorspaceOutput,
         ] {
             assert!(
-                with_timer.contains(&EntityKind::Sensor(kind)),
-                "{kind:?} {with_timer:?}"
+                read_pages.contains(&EntityKind::Sensor(kind)),
+                "{kind:?} {read_pages:?}"
             );
         }
         assert!(
-            with_timer
+            read_pages
                 .iter()
                 .all(|k| matches!(k, EntityKind::Sensor(_))),
-            "{with_timer:?}"
+            "{read_pages:?}"
         );
         // A page that the receiver does not have gives no values.
         let no_video = extra(&DeviceConfig {
@@ -552,7 +560,7 @@ pub(crate) mod tests {
                 video_page: true,
                 ..denon_marantz::MissingSources::default()
             },
-            ..timer.clone()
+            ..pages.clone()
         });
         assert!(!no_video.contains(&EntityKind::Sensor(SensorKind::HdrInput)));
         assert!(!no_video.contains(&EntityKind::Sensor(SensorKind::ColorspaceOutput)));
@@ -562,7 +570,7 @@ pub(crate) mod tests {
                 channels_page: true,
                 ..denon_marantz::MissingSources::default()
             },
-            ..timer
+            ..pages.clone()
         });
         assert!(!no_channels.contains(&EntityKind::Sensor(SensorKind::InputChannels)));
         assert!(no_channels.contains(&EntityKind::Sensor(SensorKind::HdrInput)));
@@ -622,9 +630,12 @@ pub(crate) mod tests {
     fn http_mode_offers_the_monitor_output_if_the_receiver_reads_it() {
         use denon_marantz::{ListedQueries, UpdateMethod};
         let mut listed = ListedQueries::default();
-        assert_eq!(
-            Vec::<EntityKind>::new(),
-            extra(&http_read(UpdateMethod::AppCommand, Some(listed)))
+        // Only the values of the signal pages come.
+        let none = extra(&http_read(UpdateMethod::AppCommand, Some(listed)));
+        assert!(
+            none.iter().all(|k| matches!(k, EntityKind::Sensor(_))
+                && *k != EntityKind::Sensor(SensorKind::MonitorOutput)),
+            "{none:?}"
         );
         // Without a list, the library does not ask for the output settings.
         let unlisted = extra(&http_read(UpdateMethod::AppCommand, None));
@@ -634,12 +645,16 @@ pub(crate) mod tests {
         );
         // The library follows the listed output settings.
         listed.output_settings = true;
+        let added: Vec<EntityKind> = extra(&http_read(UpdateMethod::AppCommand, Some(listed)))
+            .into_iter()
+            .filter(|k| !none.contains(k))
+            .collect();
         assert_eq!(
             vec![
                 EntityKind::Select(SelectKind::MonitorOutput),
                 EntityKind::Sensor(SensorKind::MonitorOutput)
             ],
-            extra(&http_read(UpdateMethod::AppCommand, Some(listed)))
+            added
         );
     }
 
@@ -670,10 +685,6 @@ pub(crate) mod tests {
                 EntityKind::Select(SelectKind::MultiEq),
                 EntityKind::Sensor(SensorKind::AudioSignal),
                 EntityKind::Sensor(SensorKind::AudioSamplingRate),
-                EntityKind::Sensor(SensorKind::VideoHdmiSignalIn),
-                EntityKind::Sensor(SensorKind::VideoHdmiSignalOut),
-                EntityKind::Sensor(SensorKind::InputChannels),
-                EntityKind::Sensor(SensorKind::OutputChannels),
                 EntityKind::Switch(SwitchKind::ToneControl),
                 EntityKind::Switch(SwitchKind::DynamicEq),
                 EntityKind::Number(NumberKind::Bass),
