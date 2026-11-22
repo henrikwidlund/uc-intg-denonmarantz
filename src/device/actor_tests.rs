@@ -14,7 +14,9 @@ use crate::config_store::{self, CommApiVersion, DeviceConfig};
 use crate::entities::sensor::EMPTY;
 use crate::entities::{EntityKind, SelectKind, SensorKind, SwitchKind};
 use crate::errors::ServiceError;
-use crate::test_support::{Fake, FakeHeos, FakeTelnet, HeosItem, quick_http, test_builder};
+use crate::test_support::{
+    Fake, FakeHeos, FakeTelnet, FakeWeb, HeosItem, quick_http, test_builder,
+};
 use actix::{Actor, Addr, Context, Handler};
 use denon_marantz::proto::telnet::answer_prefix;
 use denon_marantz::{Brand, DiscoveredReceiver, Info, ReceiverType, TypeProof, UpdateMethod};
@@ -79,6 +81,7 @@ fn cfg() -> DeviceConfig {
         tuner_preset_names: Vec::new(),
         network_favorite_names: Vec::new(),
         info: None,
+        missing: denon_marantz::MissingSources::default(),
     }
 }
 
@@ -2137,4 +2140,150 @@ async fn only_a_new_type_port_or_update_method_connects_again() {
     for new in &changed {
         assert!(read_differently(&info, new), "{new:?}");
     }
+}
+
+const VIDEO_PAGE: &str = "/ajax/info/get_config?type=3";
+const CHANNELS_PAGE: &str = "/ajax/info/get_config?type=2";
+
+/// An actor in HTTP mode with the signal timer, connected to a fake receiver whose web pages
+/// answer with 404. The HTTP poll runs every 100 ms.
+async fn http_actor_with_web(
+    cfg: DeviceConfig,
+    web: &FakeWeb,
+) -> (Addr<DenonActor>, Arc<Mutex<Vec<DeviceEvent>>>, Fake) {
+    let http = Fake::start(true).await;
+    let (http_port, web_port) = (http.port(), web.port());
+    let setup: TestBuilder =
+        Rc::new(move |_, builder| test_builder(http_port, 1, builder).web_interface_port(web_port));
+    TEST_BUILDER.with(|slot| *slot.borrow_mut() = Some(setup));
+    TEST_DISCOVERY.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let collector = Collector(events.clone()).start();
+    let cfg = DeviceConfig {
+        use_telnet: false,
+        signal_poll_secs: 1,
+        ..cfg
+    };
+    let actor = DenonActor::new(cfg.id.as_str().into(), cfg, collector.recipient())
+        .with_retry_delay(Duration::from_secs(60))
+        .with_poll_interval(Duration::from_millis(100))
+        .start();
+    actor.send(Connect).await.expect("connect");
+    (actor, events, http)
+}
+
+/// The configurations that the actor sent to the controller.
+fn configs(events: &Mutex<Vec<DeviceEvent>>) -> Vec<DeviceConfig> {
+    events
+        .lock()
+        .expect("lock")
+        .iter()
+        .filter_map(|event| match event {
+            DeviceEvent::Config { cfg, .. } => Some(DeviceConfig::clone(cfg)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn pages_missing(cfg: &DeviceConfig) -> bool {
+    cfg.missing.video_page && cfg.missing.channels_page
+}
+
+/// Connect until the actor saved the missing pages. Gives the saved configuration.
+async fn learn_missing_pages(
+    web: &FakeWeb,
+) -> (
+    Addr<DenonActor>,
+    Arc<Mutex<Vec<DeviceEvent>>>,
+    Fake,
+    DeviceConfig,
+) {
+    let (actor, events, http) = http_actor_with_web(cfg(), web).await;
+    until("the missing pages", 10, || {
+        configs(&events).iter().any(pages_missing)
+    })
+    .await;
+    let saved = configs(&events)
+        .into_iter()
+        .find(pages_missing)
+        .expect("saved");
+    (actor, events, http, saved)
+}
+
+#[actix::test]
+async fn missing_pages_are_saved_once_and_not_asked_after_a_reconnect() {
+    let web = FakeWeb::start(404).await;
+    let (actor, events, _http, saved) = learn_missing_pages(&web).await;
+    // More polls and signal reads save nothing new.
+    let before = configs(&events).len();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let later = configs(&events);
+    assert!(
+        later[before..].iter().all(|c| c.missing == saved.missing),
+        "{:?}",
+        later[before..]
+            .iter()
+            .map(|c| c.missing)
+            .collect::<Vec<_>>()
+    );
+    actor.send(Disconnect).await.expect("disconnect");
+
+    // With the stored values and missing sources, the pages are not asked again.
+    let web = FakeWeb::start(404).await;
+    let (_actor, events, _http) = http_actor_with_web(saved, &web).await;
+    until("connected", 5, || {
+        status_count(&events, DeviceStatus::Connected) == 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(
+        (0, 0),
+        (web.requests(VIDEO_PAGE), web.requests(CHANNELS_PAGE))
+    );
+}
+
+#[actix::test]
+async fn new_receiver_values_clear_the_missing_sources() {
+    // Missing sources without receiver values: the connect reads new values.
+    let web = FakeWeb::start(404).await;
+    let cfg = DeviceConfig {
+        missing: denon_marantz::MissingSources {
+            tone_control: true,
+            video_page: true,
+            ..denon_marantz::MissingSources::default()
+        },
+        ..cfg()
+    };
+    let (_actor, events, _http) = http_actor_with_web(cfg, &web).await;
+    until("the receiver values", 10, || {
+        configs(&events).iter().any(|c| c.info.is_some())
+    })
+    .await;
+    let first = configs(&events)
+        .into_iter()
+        .find(|c| c.info.is_some())
+        .expect("saved");
+    assert!(!first.missing.tone_control, "{:?}", first.missing);
+}
+
+#[actix::test]
+async fn a_new_setup_asks_the_missing_pages_again() {
+    let web = FakeWeb::start(404).await;
+    let (actor, events, _http, saved) = learn_missing_pages(&web).await;
+    let connected = status_count(&events, DeviceStatus::Connected);
+    let asked = web.requests(VIDEO_PAGE);
+    // A new setup gives the configuration without missing sources.
+    let setup = DeviceConfig {
+        missing: denon_marantz::MissingSources::default(),
+        ..saved
+    };
+    actor.send(UpdateConfig(setup)).await.expect("update");
+    until("connected again", 5, || {
+        status_count(&events, DeviceStatus::Connected) > connected
+    })
+    .await;
+    until("the video page asked again", 5, || {
+        web.requests(VIDEO_PAGE) > asked
+    })
+    .await;
 }

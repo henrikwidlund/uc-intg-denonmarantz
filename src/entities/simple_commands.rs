@@ -260,6 +260,7 @@ mod tests {
             tuner_preset_names: Vec::new(),
             network_favorite_names: Vec::new(),
             info: None,
+            missing: denon_marantz::MissingSources::default(),
         }
     }
 

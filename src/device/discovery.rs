@@ -8,8 +8,8 @@ use denon_marantz::proto::source::playing_kind;
 use denon_marantz::proto::{NetworkAudioCommand, PlayingKind, Power};
 use denon_marantz::{
     Ask, Avr, AvrBuilder, Brand, Command, DiscoveredReceiver, DiscoveryConfig, Error, HttpConfig,
-    Info, InfoCheck, PageStatus, Query, ReceiverType, SpecFeature, StartOptions, StartReport,
-    Started, State, TelnetSync, TunerInfo, UpdateMethod, Zone, discover_all,
+    Info, InfoCheck, MissingSources, PageStatus, Query, ReceiverType, SpecFeature, StartOptions,
+    StartReport, Started, State, TelnetSync, TunerInfo, UpdateMethod, Zone, discover_all,
 };
 use log::debug;
 use std::borrow::Cow;
@@ -141,9 +141,13 @@ async fn identify_with(host: &str, known: Option<Known>) -> Result<Avr, Error> {
 }
 
 /// Connect with the values of an earlier connect. It sends no request: the start checks the
-/// values, see [`Started::info_check`].
-pub async fn connect_known(host: &str, info: Info) -> Result<Avr, Error> {
-    builder(host, None).known(info).connect().await
+/// values, see [`Started::info_check`]. The sources in `missing` are not asked.
+pub async fn connect_known(host: &str, info: Info, missing: MissingSources) -> Result<Avr, Error> {
+    builder(host, None)
+        .known(info)
+        .missing(missing)
+        .connect()
+        .await
 }
 
 /// The builder of a connection. A test can change it, so that the library talks to a fake

@@ -663,6 +663,8 @@ impl Controller {
                         network_favorite_names: old
                             .map_or_else(Vec::new, |c| c.network_favorite_names.clone()),
                         info: Some(identified.info),
+                        // A new setup asks all sources again.
+                        missing: denon_marantz::MissingSources::default(),
                     };
                     if act.setup_replace {
                         act.remove_other_devices(cfg.key());

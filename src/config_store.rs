@@ -9,7 +9,7 @@
 //! The data is serialized on the caller thread. One background thread writes the files in order,
 //! so the actor thread does not wait for the disk.
 
-use denon_marantz::{Brand, HttpReads, Query, SpecFeature, SpecGeneration};
+use denon_marantz::{Brand, HttpReads, MissingSources, Query, SpecFeature, SpecGeneration};
 use log::{error, info};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -166,6 +166,16 @@ pub struct DeviceConfig {
         deserialize_with = "none_if_unknown"
     )]
     pub info: Option<denon_marantz::Info>,
+    /// The HTTP sources that the receiver does not have: a web page that answered 404, or a value
+    /// that `Deviceinfo.xml` does not list or that a read dropped. The entities leave out their
+    /// values, and the next connect does not ask them. Cleared when `info` changes and at a new
+    /// setup. A value that does not load is the default.
+    #[serde(
+        default,
+        skip_serializing_if = "is_default",
+        deserialize_with = "default_if_unknown"
+    )]
+    pub missing: MissingSources,
 }
 
 /// What the id of a receiver is.
@@ -328,15 +338,16 @@ impl DeviceConfig {
     }
 
     /// The driver gets the value: telnet gives every value, and over HTTP a value comes if a
-    /// repeated read gives it (see `Info::http_reads` and `Self::http_reads`). Before the receiver is
-    /// read, `before_read` decides.
+    /// repeated read gives it (see `Info::http_reads_without`, `Self::missing` and
+    /// `Self::http_reads`). Before the receiver is read, `before_read` decides.
     pub fn reads_value(&self, query: Query, before_read: BeforeRead) -> bool {
         self.use_telnet
             || self
                 .info
                 .as_ref()
                 .map_or(before_read == BeforeRead::Shown, |info| {
-                    info.http_reads(query).intersects(self.http_reads())
+                    info.http_reads_without(query, self.missing)
+                        .intersects(self.http_reads())
                 })
     }
 
@@ -420,15 +431,16 @@ impl DeviceConfig {
     }
 
     /// Take what a device actor found on the receiver: the address, the receiver kind, the ids,
-    /// the receiver values, the form of the tuner presets and the names of the presets and
-    /// favorites. The other fields are settings and keep their values. `None` if nothing changed,
-    /// else whether the receiver kind or the receiver values changed: then the receiver can have
-    /// other entities.
+    /// the receiver values, the missing sources, the form of the tuner presets and the names of the
+    /// presets and favorites. The other fields are settings and keep their values. `None` if
+    /// nothing changed, else whether the receiver kind, the receiver values or, in HTTP mode, the
+    /// missing sources changed: then the receiver can have other entities.
     pub fn take_found(&mut self, found: Self) -> Option<bool> {
         let kind = found.kind();
         let new_kind = kind != self.kind();
         let new_ids = self.add_ids(found.serial.as_deref(), found.mac.as_deref());
         let new_info = found.info.is_some() && self.info != found.info;
+        let new_missing = self.missing != found.missing;
         let new_form = found.tuner_presets_lettered.is_some()
             && self.tuner_presets_lettered != found.tuner_presets_lettered;
         let new_presets = !found.tuner_preset_names.is_empty()
@@ -439,6 +451,7 @@ impl DeviceConfig {
             && !new_kind
             && !new_ids
             && !new_info
+            && !new_missing
             && !new_form
             && !new_presets
             && !new_favorites
@@ -457,9 +470,11 @@ impl DeviceConfig {
         if new_form {
             self.tuner_presets_lettered = found.tuner_presets_lettered;
         }
+        self.missing = found.missing;
         self.address = found.address;
         self.set_kind(kind);
-        Some(new_kind || new_info)
+        // With telnet, the missing sources do not change the entities.
+        Some(new_kind || new_info || (new_missing && !self.use_telnet))
     }
 
     pub const fn kind(&self) -> ReceiverKind {
@@ -498,6 +513,13 @@ fn none_if_unknown<'de, D: Deserializer<'de>, T: DeserializeOwned>(
 ) -> Result<Option<T>, D::Error> {
     let value = Option::<serde_json::Value>::deserialize(d)?;
     Ok(value.and_then(|v| T::deserialize(v).ok()))
+}
+
+/// Like `none_if_unknown`, for a value with a default.
+fn default_if_unknown<'de, D: Deserializer<'de>, T: DeserializeOwned + Default>(
+    d: D,
+) -> Result<T, D::Error> {
+    none_if_unknown(d).map(Option::unwrap_or_default)
 }
 
 /// The 12 hexadecimal digits of a MAC address in uppercase. `:` and `-` between them are removed.
@@ -561,6 +583,21 @@ const fn default_timeout() -> u32 {
 #[allow(clippy::trivially_copy_pass_by_ref)] // The signature that serde needs.
 const fn is_zero(v: &u16) -> bool {
     *v == 0
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // The signature that serde needs.
+fn is_default(v: &MissingSources) -> bool {
+    *v == MissingSources::default()
+}
+
+/// The sources that are missing in `a` or in `b`.
+pub const fn missing_union(a: MissingSources, b: MissingSources) -> MissingSources {
+    MissingSources {
+        appcommand0300: a.appcommand0300 || b.appcommand0300,
+        tone_control: a.tone_control || b.tone_control,
+        video_page: a.video_page || b.video_page,
+        channels_page: a.channels_page || b.channels_page,
+    }
 }
 
 /// Version of the backup format.
@@ -960,6 +997,7 @@ mod tests {
             tuner_preset_names: Vec::new(),
             network_favorite_names: Vec::new(),
             info: None,
+            missing: MissingSources::default(),
         }
     }
 
@@ -1193,7 +1231,60 @@ mod tests {
             info: read_with_version(found.clone(), "0301").info,
             ..found
         };
+        assert_eq!(Some(true), cfg.take_found(read.clone()));
+        // Missing sources are taken, also when they are cleared, and can change the entities.
+        let missing = DeviceConfig {
+            missing: MissingSources {
+                video_page: true,
+                ..MissingSources::default()
+            },
+            ..read.clone()
+        };
+        assert_eq!(Some(true), cfg.take_found(missing.clone()));
+        assert_eq!(missing.missing, cfg.missing);
         assert_eq!(Some(true), cfg.take_found(read));
+        assert_eq!(MissingSources::default(), cfg.missing);
+        // With telnet they are taken, but the entities stay the same.
+        cfg.use_telnet = true;
+        assert_eq!(Some(false), cfg.take_found(missing.clone()));
+        assert_eq!(missing.missing, cfg.missing);
+    }
+
+    #[test]
+    fn missing_sources_are_saved_only_when_set() {
+        let d: DeviceConfig =
+            serde_json::from_str(r#"{"id":"A","name":"C","address":"h"}"#).expect("json");
+        assert_eq!(MissingSources::default(), d.missing);
+        assert!(!serde_json::to_string(&d).expect("json").contains("missing"));
+        let d: DeviceConfig = serde_json::from_str(
+            r#"{"id":"A","name":"C","address":"h","missing":{"channels_page":true,"later":1}}"#,
+        )
+        .expect("json");
+        assert!(d.missing.channels_page && !d.missing.video_page);
+        // A value that does not load does not stop the receiver from loading.
+        for bad in ["null", "true", r#"{"video_page":"yes"}"#] {
+            let text = format!(r#"{{"id":"A","name":"C","address":"h","missing":{bad}}}"#);
+            let d: DeviceConfig = serde_json::from_str(&text).expect("json");
+            assert_eq!(MissingSources::default(), d.missing, "{bad}");
+        }
+        let text = serde_json::to_string(&d).expect("json");
+        assert!(text.contains(r#""channels_page":true"#), "{text}");
+    }
+
+    #[test]
+    fn missing_sources_add_up() {
+        let video = MissingSources {
+            video_page: true,
+            ..MissingSources::default()
+        };
+        let tone = MissingSources {
+            tone_control: true,
+            ..MissingSources::default()
+        };
+        let both = missing_union(video, tone);
+        assert!(both.video_page && both.tone_control);
+        assert!(!both.appcommand0300 && !both.channels_page);
+        assert_eq!(video, missing_union(video, MissingSources::default()));
     }
 
     #[test]

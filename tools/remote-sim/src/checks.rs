@@ -1408,16 +1408,18 @@ const QUERIED: [(&str, Query, bool); 65] = {
 /// The selects, sensors, switches and numbers in HTTP mode for the `info` of the receiver in
 /// `config.json`, as ids without the key. With `info`, an entity comes if the receiver may have
 /// the value and the HTTP poll (`Avr::update` and `Avr::update_signal_and_settings`) reads it, or,
-/// with the signal timer on, `Avr::refresh_signal_pages`.
+/// with the signal timer on, `Avr::refresh_signal_pages`. The sources in `missing` give no values.
 /// Without `info`, the entities of the Python integration come. Dirac also needs the setup option,
 /// and the quick select its first slot. An `info` that does not load counts as none, as in the
 /// driver: the note says so.
 fn http_entities(device: &Value) -> (BTreeSet<&'static str>, Option<String>) {
-    use denon_marantz::{HttpReads, Info};
+    use denon_marantz::{HttpReads, Info, MissingSources};
     let (info, note) = match serde_json::from_value::<Option<Info>>(device["info"].clone()) {
         Ok(info) => (info, None),
         Err(e) => (None, Some(format!("info in config.json not read: {e}"))),
     };
+    let missing: MissingSources =
+        serde_json::from_value(device["missing"].clone()).unwrap_or_default();
     // The poll, and the signal pages if the signal timer is on.
     let mut poll = HttpReads::UPDATE | HttpReads::SIGNAL_AND_SETTINGS;
     if device["signal_poll_secs"]
@@ -1436,7 +1438,7 @@ fn http_entities(device: &Value) -> (BTreeSet<&'static str>, Option<String>) {
                 _ => true,
             };
             let read = info.as_ref().map_or(*base, |info| {
-                info.offers(*query) && info.http_reads(*query).intersects(poll)
+                info.offers(*query) && info.http_reads_without(*query, missing).intersects(poll)
             });
             setup && read
         })

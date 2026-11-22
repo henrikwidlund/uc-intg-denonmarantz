@@ -392,6 +392,7 @@ pub(crate) mod tests {
             tuner_preset_names: Vec::new(),
             network_favorite_names: Vec::new(),
             info: None,
+            missing: denon_marantz::MissingSources::default(),
         }
     }
 
@@ -545,6 +546,26 @@ pub(crate) mod tests {
                 .all(|k| matches!(k, EntityKind::Sensor(_))),
             "{with_timer:?}"
         );
+        // A page that the receiver does not have gives no values.
+        let no_video = extra(&DeviceConfig {
+            missing: denon_marantz::MissingSources {
+                video_page: true,
+                ..denon_marantz::MissingSources::default()
+            },
+            ..timer.clone()
+        });
+        assert!(!no_video.contains(&EntityKind::Sensor(SensorKind::HdrInput)));
+        assert!(!no_video.contains(&EntityKind::Sensor(SensorKind::ColorspaceOutput)));
+        assert!(no_video.contains(&EntityKind::Sensor(SensorKind::InputChannels)));
+        let no_channels = extra(&DeviceConfig {
+            missing: denon_marantz::MissingSources {
+                channels_page: true,
+                ..denon_marantz::MissingSources::default()
+            },
+            ..timer
+        });
+        assert!(!no_channels.contains(&EntityKind::Sensor(SensorKind::InputChannels)));
+        assert!(no_channels.contains(&EntityKind::Sensor(SensorKind::HdrInput)));
         let left_out: Vec<EntityKind> = EntityKind::all(&cfg(false, true))
             .filter(|k| !EntityKind::all(&pages).any(|o| o == *k))
             .collect();
@@ -556,6 +577,44 @@ pub(crate) mod tests {
                 EntityKind::Sensor(SensorKind::Dimmer),
             ],
             left_out
+        );
+    }
+
+    #[test]
+    fn http_mode_leaves_out_the_values_of_missing_sources() {
+        use denon_marantz::{MissingSources, UpdateMethod};
+        let without = |missing| {
+            extra(&DeviceConfig {
+                missing,
+                ..http_read(UpdateMethod::AppCommand, None)
+            })
+        };
+        let tone_values = [
+            EntityKind::Switch(SwitchKind::ToneControl),
+            EntityKind::Number(NumberKind::Bass),
+            EntityKind::Number(NumberKind::Treble),
+        ];
+        let audyssey = [
+            EntityKind::Select(SelectKind::MultiEq),
+            EntityKind::Switch(SwitchKind::DynamicEq),
+        ];
+        let all = without(MissingSources::default());
+        assert!(tone_values.iter().chain(&audyssey).all(|k| all.contains(k)));
+        let tone = without(MissingSources {
+            tone_control: true,
+            ..MissingSources::default()
+        });
+        assert!(tone_values.iter().all(|k| !tone.contains(k)), "{tone:?}");
+        assert!(audyssey.iter().all(|k| tone.contains(k)), "{tone:?}");
+        // Audyssey comes only from `AppCommand0300.xml`.
+        let no_0300 = without(MissingSources {
+            appcommand0300: true,
+            ..MissingSources::default()
+        });
+        assert!(audyssey.iter().all(|k| !no_0300.contains(k)), "{no_0300:?}");
+        assert!(
+            tone_values.iter().all(|k| no_0300.contains(k)),
+            "{no_0300:?}"
         );
     }
 

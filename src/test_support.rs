@@ -483,6 +483,10 @@ impl FakeWeb {
         Self { port, paths }
     }
 
+    pub const fn port(&self) -> u16 {
+        self.port
+    }
+
     /// How often a page was asked for.
     pub fn requests(&self, path: &str) -> usize {
         self.paths

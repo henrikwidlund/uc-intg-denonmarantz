@@ -8,8 +8,9 @@ driver id (`denonavr_rs`), because the Python integration cannot be stopped or u
 the entity names and the command names are the same, so receivers that are set up with the Python integration
 work without a new setup. The driver adds what it finds on the receiver to `config.json`: the serial number,
 the MAC address, the receiver type, the HTTP read method, `CommApiVers` (the protocol generation), if the
-receiver has a tuner, the form and names of the tuner presets, the names of the network favorites, and what
-the last full connect found (`info`). The Python integration ignores them.
+receiver has a tuner, the form and names of the tuner presets, the names of the network favorites, what the
+last full connect found (`info`), and the HTTP sources that the receiver does not have (`missing`). The Python
+integration ignores them.
 
 The device id in the entity ids is the MAC address of the receiver. Receivers from about 2011 and older do not
 give it: they use the serial number. Receivers that are set up with the Python integration keep the serial

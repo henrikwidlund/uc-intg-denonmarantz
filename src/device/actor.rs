@@ -16,7 +16,8 @@ use actix::prelude::*;
 use denon_marantz::HeosPlayerStatus;
 use denon_marantz::heos::{Change as HeosChange, PlayState, PlayerState};
 use denon_marantz::{
-    Ask, Avr, Change, Error as AvrError, Info, Query, Setting, Started, State, TelnetStatus,
+    Ask, Avr, Change, Error as AvrError, Info, MissingSources, Query, Setting, Started, State,
+    TelnetStatus,
 };
 use futures::StreamExt;
 use log::{debug, info, warn};
@@ -637,7 +638,12 @@ impl DenonActor {
                     },
                     move || addr.do_send(StartSynced(generation)),
                 )
-                .into_actor(self),
+                .into_actor(self)
+                .map(move |(), act, _| {
+                    if act.generation == generation {
+                        act.note_missing();
+                    }
+                }),
             ),
         );
         if self.cfg.use_telnet {
@@ -891,6 +897,11 @@ impl DenonActor {
         let new_info = info.type_proof.is_proven() && self.cfg.info.as_ref() != Some(info);
         if new_info {
             self.cfg.info = Some(info.clone());
+            // New values can come with other sources. A look-up connect did not use the missing
+            // sources. A connect with the stored values at a new address used them:
+            // `note_missing` adds them again.
+            // `info_changed` connects again.
+            self.cfg.missing = MissingSources::default();
         }
         if !new_kind && !new_ids && !new_info {
             return;
@@ -911,6 +922,23 @@ impl DenonActor {
         });
     }
 
+    /// Store the HTTP sources that the receiver showed it does not have. Only new ones are added:
+    /// a connect without the stored values counts a source as there until a read tried it. The
+    /// controller saves them.
+    fn note_missing(&mut self) {
+        let Some(avr) = &self.avr else { return };
+        let missing = crate::config_store::missing_union(self.cfg.missing, avr.missing_sources());
+        if missing == self.cfg.missing {
+            return;
+        }
+        info!("[{}] missing over HTTP: {missing:?}", self.cfg.name);
+        self.cfg.missing = missing;
+        self.controller.do_send(DeviceEvent::Config {
+            key: self.key.clone(),
+            cfg: Box::new(self.cfg.clone()),
+        });
+    }
+
     /// The receiver gave other values than the stored ones. Another receiver at the address is
     /// not used: the receiver is looked up until it is found. Otherwise the values and the receiver
     /// kind are stored. A new type, port or update method changes how the receiver is read: it is
@@ -923,10 +951,21 @@ impl DenonActor {
             self.connect(ctx);
             return;
         }
-        let reconnect = self
-            .avr
-            .as_ref()
-            .is_some_and(|avr| read_differently(avr.info(), &info));
+        // New values can come with other sources, for example after a firmware update. The
+        // connection keeps the missing sources, so connect again without them. With an old
+        // configuration version the values are not stored, so the flags stay.
+        let clear = info.type_proof.is_proven()
+            && version == self.cfg_version
+            && self.cfg.missing != MissingSources::default();
+        if clear {
+            debug!("[{}] missing sources cleared", self.cfg.name);
+            self.cfg.missing = MissingSources::default();
+        }
+        let reconnect = clear
+            || self
+                .avr
+                .as_ref()
+                .is_some_and(|avr| read_differently(avr.info(), &info));
         info!(
             "[{}] receiver values changed: {} on port {}, {:?}",
             self.cfg.name,
@@ -989,6 +1028,7 @@ impl DenonActor {
                     return;
                 }
                 act.polling = false;
+                act.note_missing();
                 if let Some(Err(e)) = &extra {
                     debug!("[{}] signal and settings not read: {e}", act.cfg.name);
                 }
@@ -1044,6 +1084,7 @@ impl DenonActor {
             .map(move |(), act, _| {
                 if act.generation == generation {
                     act.signal_polling = false;
+                    act.note_missing();
                 }
             }),
         );
@@ -1284,7 +1325,7 @@ async fn connect_avr(
     let deadline = Instant::now() + discovery::NETWORK_RETRY_TIMEOUT;
     let mut stall = discovery::Stall::new(last);
     if let Some(info) = known {
-        let avr = discovery::connect_known(&cfg.address, info)
+        let avr = discovery::connect_known(&cfg.address, info, cfg.missing)
             .await
             .map_err(Some)?;
         match start_avr(avr, None, cfg.use_telnet, deadline, &mut stall, &early).await {
@@ -1622,6 +1663,7 @@ impl Handler<StartSynced> for DenonActor {
         }
         // A receiver without a list has sent none until now: the groups are the choices.
         self.sound_groups = true;
+        self.note_missing();
         self.ask_names();
         self.schedule_emit(ctx);
     }
@@ -1824,9 +1866,12 @@ impl Handler<UpdateConfig> for DenonActor {
     fn handle(&mut self, msg: UpdateConfig, ctx: &mut Self::Context) {
         let cfg = msg.0;
         let new_address = cfg.address != self.cfg.address;
+        // A new setup clears the missing sources: the connection still has them.
         let reconnect = new_address
             || cfg.use_telnet != self.cfg.use_telnet
-            || cfg.signal_poll_secs != self.cfg.signal_poll_secs;
+            || cfg.signal_poll_secs != self.cfg.signal_poll_secs
+            || (cfg.missing == MissingSources::default()
+                && self.cfg.missing != MissingSources::default());
         if new_address {
             self.connect_times = discovery::ConnectTimes::default();
         }
@@ -2114,6 +2159,7 @@ mod tests {
             tuner_preset_names: Vec::new(),
             network_favorite_names: Vec::new(),
             info: None,
+            missing: MissingSources::default(),
         }
     }
 
