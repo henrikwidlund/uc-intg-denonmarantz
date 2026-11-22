@@ -476,18 +476,15 @@ pub(crate) mod tests {
         assert_eq!(12, sensors(true, true, "none").len());
     }
 
-    /// HTTP mode, as after a read of a receiver with this update method, these listed queries and
-    /// the HDMI output over HTTP or not.
+    /// HTTP mode, as after a read of a receiver with this update method and these listed queries.
     fn http_read(
         update_method: denon_marantz::UpdateMethod,
         queries: Option<denon_marantz::ListedQueries>,
-        hdmi_output_over_http: bool,
     ) -> DeviceConfig {
         let mut c = crate::config_store::read_with_version(cfg(false, true), "0301");
         if let Some(info) = &mut c.info {
             info.update_method = update_method;
             info.queries = queries;
-            info.hdmi_output_over_http = hdmi_output_over_http;
         }
         c
     }
@@ -519,13 +516,13 @@ pub(crate) mod tests {
         ]
         .map(EntityKind::Sensor);
 
-        let read = extra(&http_read(UpdateMethod::AppCommand, None, false));
+        let read = extra(&http_read(UpdateMethod::AppCommand, None));
         assert_eq!(app_command.len() + signal.len(), read.len(), "{read:?}");
         assert!(app_command.iter().chain(&signal).all(|k| read.contains(k)));
 
         // Without the signal timer the signal pages are not read again. The status pages have no
         // dimmer and no Audyssey values.
-        let pages = http_read(UpdateMethod::StatusPages, None, false);
+        let pages = http_read(UpdateMethod::StatusPages, None);
         assert_eq!(Vec::<EntityKind>::new(), extra(&pages));
         // With the signal timer, the values of the signal pages come.
         let timer = DeviceConfig {
@@ -570,29 +567,29 @@ pub(crate) mod tests {
         let mut listed = ListedQueries::default();
         assert_eq!(
             Vec::<EntityKind>::new(),
-            extra(&http_read(UpdateMethod::AppCommand, Some(listed), true))
+            extra(&http_read(UpdateMethod::AppCommand, Some(listed)))
         );
         // Without a list, the library does not ask for the output settings.
-        let unlisted = extra(&http_read(UpdateMethod::AppCommand, None, true));
+        let unlisted = extra(&http_read(UpdateMethod::AppCommand, None));
         assert!(
             !unlisted.contains(&EntityKind::Select(SelectKind::MonitorOutput)),
             "{unlisted:?}"
         );
-        // The library follows the listed output settings, not the stored flag.
+        // The library follows the listed output settings.
         listed.output_settings = true;
         assert_eq!(
             vec![
                 EntityKind::Select(SelectKind::MonitorOutput),
                 EntityKind::Sensor(SensorKind::MonitorOutput)
             ],
-            extra(&http_read(UpdateMethod::AppCommand, Some(listed), false))
+            extra(&http_read(UpdateMethod::AppCommand, Some(listed)))
         );
     }
 
     #[test]
     fn http_mode_leaves_out_what_the_receiver_does_not_list() {
         use denon_marantz::{ListedQueries, UpdateMethod};
-        let http = |queries| http_read(UpdateMethod::AppCommand, queries, false);
+        let http = |queries| http_read(UpdateMethod::AppCommand, queries);
         let all: Vec<EntityKind> = EntityKind::all(&http(None)).collect();
         let mut signal = ListedQueries::default();
         signal.tone_control = true;

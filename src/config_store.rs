@@ -952,7 +952,6 @@ pub(crate) fn read_with_version(cfg: DeviceConfig, version: &str) -> DeviceConfi
         dirac_live: false,
         tuner: TunerInfo::Unknown,
         quick_select_count: None,
-        hdmi_output_over_http: false,
         queries: None,
         zones: vec![Zone::Main],
         zone_count: None,

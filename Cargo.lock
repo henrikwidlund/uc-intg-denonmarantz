@@ -611,7 +611,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=8482c872d305df36f68d89714816941b47b5db17#8482c872d305df36f68d89714816941b47b5db17"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=8b56725f343d3ecbc3a47ea400897d86e1d384fb#8b56725f343d3ecbc3a47ea400897d86e1d384fb"
 dependencies = [
  "bytes",
  "denon-marantz-discovery",
@@ -621,7 +621,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "if-addrs",
- "mdns-sd 0.21.7",
+ "mdns-sd",
  "serde",
  "socket2",
  "thiserror",
@@ -632,7 +632,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz-discovery"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=8482c872d305df36f68d89714816941b47b5db17#8482c872d305df36f68d89714816941b47b5db17"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=8b56725f343d3ecbc3a47ea400897d86e1d384fb#8b56725f343d3ecbc3a47ea400897d86e1d384fb"
 dependencies = [
  "http 1.5.0",
 ]
@@ -640,7 +640,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz-heos"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=8482c872d305df36f68d89714816941b47b5db17#8482c872d305df36f68d89714816941b47b5db17"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=8b56725f343d3ecbc3a47ea400897d86e1d384fb#8b56725f343d3ecbc3a47ea400897d86e1d384fb"
 dependencies = [
  "denon-marantz-heos-proto",
  "serde",
@@ -652,7 +652,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz-heos-proto"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=8482c872d305df36f68d89714816941b47b5db17#8482c872d305df36f68d89714816941b47b5db17"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=8b56725f343d3ecbc3a47ea400897d86e1d384fb#8b56725f343d3ecbc3a47ea400897d86e1d384fb"
 dependencies = [
  "serde",
  "serde_json",
@@ -662,7 +662,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz-proto"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=8482c872d305df36f68d89714816941b47b5db17#8482c872d305df36f68d89714816941b47b5db17"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=8b56725f343d3ecbc3a47ea400897d86e1d384fb#8b56725f343d3ecbc3a47ea400897d86e1d384fb"
 dependencies = [
  "quick-xml",
  "serde",
@@ -1446,20 +1446,6 @@ name = "log"
 version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
-
-[[package]]
-name = "mdns-sd"
-version = "0.21.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6743ed743ff2bada2b8651ef298d3f98addb0b74844f19cdd57137d8bd0219e"
-dependencies = [
- "fastrand",
- "flume",
- "if-addrs",
- "mio",
- "socket-pktinfo",
- "socket2",
-]
 
 [[package]]
 name = "mdns-sd"
@@ -2323,7 +2309,7 @@ dependencies = [
  "hostname",
  "jiff 1.0.2",
  "log",
- "mdns-sd 0.22.0",
+ "mdns-sd",
  "rust-fsm",
  "serde",
  "serde_json",
