@@ -16,8 +16,10 @@ use tokio::sync::broadcast::error::RecvError;
 pub const FILE: &str = "remote-sim-restore.txt";
 
 /// Queries of the settings, in the order in which they are set back. The sound mode goes first: it
-/// can change the sound settings. The Dirac filter goes before MultEQ, and the tone control before
-/// bass and treble. [`send_order`] changes this order for bass and treble.
+/// can change the sound settings. The speaker preset goes before the Dirac filter: each preset has
+/// its own filter. The Dirac filter goes before MultEQ, and the tone control before bass and
+/// treble. [`send_order`] changes this order for bass and treble, and [`write`] sends a speaker
+/// preset that differs first.
 pub const QUERIES: &[&str] = &[
     "MS?",
     "VSAUDIO ?",
@@ -28,6 +30,7 @@ pub const QUERIES: &[&str] = &[
     "SLP?",
     "MNZST?",
     "ECO?",
+    "SPPR ?",
     "PSDIRAC ?",
     "PSMULTEQ: ?",
     "PSDYNEQ ?",
@@ -140,39 +143,55 @@ fn is_saved(line: &str) -> bool {
 }
 
 /// Send the saved lines that differ from the receiver, read with `queries`. Lines that did not come
-/// back are sent once more. Returns the lines that the receiver did not take: they have a different
-/// value when read again.
+/// back are sent once more. A speaker preset that differs is sent first and alone, and the receiver
+/// is read again. Returns the lines that the receiver did not take: they have a different value
+/// when read again.
 pub async fn write(avr: &Avr, queries: &[&str], lines: &[String]) -> Result<Vec<String>, Fail> {
     // Only the lines that differ are sent, so nothing changes that does not need to.
-    let now = read(avr, queries).await?;
+    let mut now = read(avr, queries).await?;
+    // A speaker preset changes the settings of the preset. It goes first and alone, so that the
+    // other lines are compared with the values of the saved preset.
+    if let Some(preset) = lines
+        .iter()
+        .find(|line| line.starts_with(PRESET) && !now.contains(line))
+    {
+        send(avr, std::slice::from_ref(preset)).await?;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        now = read(avr, queries).await?;
+    }
     let changed = with_detour(lines, differing(lines, &now));
     if changed.is_empty() {
         return Ok(changed);
     }
     send(avr, &changed).await?;
-    // The receiver needs time to apply a sound mode.
+    // The receiver needs time to apply a sound mode or a speaker preset.
     tokio::time::sleep(Duration::from_secs(2)).await;
     let now = read(avr, queries).await?;
     let missed = differing(lines, &now);
     if missed.is_empty() {
         return Ok(missed);
     }
-    // A busy receiver can answer too late, or ignore a line while it applies the sound mode. Send
-    // the missed lines again and ask for them only. The Dirac and tone control lines are checked
-    // again too, because the retry changes them. A Dirac change can change MultEQ and Dynamic EQ.
+    // A busy receiver can answer too late, or ignore a line while it applies the sound mode or a
+    // speaker preset. Send the missed lines again and ask for them only. The Dirac and tone control
+    // lines are checked again too, because the retry changes them. A Dirac change can change MultEQ
+    // and Dynamic EQ, and a preset change can change all settings.
     let missed = with_detour(lines, missed);
     send(avr, &missed).await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
     let mut again: Vec<&str> = Vec::new();
-    let mut queries: Vec<&str> = missed
+    let mut retry: Vec<&str> = missed
         .iter()
         .filter_map(|line| position(line))
         .map(|i| QUERIES[i])
         .collect();
     if missed.iter().any(|line| line.starts_with(DIRAC)) {
-        queries.extend(DIRAC_DEPENDENT);
+        retry.extend(DIRAC_DEPENDENT);
     }
-    for query in queries {
+    // A preset change can change all settings.
+    if missed.iter().any(|line| line.starts_with(PRESET)) {
+        retry.extend(queries);
+    }
+    for query in retry {
         if !again.contains(&query) {
             again.push(query);
         }
@@ -215,8 +234,9 @@ async fn send(avr: &Avr, lines: &[String]) -> Result<(), Fail> {
     for (i, line) in order.iter().enumerate() {
         avr.telnet_send(Zone::Main, Command::Raw(line)).await?;
         let rest = &order[i + 1..];
-        // The receiver may reset the sound settings while it applies a sound mode.
-        if line.starts_with(SOUND_MODE) && !rest.is_empty() {
+        // The receiver may reset the sound settings while it applies a sound mode or a speaker
+        // preset.
+        if (line.starts_with(SOUND_MODE) || line.starts_with(PRESET)) && !rest.is_empty() {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
         // The receiver may ignore tone control while it changes the Dirac filter.
@@ -260,6 +280,7 @@ fn is_tone_level(line: &str) -> bool {
 }
 
 const SOUND_MODE: &str = "MS";
+const PRESET: &str = "SPPR";
 const DIRAC: &str = "PSDIRAC";
 /// Queries of the values that a Dirac change can change.
 const DIRAC_DEPENDENT: &[&str] = &["PSMULTEQ: ?", "PSDYNEQ ?"];
@@ -356,7 +377,9 @@ mod tests {
         assert_eq!(Some("PSIMAXLPF ?"), query("PSIMAXLPF 120"));
         // The tactile channel is also in the `CV?` list, and goes back before the transducer.
         assert_eq!(Some("CVTTR ?"), query("CVTTR 50"));
-        assert!(position("CVTTR ON") < position("SSTTR OFF"));
+        assert!(position("CVTTR ON").unwrap() < position("SSTTR OFF").unwrap());
+        assert_eq!(Some("SPPR ?"), query("SPPR 2"));
+        assert!(position("SPPR 2").unwrap() < position("PSDIRAC 1").unwrap());
         assert_eq!(None, query("PWON"));
     }
 

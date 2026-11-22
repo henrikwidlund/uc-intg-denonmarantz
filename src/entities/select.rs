@@ -464,8 +464,8 @@ fn slot_has_filter(slot: Option<&DiracSlot>) -> bool {
 }
 
 /// The options of the Dirac filter, in the order of `DIRAC_FILTERS`. A slot shows the name that the
-/// filter was saved with, else `Slot 1` to `Slot 3` as the Python integration. The same name in
-/// two slots gets the slot number.
+/// filter was saved with, else `Slot 1` to `Slot 3` as the Python integration. A label that two
+/// options share gets the slot label in parentheses, for example `Cinema (Slot 2)`.
 fn dirac_labels(v: &View<'_>) -> Vec<String> {
     let slots = &v.state.device().dirac_slots;
     let mut labels: Vec<String> = DIRAC_FILTERS

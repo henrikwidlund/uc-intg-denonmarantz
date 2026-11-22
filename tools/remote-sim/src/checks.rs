@@ -2070,6 +2070,11 @@ async fn sweep_one(ctx: &mut Ctx, kind: &str, option: &Value) -> Result<Outcome,
             Err(_) => Err(e),
         };
     }
+    if kind == "speaker_preset"
+        && let Some(oracle) = &ctx.oracle
+    {
+        oracle.ask_dirac().await?;
+    }
     if SENSORS.contains(&kind) {
         let sensor = ctx.sensor(kind);
         ctx.client
@@ -2248,6 +2253,8 @@ async fn send_simple_commands(ctx: &mut Ctx) -> Check {
     let mut problems = Vec::new();
     let mut refused: Vec<String> = Vec::new();
     let mp = ctx.mp();
+    // A speaker preset command was sent since the last compare.
+    let mut preset_sent = false;
     for (i, name) in names.iter().enumerate() {
         let (response, took) = ctx
             .client
@@ -2264,6 +2271,7 @@ async fn send_simple_commands(ctx: &mut Ctx) -> Check {
             problems.push(format!("{name}: took {} ms", took.as_millis()));
         }
         ctx.client.listen_ms(300).await?;
+        preset_sent |= name.starts_with("SPEAKER_PRESET");
         // The driver refuses tone control commands until it sees the new filter.
         if let Some(filter) = dirac_filter(name)
             && response["code"] == 200
@@ -2291,6 +2299,13 @@ async fn send_simple_commands(ctx: &mut Ctx) -> Check {
             problems.push(format!("{name}: the volume went to {v}, it was lowered"));
         }
         if i % 10 == 9 {
+            if preset_sent
+                && let Some(oracle) = &ctx.oracle
+                && let Err(e) = oracle.ask_dirac().await
+            {
+                problems.push(format!("after {name}: Dirac values not asked: {e}"));
+            }
+            preset_sent = false;
             if let Err(e) = verify_all(ctx, 6).await {
                 problems.push(format!("after {name}: {e}"));
             }

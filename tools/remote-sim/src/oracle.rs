@@ -5,8 +5,8 @@
 //! them with the values that the driver shows.
 
 use crate::Fail;
-use denon_marantz::proto::Sleep;
 use denon_marantz::proto::source::telnet_to_display_source;
+use denon_marantz::proto::{DiracFilter, DiracSlot, Sleep};
 use denon_marantz::{
     Ask, Avr, Feature, Query, QueryGroup, SettingStatus, StartOptions, State, Zone,
 };
@@ -39,6 +39,21 @@ impl Oracle {
         Ok(())
     }
 
+    /// Ask again for the Dirac slots and filter: the receiver does not send them after a speaker
+    /// preset change. Nothing is asked if the receiver gave no Dirac filter.
+    pub async fn ask_dirac(&self) -> Result<(), Fail> {
+        if self.state().device().dirac_filter.is_none() {
+            return Ok(());
+        }
+        self.avr
+            .telnet_ask(&[
+                Ask::Query(Query::DiracSlots),
+                Ask::Query(Query::DiracFilter),
+            ])
+            .await?;
+        Ok(())
+    }
+
     /// What the library says about a setting, from the values of the second connection.
     pub fn status(&self, feature: Feature) -> SettingStatus {
         self.avr.setting_status(feature)
@@ -59,6 +74,36 @@ impl Oracle {
 
 fn on_off(value: Option<bool>) -> Option<String> {
     value.map(|on| if on { "ON" } else { "OFF" }.to_owned())
+}
+
+/// Dirac filters in the option order of the driver.
+const DIRAC_FILTERS: [DiracFilter; 4] = [
+    DiracFilter::Slot1,
+    DiracFilter::Slot2,
+    DiracFilter::Slot3,
+    DiracFilter::Off,
+];
+
+/// The Dirac filter as the driver shows it: the name that the filter was saved with, else
+/// `Slot 1` to `Slot 3` or `Off`. A label that two options share gets the slot label in
+/// parentheses, for example `Cinema (Slot 2)`.
+fn dirac_label(slots: &[DiracSlot; 3], filter: Option<DiracFilter>) -> Option<String> {
+    let name = |i: usize| {
+        slots
+            .get(i)
+            .and_then(|slot| slot.name.as_deref())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(DIRAC_FILTERS[i].label())
+    };
+    let i = DIRAC_FILTERS.iter().position(|f| Some(*f) == filter)?;
+    let own = name(i);
+    let shared = (0..DIRAC_FILTERS.len()).any(|j| j != i && name(j) == own);
+    Some(if shared {
+        format!("{own} ({})", DIRAC_FILTERS[i].label())
+    } else {
+        own.to_owned()
+    })
 }
 
 fn label<T: Copy>(value: Option<T>, f: fn(T) -> &'static str) -> Option<String> {
@@ -86,6 +131,7 @@ pub fn expected(state: &State) -> Vec<Expected> {
     let monitor = label(device.video_settings.hdmi_output, HdmiOutput::label);
     let picture = label(device.picture_settings.mode, PictureMode::label);
     let codec = label(device.digital_codec, DigitalCodec::label);
+    let dirac = dirac_label(&device.dirac_slots, device.dirac_filter);
     let db = zone.volume.map(|v| f64::from(v.db()));
     let signal = &device.signal;
     let color = signal.video_color();
@@ -97,6 +143,7 @@ pub fn expected(state: &State) -> Vec<Expected> {
         ("select.monitor_output", monitor.clone()),
         ("select.picture_mode", picture.clone()),
         ("select.digital_codec", codec.clone()),
+        ("select.dirac_filter", dirac.clone()),
         (
             "select.reference_level_offset",
             label(device.reference_level_offset, ReferenceLevelOffset::label),
@@ -118,6 +165,7 @@ pub fn expected(state: &State) -> Vec<Expected> {
         ("sensor.monitor_output", monitor),
         ("sensor.picture_mode", picture),
         ("sensor.digital_codec", codec),
+        ("sensor.dirac_filter", dirac),
         (
             "sensor.mute",
             Some(
@@ -196,4 +244,56 @@ pub fn expected(state: &State) -> Vec<Expected> {
             zone.sound_mode_category.map(|c| c.label().to_owned()),
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use denon_marantz::proto::telnet::Message;
+
+    fn state(lines: &[&str]) -> State {
+        let mut state = State::new(true);
+        for line in lines {
+            let message = Message::parse(line).unwrap_or_else(|| panic!("not a message: {line}"));
+            state.apply_message(&message);
+        }
+        state
+    }
+
+    fn dirac(lines: &[&str]) -> Option<String> {
+        let state = state(lines);
+        expected(&state)
+            .into_iter()
+            .find(|(name, _)| *name == "select.dirac_filter")
+            .and_then(|(_, value)| value)
+    }
+
+    #[test]
+    fn the_dirac_filter_is_shown_as_the_driver_shows_it() {
+        assert_eq!(None, dirac(&["PWON"]));
+        assert_eq!(Some("Off".to_owned()), dirac(&["PWON", "PSDIRAC OFF"]));
+        assert_eq!(Some("Slot 2".to_owned()), dirac(&["PWON", "PSDIRAC 2"]));
+        let named = ["PWON", "OPDLSSL3NAME Music", "PSDIRAC 3"];
+        assert_eq!(Some("Music".to_owned()), dirac(&named));
+        let same = [
+            "PWON",
+            "OPDLSSL1NAME Cinema",
+            "OPDLSSL2NAME Cinema",
+            "PSDIRAC 2",
+        ];
+        assert_eq!(Some("Cinema (Slot 2)".to_owned()), dirac(&same));
+        let spaces = ["PWON", "OPDLSSL1NAME    ", "PSDIRAC 1"];
+        assert_eq!(Some("Slot 1".to_owned()), dirac(&spaces));
+        let padded = ["PWON", "OPDLSSL2NAME Dirac ART      ", "PSDIRAC 2"];
+        assert_eq!(Some("Dirac ART".to_owned()), dirac(&padded));
+        let off = ["PWON", "OPDLSSL1NAME Off"];
+        assert_eq!(
+            Some("Off (Slot 1)".to_owned()),
+            dirac(&[&off[..], &["PSDIRAC 1"]].concat())
+        );
+        assert_eq!(
+            Some("Off (Off)".to_owned()),
+            dirac(&[&off[..], &["PSDIRAC OFF"]].concat())
+        );
+    }
 }
