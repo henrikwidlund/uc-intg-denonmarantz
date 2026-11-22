@@ -10,8 +10,8 @@ publish = false
 [workspace]
 
 [dependencies]
-denon-marantz = { git = "https://github.com/henrikwidlund/rusty-denon-marantz", rev = "8436182364cfd9448b767dabf7ffa8b708cb14cd", default-features = false, features = ["telnet", "http", "serde"] }
-denon-marantz-heos = { git = "https://github.com/henrikwidlund/rusty-denon-marantz", rev = "8436182364cfd9448b767dabf7ffa8b708cb14cd" }
+denon-marantz = { git = "https://github.com/henrikwidlund/rusty-denon-marantz", rev = "8434ddcdfcbf12d739a253d45757ea0e67fe571b", default-features = false, features = ["telnet", "http", "serde"] }
+denon-marantz-heos = { git = "https://github.com/henrikwidlund/rusty-denon-marantz", rev = "8434ddcdfcbf12d739a253d45757ea0e67fe571b" }
 jiff = { version = "1", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 serde_json = "1"
