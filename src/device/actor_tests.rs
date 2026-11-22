@@ -2380,12 +2380,31 @@ async fn a_web_interface_that_does_not_answer_does_not_delay_the_http_poll() {
 async fn a_disconnect_during_a_signal_read_drops_the_receiver_at_once() {
     // The start reads the video page twice: the library asks again after an answer that it
     // cannot read. Later reads of it are signal reads and get no answer for 60 s. The other pages
-    // answer at once: the start tasks of the library also hold the receiver, and the driver
-    // cannot stop them.
+    // answer at once, so that only the signal read waits.
     let web = FakeWeb::start_slow_after(200, Duration::from_secs(60), Some((VIDEO_PAGE, 2))).await;
     let (actor, _events, _http) =
         http_actor_with_timeout(cfg(), &web, Duration::from_secs(30)).await;
     until("the signal read", 10, || web.requests(VIDEO_PAGE) >= 3).await;
+    let avr = actor.send(CurrentAvr).await.expect("send").expect("avr");
+    actor.send(Disconnect).await.expect("disconnect");
+    until("the receiver is dropped", 3, || avr.upgrade().is_none()).await;
+}
+
+#[actix::test]
+async fn a_disconnect_during_the_start_drops_the_receiver_at_once() {
+    // No page of the web interface answers: the start task of the library waits for the video
+    // page.
+    let web = FakeWeb::start_slow(200, Duration::from_secs(60)).await;
+    let (actor, events, _http) =
+        http_actor_with_timeout(cfg(), &web, Duration::from_secs(30)).await;
+    until("connected", 5, || {
+        status_count(&events, DeviceStatus::Connected) == 1
+    })
+    .await;
+    until("the start reads the video page", 5, || {
+        web.requests(VIDEO_PAGE) >= 1
+    })
+    .await;
     let avr = actor.send(CurrentAvr).await.expect("send").expect("avr");
     actor.send(Disconnect).await.expect("disconnect");
     until("the receiver is dropped", 3, || avr.upgrade().is_none()).await;

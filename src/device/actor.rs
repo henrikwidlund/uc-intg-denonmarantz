@@ -16,8 +16,8 @@ use actix::prelude::*;
 use denon_marantz::HeosPlayerStatus;
 use denon_marantz::heos::{Change as HeosChange, PlayState, PlayerState};
 use denon_marantz::{
-    Ask, Avr, Change, Error as AvrError, Info, MissingSources, Query, Setting, Started, State,
-    TelnetStatus,
+    Ask, Avr, Change, Error as AvrError, Info, MissingSources, Query, Setting, StartStopper,
+    Started, State, TelnetStatus,
 };
 use futures::StreamExt;
 use log::{debug, info, warn};
@@ -147,7 +147,8 @@ struct Connected {
     changes: broadcast::Receiver<Change>,
     /// The address, if it is not the one of the configuration.
     address: Option<String>,
-    /// The start, which reads the web pages in the background.
+    /// The start, which reads the web pages in the background. Stop it if the result is not used:
+    /// dropping it does not stop the start task.
     started: Started,
     /// Time of the try of the start that worked.
     took: Duration,
@@ -266,6 +267,9 @@ pub struct DenonActor {
     run_stop: Arc<AtomicU64>,
     expected: Arc<Expected>,
     timers: Timers,
+    /// Stops the start task of the library. Dropping `Started` does not stop it, and it holds
+    /// the `Avr`.
+    start_stopper: Option<StartStopper>,
 }
 
 impl DenonActor {
@@ -330,6 +334,7 @@ impl DenonActor {
             run_stop: Arc::default(),
             expected: Arc::default(),
             timers: Timers::default(),
+            start_stopper: None,
         }
     }
 
@@ -566,13 +571,16 @@ impl DenonActor {
                     "[{}] result of an old connect attempt ignored",
                     act.cfg.name
                 );
+                if let Ok(connected) = result {
+                    connected.started.stop();
+                }
                 return;
             }
             match result {
                 Ok(connected) if act.want && act.status == DeviceStatus::Connecting => {
                     act.on_connected(connected, version, start, ctx);
                 }
-                Ok(_) => {}
+                Ok(connected) => connected.started.stop(),
                 Err(e) => {
                     match e {
                         Some(e) => warn!("[{}] connect failed: {e}", act.cfg.name),
@@ -640,6 +648,9 @@ impl DenonActor {
             BroadcastStream::new(changes).map(move |change| Changed(generation, change.ok())),
         );
         let addr = ctx.address();
+        if let Some(old) = self.start_stopper.replace(started.stopper()) {
+            old.stop();
+        }
         self.timers.pages = Some(
             ctx.spawn(
                 discovery::after_start(
@@ -1115,8 +1126,8 @@ impl DenonActor {
         self.emit();
     }
 
-    /// Close the connection and cancel the timers and reads of it. Commands, telnet asks and the
-    /// tasks of the library end on their own.
+    /// Close the connection, cancel the timers and reads of it and stop the start task of the
+    /// library. Commands, telnet asks and the other tasks of the library end on their own.
     fn close(&mut self, ctx: &mut Context<Self>) {
         // Names that came before the close are saved now: the next connection may not ask again.
         if let Some(handle) = self.timers.names.take() {
@@ -1143,6 +1154,9 @@ impl DenonActor {
         // An older connect attempt must not run on: it would read the receiver in parallel with
         // the next one.
         self.cancel_connect(ctx);
+        if let Some(stopper) = self.start_stopper.take() {
+            stopper.stop();
+        }
         for handle in [
             self.timers.poll.take(),
             self.timers.poll_read.take(),
