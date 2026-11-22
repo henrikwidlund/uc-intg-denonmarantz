@@ -115,7 +115,7 @@ pub fn without_state(
     }
 }
 
-const fn action_without_state(cfg: &DeviceConfig, action: &Action) -> bool {
+fn action_without_state(cfg: &DeviceConfig, action: &Action) -> bool {
     match action {
         Action::On
         | Action::Off

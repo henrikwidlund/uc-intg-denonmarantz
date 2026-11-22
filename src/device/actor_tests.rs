@@ -73,7 +73,6 @@ fn cfg() -> DeviceConfig {
         receiver_type: None,
         update_method: None,
         hdmi_output_over_http: None,
-        quick_select_count: None,
         listed_queries: None,
         comm_api_version: None,
         has_tuner: None,
@@ -239,11 +238,41 @@ async fn the_values_of_older_receivers_are_read_only_on_older_receivers() {
     }
 
     let old = rig_on(older_receiver().await, |_| cfg(), answers_all, QUICK).await;
-    for line in ["PSDIL ?", "PSMODE: ?", "PSDSX ?", "MNPRV?"] {
+    for line in ["PSDIL ?", "PSMODE: ?", "PSDSX ?"] {
         until(line, 10, || old.telnet.count(line) >= 1).await;
     }
     // Not in the spec of 2014 and 2015.
-    assert_eq!(0, old.telnet.count("PSSB: ?"));
+    for line in ["PSSB: ?", "MNPRV?"] {
+        assert_eq!(0, old.telnet.count(line), "{line}");
+    }
+}
+
+/// A current receiver whose `Deviceinfo.xml` lists only the LFE level.
+async fn receiver_with_few_features() -> Fake {
+    Fake::start_with_info(
+        b"<Device_Info><CommApiVers>0301</CommApiVers><ModelName>AVR-X3700H</ModelName>\
+        <DeviceZones>2</DeviceZones><MacAddress>0123456789AB</MacAddress><DeviceCapabilities>\
+        <Setup><SurroundParameter><LFE/></SurroundParameter></Setup></DeviceCapabilities>\
+        </Device_Info>",
+    )
+    .await
+}
+
+#[actix::test]
+async fn queries_of_features_that_the_receiver_does_not_list_are_not_sent() {
+    let rig = rig_on(
+        receiver_with_few_features().await,
+        |_| cfg(),
+        answers_all,
+        QUICK,
+    )
+    .await;
+    // The sleep timer needs no feature. The extra values are sent in one go.
+    until("the sleep timer", 10, || rig.telnet.count("SLP?") >= 1).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    for line in ["PV?", "PSIMAX ?", "SSSMG ?"] {
+        assert_eq!(0, rig.telnet.count(line), "{line}");
+    }
 }
 
 /// A Denon receiver of 2015 (`CommApiVers` 0300), with network favorites before HEOS.
@@ -2067,15 +2096,13 @@ async fn changed_values_update_the_receiver_kind_without_a_new_connect() {
             quick_select_count: Some(99),
             ..info
         }),
-        quick_select_count: Some(99),
         ..cfg()
     };
     let rig = rig_with(cfg, answers_all, QUICK).await;
     let updated = || {
         rig.events.lock().expect("lock").iter().any(|event| {
             matches!(event, DeviceEvent::Config { cfg, .. }
-                if cfg.quick_select_count == count
-                    && cfg.info.as_ref().is_some_and(|i| i.quick_select_count == count))
+                if cfg.info.as_ref().is_some_and(|i| i.quick_select_count == count))
         })
     };
     until("the new receiver kind", 5, updated).await;

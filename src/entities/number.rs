@@ -6,7 +6,7 @@
 use crate::config_store::DeviceConfig;
 use crate::entities::{NumberKind, View, availability};
 use crate::errors::ServiceError;
-use denon_marantz::{Avr, State, Zone};
+use denon_marantz::{Avr, Query, State, Zone};
 #[cfg(test)]
 use serde_json::json;
 use serde_json::{Map, Value};
@@ -36,9 +36,18 @@ pub const fn name(kind: NumberKind) -> &'static str {
     }
 }
 
-/// The values come with telnet, or with `AppCommand` over HTTP if the receiver lists the query.
-pub const fn available(cfg: &DeviceConfig, _kind: NumberKind) -> bool {
-    cfg.use_telnet || cfg.reads_tone_control()
+/// The query of the value.
+pub(super) const fn query(kind: NumberKind) -> Query {
+    match kind {
+        NumberKind::Bass => Query::Bass,
+        NumberKind::Treble => Query::Treble,
+    }
+}
+
+/// The receiver may have the value (see `DeviceConfig::offers_query`). The values come with telnet,
+/// or with `AppCommand` over HTTP if the receiver lists the query.
+pub fn available(cfg: &DeviceConfig, kind: NumberKind) -> bool {
+    cfg.offers_query(query(kind)) && (cfg.use_telnet || cfg.reads_tone_control())
 }
 
 /// The level in dB. `None` if the receiver did not report it.

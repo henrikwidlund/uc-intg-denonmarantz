@@ -92,23 +92,29 @@ impl Entry {
         self.brand != Brand::Denon
     }
 
-    /// The receiver has the command: it has the brand, the quick select slot and the feature, and
-    /// telnet is on if the command needs it.
-    const fn is_supported(&self, cfg: &DeviceConfig) -> bool {
+    /// The receiver has the command: it has the brand, the quick select slot and the feature, the
+    /// library offers the text, and telnet is on if the command needs it.
+    fn is_supported(&self, cfg: &DeviceConfig) -> bool {
         (cfg.use_telnet || !self.telnet_only)
-            && match self.quick_select {
-                Some(slot) => cfg.has_quick_select(slot),
-                None => true,
-            }
-            && match self.feature {
-                Some(feature) => cfg.offers(feature),
-                None => true,
-            }
             && match self.brand {
                 Brand::All => true,
                 Brand::Denon => cfg.is_denon,
                 Brand::Marantz => !cfg.is_denon,
             }
+            && self
+                .quick_select
+                .is_none_or(|slot| cfg.has_quick_select(slot))
+            && self.feature.is_none_or(|feature| cfg.offers(feature))
+            && cfg.offers_line(self.brand_text(cfg.is_denon))
+    }
+
+    /// The text for the brand. A toggle keeps both values.
+    fn brand_text(&self, is_denon: bool) -> &'static str {
+        match self.text.split_once(" / ") {
+            Some((denon, _)) if is_denon => denon,
+            Some((_, marantz)) => marantz,
+            None => self.text,
+        }
     }
 
     /// The command sends one of two values, for example `PSGEQ ON/OFF`.
@@ -118,8 +124,8 @@ impl Entry {
 
     /// The text to send to the receiver now.
     pub fn text(&self, is_denon: bool, state: &State) -> String {
-        if let Some((denon, marantz)) = self.text.split_once(" / ") {
-            return (if is_denon { denon } else { marantz }).to_owned();
+        if self.text.contains(" / ") {
+            return self.brand_text(is_denon).to_owned();
         }
         match toggle_current(self.name, state) {
             Some(current) => toggled(self.text, Some(current)),
@@ -149,9 +155,9 @@ pub fn supported(cfg: &DeviceConfig) -> Vec<&'static str> {
         .collect()
 }
 
-/// The feature that the command needs.
-pub fn feature(name: &str) -> Option<Feature> {
-    get(name)?.feature
+/// The receiver has the command. True for a name that is not in the table.
+pub fn is_supported(name: &str, cfg: &DeviceConfig) -> bool {
+    get(name).is_none_or(|e| e.is_supported(cfg))
 }
 
 pub fn get(name: &str) -> Option<&'static Entry> {
@@ -224,6 +230,7 @@ fn toggle_current(name: &str, state: &State) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use denon_marantz::proto::spec_feature_of_line;
 
     fn cfg(use_telnet: bool, is_denon: bool) -> DeviceConfig {
         DeviceConfig {
@@ -247,7 +254,6 @@ mod tests {
             receiver_type: None,
             update_method: None,
             hdmi_output_over_http: None,
-            quick_select_count: None,
             listed_queries: None,
             comm_api_version: None,
             has_tuner: None,
@@ -260,14 +266,28 @@ mod tests {
     }
 
     #[test]
+    fn a_command_of_a_feature_that_the_receiver_does_not_list_is_not_offered() {
+        use denon_marantz::{DeviceFeature, DeviceFeatures};
+        let with = |features| {
+            let mut c = crate::config_store::read_with_version(cfg(true, true), "0301");
+            if let Some(info) = &mut c.info {
+                info.features = features;
+            }
+            c
+        };
+        let lfe = DeviceFeatures::default().with(DeviceFeature::Lfe);
+        assert!(supported(&with(None)).contains(&"PICTURE_MODE_MOVIE"));
+        assert!(!supported(&with(Some(lfe))).contains(&"PICTURE_MODE_MOVIE"));
+        // A command that needs no feature stays.
+        assert!(supported(&with(Some(lfe))).contains(&"INFO_MENU"));
+    }
+
+    #[test]
     fn a_command_of_a_missing_quick_select_slot_is_not_offered() {
         assert_eq!(Some(2), quick_select_slot("QUICK_SELECT_MEMORY_2"));
         assert_eq!(Some(6), quick_select_slot("SMART_SELECT_6"));
         assert_eq!(None, quick_select_slot("ZONE_FAVORITE_1"));
-        let c = DeviceConfig {
-            quick_select_count: Some(3),
-            ..cfg(true, true)
-        };
+        let c = crate::config_store::read_with_quick_selects(cfg(true, true), Some(3));
         let names = supported(&c);
         assert!(names.contains(&"QUICK_SELECT_3"));
         assert!(!names.contains(&"QUICK_SELECT_4"));
@@ -299,6 +319,7 @@ mod tests {
                     get(n).is_some_and(|e| {
                         e.feature
                             .is_none_or(|f| matches!(f, Feature::Tuner | Feature::Dirac))
+                            && spec_feature_of_line(e.brand_text(c.is_denon)).is_none()
                     })
                 })
                 .count()
@@ -343,7 +364,7 @@ mod tests {
         ] {
             let driver = EXTRA_QUERIES
                 .iter()
-                .chain(OLDER_QUERIES.iter().map(|(_, query)| query))
+                .chain(OLDER_QUERIES.iter())
                 .filter_map(|query| query.text(brand));
             let asked: Vec<&str> = queries(brand, QueryGroup::START_ORDER)
                 .chain(driver)
@@ -401,9 +422,8 @@ mod tests {
 
     #[test]
     fn the_commands_of_older_receivers_follow_the_generation() {
-        let with = |is_denon: bool, version: &str| DeviceConfig {
-            comm_api_version: crate::config_store::CommApiVersion::parse(version),
-            ..cfg(true, is_denon)
+        let with = |is_denon: bool, version: &str| {
+            crate::config_store::read_with_version(cfg(true, is_denon), version)
         };
         let has = |c: &DeviceConfig, name: &str| supported(c).contains(&name);
         let denon_2013 = with(true, "0210");
@@ -414,7 +434,7 @@ mod tests {
         assert!(!has(&denon_2013, "DYNAMIC_COMPRESSION_LOW"));
         let denon_2015 = with(true, "0300");
         assert!(has(&denon_2015, "DIALOG_LEVEL_UP"));
-        assert!(has(&denon_2015, "INSTA_PREVUE_ON"));
+        assert!(!has(&denon_2015, "INSTA_PREVUE_ON"));
         assert!(!has(&denon_2015, "SURROUND_BACK_MODE_ON"));
         let marantz_2013 = with(false, "0210");
         assert!(has(&marantz_2013, "DYNAMIC_COMPRESSION_LOW"));
@@ -428,7 +448,7 @@ mod tests {
         assert!(!has(&denon_now, "NETWORK_NEXT"));
         assert!(has(&denon_now, "INPUT_MODE_7_1_IN"));
         assert!(has(&denon_now, "INPUT_MODE_SELECT"));
-        assert!(has(&with(false, "0301"), "FRONT_HEIGHT_ON"));
+        assert!(!has(&with(false, "0301"), "FRONT_HEIGHT_ON"));
         assert!(!has(&with(false, "0301"), "AUTO_FLAG_DETECT_ON"));
     }
 

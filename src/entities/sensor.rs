@@ -4,7 +4,6 @@
 //! Sensor entities. Names, values and units are the ones of the Python integration.
 
 use crate::config_store::{DeviceConfig, Feature};
-use crate::device::discovery::listed;
 use crate::entities::{SelectKind, SensorKind, View, availability, is_off, select};
 use denon_marantz::proto::{InOut, Sleep};
 use denon_marantz::{Query, Volume, Zone};
@@ -100,42 +99,90 @@ pub const fn name(kind: SensorKind) -> &'static str {
     }
 }
 
-/// The feature that a sensor of older receivers shows.
-pub(super) const fn feature(kind: SensorKind) -> Option<Feature> {
+/// The query of the value. `None` for the tuner frequency, which depends on the tuner setup.
+pub(super) const fn query(kind: SensorKind) -> Option<Query> {
+    use SensorKind as S;
     Some(match kind {
-        SensorKind::ProLogicMode => Feature::ProLogicMode,
-        SensorKind::SurroundBackMode => Feature::SurroundBackMode,
-        SensorKind::FrontHeight => Feature::FrontHeight,
-        SensorKind::DynamicCompression => Feature::DynamicCompression,
-        SensorKind::AutoFlagDetect => Feature::AutoFlagDetect,
-        SensorKind::DialogLevelAdjust | SensorKind::DialogLevel => Feature::DialogLevel,
-        SensorKind::AudysseyDsx | SensorKind::StageWidth | SensorKind::StageHeight => {
-            Feature::AudysseyDsx
-        }
-        SensorKind::HeightGain => Feature::HeightGain,
-        SensorKind::InstaPrevue => Feature::InstaPrevue,
-        _ => return None,
+        S::VolumeDb | S::VolumeAbsolute => Query::Volume,
+        S::SoundMode => Query::SoundMode,
+        S::InputSource => Query::Source,
+        S::Mute => Query::Mute,
+        S::Dimmer => Query::Dimmer,
+        S::EcoMode => Query::Eco,
+        S::SleepTimer => Query::Sleep,
+        S::AudioDelay => Query::AudioDelay,
+        S::AudioSignal => Query::AudioSignal,
+        S::AudioSamplingRate => Query::SamplingRate,
+        S::MonitorOutput => Query::HdmiOutput,
+        S::VideoHdmiSignalIn => Query::VideoInput,
+        S::VideoHdmiSignalOut => Query::VideoOutput,
+        S::InputChannels => Query::InputChannels,
+        S::OutputChannels => Query::OutputChannels,
+        S::MaxResolution => Query::HdmiMaxResolution,
+        S::HdrInput | S::HdrOutput => Query::HdrFormat,
+        S::PixelDepthInput | S::PixelDepthOutput => Query::PixelDepth,
+        S::MaxFrlInput | S::MaxFrlOutput => Query::MaxFrl,
+        S::ColorspaceInput | S::ColorspaceOutput => Query::ColorSpace,
+        S::PictureMode => Query::PictureMode,
+        S::TunerFrequency => return None,
+        S::AllZoneStereo => Query::AllZoneStereo,
+        S::DigitalCodec => Query::DigitalCodec,
+        S::DiracFilter => Query::DiracFilter,
+        S::ProLogicMode => Query::ProLogicMode,
+        S::SurroundBackMode => Query::SurroundBackMode,
+        S::FrontHeight => Query::FrontHeight,
+        S::DynamicCompression => Query::DynamicCompression,
+        S::AutoFlagDetect => Query::AutoFlagDetect,
+        S::DialogLevelAdjust | S::DialogLevel => Query::DialogLevel,
+        S::AudysseyDsx => Query::AudysseyDsx,
+        S::StageWidth => Query::StageWidth,
+        S::StageHeight => Query::StageHeight,
+        S::HeightGain => Query::HeightGain,
+        S::InstaPrevue => Query::InstaPrevue,
+        S::BluetoothLevel => Query::BluetoothLevel,
+        S::SoundModeCategory => Query::SoundModeCategory,
     })
 }
 
-/// The first seven sensors always exist, the others only with a telnet connection. The sensors of
-/// older receivers also need the feature, and the sound mode category needs the receiver to list
-/// it. The signal sensors and the HDMI output that `Avr::update_signal_and_settings` reads also
-/// come over HTTP. The audio signal and the sampling rate need the receiver to list the query.
+/// The values of older receivers. They come on telnet only.
+pub(super) const fn is_older(kind: SensorKind) -> bool {
+    use SensorKind as S;
+    matches!(
+        kind,
+        S::ProLogicMode
+            | S::SurroundBackMode
+            | S::FrontHeight
+            | S::DynamicCompression
+            | S::AutoFlagDetect
+            | S::DialogLevelAdjust
+            | S::DialogLevel
+            | S::AudysseyDsx
+            | S::StageWidth
+            | S::StageHeight
+            | S::HeightGain
+            | S::InstaPrevue
+    )
+}
+
+/// The receiver may have the value (see `DeviceConfig::offers_query`), and the setup and the
+/// connection allow it.
 pub fn available(cfg: &DeviceConfig, kind: SensorKind) -> bool {
-    if matches!(kind, SensorKind::SoundModeCategory) {
-        let features = cfg.info.as_ref().and_then(|info| info.features);
-        return cfg.use_telnet && listed(features, Query::SoundModeCategory);
+    query(kind).is_none_or(|query| cfg.offers_query(query)) && allowed(cfg, kind)
+}
+
+/// The first seven sensors exist without telnet, the others only with a telnet connection. The
+/// sensors of older receivers and the sound mode category come on telnet only. The signal sensors
+/// and the HDMI output that `Avr::update_signal_and_settings` reads also come over HTTP. The audio
+/// signal and the sampling rate need the receiver to list the query.
+fn allowed(cfg: &DeviceConfig, kind: SensorKind) -> bool {
+    if is_older(kind) || matches!(kind, SensorKind::SoundModeCategory) {
+        return cfg.use_telnet;
     }
     if matches!(kind, SensorKind::DiracFilter) {
         return cfg.use_telnet && cfg.has_dirac();
     }
     if matches!(kind, SensorKind::TunerFrequency) {
         return cfg.use_telnet && cfg.offers(Feature::Tuner);
-    }
-    // The values of older receivers come on telnet only.
-    if let Some(feature) = feature(kind) {
-        return cfg.use_telnet && cfg.offers(feature);
     }
     cfg.use_telnet
         || (cfg.reads_hdmi_output() && matches!(kind, SensorKind::MonitorOutput))

@@ -75,16 +75,13 @@ pub fn definition(mut entity: AvailableIntgEntity, cfg: &DeviceConfig) -> Availa
     entity
 }
 
-/// The UI pages without the buttons of quick select slots and of features that the receiver does
-/// not have. A page without buttons is left out.
+/// The UI pages without the buttons of commands that the receiver does not have. A page without
+/// buttons is left out.
 fn pages_for(pages: &Value, cfg: &DeviceConfig) -> Value {
     let has = |item: &Value| {
-        let cmd = item["command"]["cmd_id"].as_str();
-        cmd.and_then(simple_commands::quick_select_slot)
-            .is_none_or(|slot| cfg.has_quick_select(slot))
-            && cmd
-                .and_then(simple_commands::feature)
-                .is_none_or(|feature| cfg.offers(feature))
+        item["command"]["cmd_id"]
+            .as_str()
+            .is_none_or(|cmd| simple_commands::is_supported(cmd, cfg))
     };
     let Some(pages) = pages.as_array() else {
         return Value::Null;
@@ -275,8 +272,8 @@ mod tests {
                 .collect()
         };
         let pages = |count| {
-            let mut cfg = crate::entities::tests::cfg(true, true);
-            cfg.quick_select_count = count;
+            let cfg = crate::entities::tests::cfg(true, true);
+            let mut cfg = crate::config_store::read_with_quick_selects(cfg, count);
             cfg.is_dirac_supported = Some(true);
             pages_for(&UI.denon, &cfg)
         };

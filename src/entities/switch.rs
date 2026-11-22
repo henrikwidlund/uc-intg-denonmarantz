@@ -7,7 +7,7 @@ use crate::config_store::DeviceConfig;
 use crate::entities::{SwitchKind, View, availability};
 use crate::errors::ServiceError;
 use denon_marantz::proto::Trigger;
-use denon_marantz::{Avr, State};
+use denon_marantz::{Avr, Query, State};
 use serde_json::{Map, Value};
 use std::str::FromStr;
 use uc_api::intg::AvailableIntgEntity;
@@ -35,9 +35,25 @@ pub const fn name(kind: SwitchKind) -> &'static str {
     }
 }
 
+/// The query of the value.
+pub(super) const fn query(kind: SwitchKind) -> Query {
+    match kind {
+        SwitchKind::ToneControl => Query::ToneControl,
+        SwitchKind::DynamicEq => Query::DynamicEq,
+        SwitchKind::Trigger1 | SwitchKind::Trigger2 | SwitchKind::Trigger3 => Query::Trigger,
+        SwitchKind::BluetoothTransmitter => Query::BluetoothTransmitter,
+    }
+}
+
+/// The receiver may have the value (see `DeviceConfig::offers_query`), and the connection allows
+/// it.
+pub fn available(cfg: &DeviceConfig, kind: SwitchKind) -> bool {
+    cfg.offers_query(query(kind)) && allowed(cfg, kind)
+}
+
 /// The values come with telnet. Tone control and Dynamic EQ also come with `AppCommand` over HTTP, if
 /// the receiver lists the query.
-pub const fn available(cfg: &DeviceConfig, kind: SwitchKind) -> bool {
+const fn allowed(cfg: &DeviceConfig, kind: SwitchKind) -> bool {
     cfg.use_telnet
         || match kind {
             SwitchKind::ToneControl => cfg.reads_tone_control(),

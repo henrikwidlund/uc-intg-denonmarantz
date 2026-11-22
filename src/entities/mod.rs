@@ -386,7 +386,6 @@ pub(crate) mod tests {
             receiver_type: None,
             update_method: None,
             hdmi_output_over_http: None,
-            quick_select_count: None,
             listed_queries: None,
             comm_api_version: None,
             has_tuner: None,
@@ -420,23 +419,56 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn entities_of_features_that_the_receiver_does_not_list_are_left_out() {
+        use denon_marantz::{DeviceFeature, DeviceFeatures};
+        let with = |features| {
+            let mut c = crate::config_store::read_with_version(cfg(true, true), "0301");
+            if let Some(info) = &mut c.info {
+                info.features = features;
+            }
+            c
+        };
+        let has = |c: &DeviceConfig, kind| EntityKind::all(c).any(|k| k == kind);
+        let picture = EntityKind::Select(SelectKind::PictureMode);
+        let lfe = DeviceFeatures::default().with(DeviceFeature::Lfe);
+        assert!(has(&with(None), picture));
+        assert!(!has(&with(Some(lfe)), picture));
+        assert!(has(
+            &with(Some(lfe.with(DeviceFeature::PictureMode))),
+            picture
+        ));
+        // A value that needs no feature stays.
+        assert!(has(
+            &with(Some(lfe)),
+            EntityKind::Sensor(SensorKind::SleepTimer)
+        ));
+    }
+
+    #[test]
     fn sensors_of_older_receivers_follow_the_generation() {
-        use crate::config_store::CommApiVersion;
+        use crate::config_store::{CommApiVersion, read_with_version};
         let sensors = |is_denon: bool, use_telnet: bool, version: &str| {
             let c = DeviceConfig {
-                comm_api_version: CommApiVersion::parse(version),
                 is_denon,
                 ..cfg(use_telnet, true)
             };
+            let c = if version == "none" {
+                DeviceConfig {
+                    comm_api_version: CommApiVersion::parse(version),
+                    ..c
+                }
+            } else {
+                read_with_version(c, version)
+            };
             EntityKind::all(&c)
                 .filter_map(|k| match k {
-                    EntityKind::Sensor(s) if sensor::feature(s).is_some() => Some(s),
+                    EntityKind::Sensor(s) if sensor::is_older(s) => Some(s),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
         };
         assert_eq!(Vec::<SensorKind>::new(), sensors(true, true, "0301"));
-        assert_eq!(vec![SensorKind::FrontHeight], sensors(false, true, "0301"));
+        assert_eq!(Vec::<SensorKind>::new(), sensors(false, true, "0301"));
         assert_eq!(Vec::<SensorKind>::new(), sensors(true, false, "0300"));
         let denon_2015 = sensors(true, true, "0300");
         assert!(denon_2015.contains(&SensorKind::DialogLevel));

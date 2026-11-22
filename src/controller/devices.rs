@@ -553,11 +553,11 @@ impl Handler<DeviceEvent> for Controller {
                     return;
                 };
                 // The event can be older than the settings of the controller.
-                let Some(new_kind) = device.cfg.take_found(*cfg) else {
+                let Some(new_entities) = device.cfg.take_found(*cfg) else {
                     return;
                 };
                 info!("[{}] saving what the receiver reported", device.cfg.name);
-                if new_kind {
+                if new_entities {
                     // The receiver can have fewer entities now.
                     self.purge_entities();
                 }

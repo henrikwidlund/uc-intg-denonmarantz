@@ -7,7 +7,9 @@
 use super::{
     EntityKind, NumberKind, SelectKind, SensorKind, SwitchKind, View, attributes, definition,
 };
-use crate::config_store::{CommApiVersion, DeviceConfig, ReceiverGeneration};
+use crate::config_store::{
+    CommApiVersion, DeviceConfig, ReceiverGeneration, read_with_quick_selects,
+};
 use denon_marantz::State;
 use denon_marantz::proto::telnet::Message;
 use serde_json::json;
@@ -35,7 +37,6 @@ fn cfg() -> DeviceConfig {
         receiver_type: None,
         update_method: None,
         hdmi_output_over_http: None,
-        quick_select_count: None,
         listed_queries: None,
         comm_api_version: None,
         has_tuner: None,
@@ -742,20 +743,14 @@ fn the_max_resolution_shows_the_label() {
 
 #[test]
 fn the_quick_select_offers_the_slots_of_the_receiver() {
-    let cfg = DeviceConfig {
-        quick_select_count: Some(3),
-        ..cfg()
-    };
+    let cfg = read_with_quick_selects(cfg(), Some(3));
     let state = state(&["PWON"]);
     let v = view(&state, &cfg);
     assert_eq!(
         json!(["Quick Select 1", "Quick Select 2", "Quick Select 3"]),
         select(&v, SelectKind::QuickSelect)["options"]
     );
-    let none = DeviceConfig {
-        quick_select_count: Some(0),
-        ..self::cfg()
-    };
+    let none = read_with_quick_selects(self::cfg(), Some(0));
     assert!(!EntityKind::all(&none).any(|k| k == EntityKind::Select(SelectKind::QuickSelect)));
 }
 

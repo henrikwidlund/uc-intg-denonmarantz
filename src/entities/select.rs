@@ -3,7 +3,7 @@
 
 //! Select entities.
 
-use crate::config_store::{DeviceConfig, Feature, Generation};
+use crate::config_store::{DeviceConfig, Feature};
 use crate::entities::sensor::EMPTY;
 use crate::entities::{SelectKind, View, availability, is_off};
 use crate::errors::ServiceError;
@@ -15,7 +15,9 @@ use denon_marantz::proto::{
     HdmiOutput, MultiEq, PictureMode, ReferenceLevelOffset, SoundModeGroup, SpeakerPreset,
     TunerBand,
 };
-use denon_marantz::{Avr, Command, SoundModeEntry, State, Zone};
+use denon_marantz::{
+    Avr, Command, MAX_QUICK_SELECT, Query, SoundModeEntry, SpecFeature, SpecGeneration, State, Zone,
+};
 use serde_json::{Map, Value};
 use std::borrow::Cow;
 
@@ -99,12 +101,40 @@ const TUNER_PRESETS: u8 = 56;
 /// Quick selects of a receiver: the first five exist on all models.
 const QUICK_SELECTS: usize = 5;
 
-/// Six selects always exist. With a telnet connection there are more, the Dirac filter if the
-/// receiver supports it, the network favorites on receivers before HEOS, and the tuner band and
+/// The query of the value. `None` for the selects that depend on the setup or the generation.
+pub(super) const fn query(kind: SelectKind) -> Option<Query> {
+    use SelectKind as S;
+    Some(match kind {
+        S::SoundMode => Query::SoundMode,
+        S::InputSource => Query::Source,
+        S::ReferenceLevelOffset => Query::ReferenceLevel,
+        S::DynamicVolume => Query::DynamicVolume,
+        S::Dimmer => Query::Dimmer,
+        S::EcoMode => Query::Eco,
+        S::MonitorOutput => Query::HdmiOutput,
+        S::SpeakerPreset => Query::SpeakerPreset,
+        S::PictureMode => Query::PictureMode,
+        S::DigitalCodec => Query::DigitalCodec,
+        S::DiracFilter => Query::DiracFilter,
+        S::MultiEq => Query::MultEq,
+        S::QuickSelect => Query::QuickSelect,
+        S::BluetoothOutput => Query::BluetoothTransmitter,
+        S::TunerBand | S::TunerPreset | S::NetworkFavorite => return None,
+    })
+}
+
+/// The receiver may have the value (see `DeviceConfig::offers_query`), and the setup and the
+/// connection allow it.
+pub fn available(cfg: &DeviceConfig, kind: SelectKind) -> bool {
+    query(kind).is_none_or(|query| cfg.offers_query(query)) && allowed(cfg, kind)
+}
+
+/// Six selects exist without telnet. With a telnet connection there are more, the Dirac filter if
+/// the receiver supports it, the network favorites on receivers before HEOS, and the tuner band and
 /// presets if the receiver may have a tuner. Over HTTP, the `MultEq` select also comes with
 /// `AppCommand` if the receiver lists the query, and the monitor output if the receiver reads it
 /// over HTTP.
-pub const fn available(cfg: &DeviceConfig, kind: SelectKind) -> bool {
+fn allowed(cfg: &DeviceConfig, kind: SelectKind) -> bool {
     match kind {
         SelectKind::SoundMode
         | SelectKind::InputSource
@@ -120,7 +150,9 @@ pub const fn available(cfg: &DeviceConfig, kind: SelectKind) -> bool {
         | SelectKind::BluetoothOutput => cfg.use_telnet,
         SelectKind::MultiEq => cfg.use_telnet || cfg.reads_audyssey(),
         SelectKind::DiracFilter => cfg.use_telnet && cfg.has_dirac(),
-        SelectKind::NetworkFavorite => cfg.use_telnet && cfg.offers(Feature::NetworkAudio),
+        SelectKind::NetworkFavorite => {
+            cfg.use_telnet && cfg.offers(Feature::Spec(SpecFeature::NetworkAudio))
+        }
         SelectKind::TunerBand | SelectKind::TunerPreset => {
             cfg.use_telnet && cfg.offers(Feature::Tuner)
         }
@@ -346,9 +378,11 @@ fn quick_select_number(labels: &[String], option: &str) -> Option<u8> {
 fn quick_select_labels(v: &View<'_>) -> Vec<String> {
     let names = &v.state.device().quick_select_names;
     let kind = if v.cfg.is_denon { "Quick" } else { "Smart" };
-    let count = v.cfg.quick_select_count.map_or_else(
-        || names.len().clamp(QUICK_SELECTS, 6),
-        |n| usize::from(n).min(6),
+    let max = usize::from(MAX_QUICK_SELECT);
+    let listed = v.cfg.info.as_ref().and_then(|info| info.quick_select_count);
+    let count = listed.map_or_else(
+        || names.len().clamp(QUICK_SELECTS, max),
+        |n| usize::from(n).min(max),
     );
     (0..count)
         .map(|i| {
@@ -372,7 +406,7 @@ fn network_favorite_labels(v: &View<'_>) -> impl Iterator<Item = (u8, String)> {
             .map(String::as_str)
             .filter(|name| !name.is_empty())
     };
-    let count = v.cfg.network_favorites();
+    let count = v.cfg.network_favorites().unwrap_or(0);
     let any = (0..usize::from(count)).any(|i| named(i).is_some());
     (1..=count).filter_map(move |n| match named(usize::from(n - 1)) {
         Some(name) => Some((n, format!("{n} {name}"))),
@@ -623,7 +657,7 @@ pub async fn select_option(
             // Older receivers use `A1` to `G8`. Until the receiver has shown its form, nothing is
             // sent: a wrong form selects another preset.
             // The current specs use `01` to `56` only.
-            let current = matches!(v.cfg.generation(), Generation::Current).then_some(false);
+            let current = matches!(v.cfg.generation(), SpecGeneration::Current).then_some(false);
             let lettered = v.state.device().tuner.presets_lettered;
             match lettered.or(v.cfg.tuner_presets_lettered).or(current) {
                 Some(true) => avr.tuner().select_lettered_preset(number).await?,

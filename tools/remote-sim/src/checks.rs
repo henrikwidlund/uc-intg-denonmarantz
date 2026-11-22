@@ -14,6 +14,10 @@ use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
+/// The UI pages and the simple commands of the driver.
+const UI_PAGES: &str = include_str!("../../../resources/remote_ui.json");
+const COMMANDS: &str = include_str!("../../../resources/commands.tsv");
+
 /// Highest volume that a check sets, on the scale of the Remote (dB plus 80): -40 dB.
 pub const MAX_VOLUME: f64 = 40.0;
 
@@ -169,7 +173,7 @@ const WEB_PAGE_VALUES: [&str; 10] = [
 ];
 
 /// Values of selects and sensors that differ from the values of the receiver.
-fn mismatches(ctx: &Ctx) -> Vec<String> {
+fn mismatches(ctx: &Ctx, offered: &BTreeSet<String>) -> Vec<String> {
     let Some(oracle) = &ctx.oracle else {
         return Vec::new();
     };
@@ -187,6 +191,10 @@ fn mismatches(ctx: &Ctx) -> Vec<String> {
             continue;
         };
         let id = format!("{kind}.{rest}.{}", ctx.key);
+        // The driver leaves out the entities of features that the receiver does not list.
+        if !offered.contains(&id) {
+            continue;
+        }
         let attr = match kind {
             "select" => "current_option",
             "switch" => "state",
@@ -214,8 +222,9 @@ fn mismatches(ctx: &Ctx) -> Vec<String> {
 /// Wait until all entities show what the receiver has.
 async fn verify_all(ctx: &mut Ctx, secs: u64) -> Result<(), Fail> {
     let deadline = Instant::now() + Duration::from_secs(secs);
+    let offered = entity_ids(ctx).await?;
     loop {
-        let bad = mismatches(ctx);
+        let bad = mismatches(ctx, &offered);
         if bad.is_empty() {
             return Ok(());
         }
@@ -526,14 +535,40 @@ pub async fn remote_ui(ctx: &mut Ctx) -> Check {
     let pages = options["user_interface"]["pages"]
         .as_array()
         .map_or(0, Vec::len);
-    // The quick select page has a button for each slot of the receiver, and is left out without
-    // slots. The tuner and Dirac pages are left out without a tuner or Dirac.
+    // A page is left out when the driver offers none of its buttons. A button of a command that is
+    // not in the table of simple commands always stays.
     let config = read_config(ctx).await?;
     let device = config_device(ctx, &config)?;
-    let slots = device["quick_select_count"].as_u64();
-    let left_out = usize::from(slots == Some(0))
-        + usize::from(!has_tuner(device))
-        + usize::from(device["is_dirac_supported"] != true);
+    let slots = device["info"]["quick_select_count"].as_u64();
+    let offered: BTreeSet<&str> = options["simple_commands"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    let table: BTreeSet<&str> = COMMANDS
+        .lines()
+        .filter_map(|l| l.split('\t').next())
+        .collect();
+    let ui: Value =
+        serde_json::from_str(UI_PAGES).map_err(|e| Fail::new(format!("remote_ui.json: {e}")))?;
+    let brand = if device["is_denon"] == false {
+        "marantz"
+    } else {
+        "denon"
+    };
+    let expected = ui[brand]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|page| {
+            page["items"].as_array().into_iter().flatten().any(|item| {
+                item["command"]["cmd_id"]
+                    .as_str()
+                    .is_none_or(|c| !table.contains(c) || offered.contains(c))
+            })
+        })
+        .count();
     let quick = options["user_interface"]["pages"]
         .as_array()
         .into_iter()
@@ -543,7 +578,25 @@ pub async fn remote_ui(ctx: &mut Ctx) -> Check {
         .filter(|c| c.starts_with("QUICK_SELECT_") || c.starts_with("SMART_SELECT_"))
         .count();
     ensure!(simple > 300, "{simple} simple commands");
-    ensure!(pages == 15 - left_out, "{pages} UI pages");
+    ensure!(pages == expected, "{pages} UI pages, expected {expected}");
+    // The page count follows the offered commands. These rules are checked on their own.
+    let has = |prefix: &str| offered.iter().any(|c| c.starts_with(prefix));
+    ensure!(
+        has_tuner(device) || !has("TUNER_"),
+        "tuner commands without a tuner"
+    );
+    ensure!(
+        device["is_dirac_supported"] == true || !has("DIRAC_"),
+        "Dirac commands without Dirac"
+    );
+    let picture = ctx.oracle.as_ref().map(|oracle| {
+        let features = oracle.avr().info().features;
+        features.is_none_or(|f| f.has(denon_marantz::DeviceFeature::PictureMode))
+    });
+    ensure!(
+        picture != Some(false) || !has("PICTURE_MODE_"),
+        "picture mode commands, but the receiver does not list picture mode"
+    );
     ensure!(
         slots.is_none_or(|n| usize::try_from(n).is_ok_and(|n| n.min(6) == quick)),
         "{quick} quick select buttons, the receiver has {slots:?}"
@@ -1288,8 +1341,8 @@ pub async fn config_file(ctx: &mut Ctx) -> Check {
         missing.is_empty(),
         "fields missing in config.json: {missing:?}"
     );
-    // `quick_select_count` is missing if the receiver does not report it. `mac` is missing on
-    // receivers that do not give it. `id_kind` is missing for the serial number.
+    // `mac` is missing on receivers that do not give it. `id_kind` is missing for the serial
+    // number.
     let kind = [
         "receiver_type",
         "update_method",
@@ -1323,7 +1376,7 @@ pub async fn config_file(ctx: &mut Ctx) -> Check {
         device["receiver_type"],
         device["update_method"],
         device["hdmi_output_over_http"],
-        device["quick_select_count"]
+        device["info"]["quick_select_count"]
     ))
 }
 
@@ -1788,6 +1841,8 @@ pub async fn select_sweep(ctx: &mut Ctx) -> Check {
     ctx.client.listen(1).await?;
     let mut summary = Vec::new();
     let mut verified = 0;
+    // The driver leaves out the selects of features that the receiver does not list.
+    let offered = entity_ids(ctx).await?;
     for kind in [
         "dimmer",
         "eco_mode",
@@ -1800,6 +1855,10 @@ pub async fn select_sweep(ctx: &mut Ctx) -> Check {
         "dirac_filter",
     ] {
         if !ctx.opt.kinds.is_empty() && !ctx.opt.kinds.iter().any(|k| k == kind) {
+            continue;
+        }
+        if !offered.contains(&ctx.select(kind)) {
+            summary.push(format!("{kind}: not offered"));
             continue;
         }
         if let Some(tally) = sweep_select(ctx, kind, &mut problems).await? {

@@ -446,7 +446,7 @@ impl DenonActor {
                     .iter()
                     .filter(|(bit, _)| parts & bit != 0)
                     .flat_map(|(_, queries)| queries.iter().copied())
-                    .filter(|&query| discovery::listed(avr.info().features, query))
+                    .filter(|&query| avr.info().offers(query))
                     .map(Ask::from)
                     .collect();
                 // An empty ask clears the filter of repeated events in the library.
@@ -628,9 +628,7 @@ impl DenonActor {
                 discovery::after_start(
                     avr.clone(),
                     started,
-                    self.cfg
-                        .use_telnet
-                        .then(|| discovery::ExtraReads::new(&self.cfg)),
+                    self.cfg.use_telnet,
                     self.cfg.name.clone(),
                     self.page_retry_delay,
                     {
@@ -1673,13 +1671,12 @@ impl Handler<LinkChanged> for DenonActor {
         {
             self.refreshing = true;
             let generation = self.generation;
-            let reads = discovery::ExtraReads::new(&self.cfg);
             ctx.spawn(
                 async move {
                     if let Err(e) = avr.update().await {
                         debug!("read after reconnect failed: {e}");
                     }
-                    discovery::read_extra_values(&avr, reads).await;
+                    discovery::read_extra_values(&avr).await;
                 }
                 .into_actor(self)
                 .map(move |(), act, _| {
@@ -2109,7 +2106,6 @@ mod tests {
             receiver_type: None,
             update_method: None,
             hdmi_output_over_http: None,
-            quick_select_count: None,
             listed_queries: None,
             comm_api_version: None,
             has_tuner: None,

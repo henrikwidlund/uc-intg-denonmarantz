@@ -111,7 +111,7 @@ struct Options {
 }
 
 impl Options {
-    const fn of(cfg: &DeviceConfig) -> Self {
+    fn of(cfg: &DeviceConfig) -> Self {
         Self {
             show_all_inputs: cfg.show_all_inputs,
             is_denon: cfg.is_denon,
@@ -655,7 +655,6 @@ impl Controller {
                         receiver_type: identified.kind.receiver_type,
                         update_method: identified.kind.update_method,
                         hdmi_output_over_http: identified.kind.hdmi_output_over_http,
-                        quick_select_count: identified.kind.quick_select_count,
                         listed_queries: identified.kind.listed_queries,
                         comm_api_version: identified.kind.comm_api_version,
                         has_tuner: identified.kind.has_tuner,

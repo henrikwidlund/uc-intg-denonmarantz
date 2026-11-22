@@ -54,7 +54,10 @@ Bluetooth or with zone 2. Please report problems as
   color space (with BT.2020, for example `4:2:2/BT.2020`), picture mode, tuner frequency, all zone stereo and
   digital codec. Some signal sensors also exist with HTTP only.
 
-With telnet, all entities exist on every receiver, except the Dirac select, sensor, commands
+Entities, simple commands and buttons of a feature that `Deviceinfo.xml` does not list are left out, for
+example the reference level, dimmer, eco mode, picture mode or Audyssey entities. Receivers from before about
+2016 list no features and get all of them.
+With telnet, all other entities exist on every receiver, except the Dirac select, sensor, commands
 (`DIRAC_LIVE_FILTER_*`) and buttons, which need a receiver with Dirac, and the entities of [older
 receivers](#older-receivers). A receiver without an AM/FM tuner gets no tuner band and tuner preset selects,
 no tuner frequency sensor, no tuner commands and buttons, and no channel up and down. The setup option
@@ -63,8 +66,8 @@ on, from asking it for its tuner band and frequency over telnet (no answer means
 the setup asks: turn the receiver on before the setup to let the driver find it out. Many newer models have a
 tuner only in North America, and some have an analog input named `TUNER` without a tuner, so `Deviceinfo.xml`
 often cannot tell. A receiver taken over from the Python integration has the tuner parts until it is
-configured again. A value that the receiver does not have, for example the picture mode of a newer receiver or
-the Audyssey settings of a receiver without Audyssey, shows `--`. A setting that the receiver does not accept
+configured again. A value that the receiver does not have shows `--`, for example the Audyssey settings of a
+receiver without a feature list and without Audyssey. A setting that the receiver does not accept
 in its current state, for example the reference level without Dynamic EQ or the tone control with a Dirac
 filter, is ignored. The driver answers OK, so the Remote shows no error, and writes a line to the log that
 says why.
@@ -81,7 +84,8 @@ are offered, from the Denon and Marantz protocol specs:
 | 0210 Marantz | 2013, for example SR5008, NR1604 | Marantz 2013 |
 | 0301 and higher | 2016 and later, with HEOS | current specs |
 
-A receiver with another value, without a value, or not read yet gets all of them. A receiver ignores a command
+A receiver with another value, without a value, or not read yet gets all of them. The brand comes from what the
+receiver reports. If it reports none, or before it is read, the brand setting is used. A receiver ignores a command
 that it does not have, so a button can do nothing on some models.
 
 - Simple commands: `PRO_LOGIC_MODE_*`, `SURROUND_BACK_MODE_*`, `FRONT_HEIGHT_*`, `DYNAMIC_COMPRESSION_*`,
@@ -105,8 +109,8 @@ Commands with a number are sent as raw text with the remote entity:
 
 | Text | What it does |
 |---|---|
-| `NSB00` to `NSB55` | Play network favorite 1 to 56 (receivers without HEOS) |
-| `NSC00` to `NSC55` | Save what plays as network favorite 1 to 56. This replaces the favorite. The driver then reads the names again. |
+| `NSB00` to `NSB55` | Play network favorite 1 to 56, 1 to 36 on Denon 0250 and 0300 (receivers without HEOS) |
+| `NSC00` to `NSC55` | Save what plays as network favorite 1 to 56, 1 to 36 on Denon 0250 and 0300. This replaces the favorite. The driver then reads the names again. |
 | `TFAN` + 6 digits | Tune the tuner, in hundredths: of MHz for FM (`TFAN010110` = 101.10 MHz), of kHz for AM (`TFAN105000` = 1050 kHz) |
 | `TPANMEM01` to `TPANMEM56` | Save the tuned station as tuner preset 1 to 56 (`TPANMEMA1` to `TPANMEMG8` on receivers with lettered presets). The driver then reads the names again. |
 | `TFHD` + 6 digits | Tune the HD Radio tuner, in the same way (North America models) |

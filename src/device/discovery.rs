@@ -7,8 +7,8 @@ use crate::config_store::{self, DeviceConfig, Feature};
 use denon_marantz::proto::source::playing_kind;
 use denon_marantz::proto::{NetworkAudioCommand, PlayingKind, Power};
 use denon_marantz::{
-    Ask, Avr, AvrBuilder, Brand, Command, DeviceFeatures, DiscoveredReceiver, DiscoveryConfig,
-    Error, HttpConfig, Info, InfoCheck, PageStatus, Query, ReceiverType, StartOptions, StartReport,
+    Ask, Avr, AvrBuilder, Brand, Command, DiscoveredReceiver, DiscoveryConfig, Error, HttpConfig,
+    Info, InfoCheck, PageStatus, Query, ReceiverType, SpecFeature, StartOptions, StartReport,
     Started, State, TelnetSync, TunerInfo, UpdateMethod, Zone, discover_all,
 };
 use log::debug;
@@ -426,25 +426,24 @@ pub(crate) const EXTRA_QUERIES: [Query; 16] = [
     Query::PictureMode,
 ];
 
-/// The values of older receivers, with the feature that they need.
-pub(crate) const OLDER_QUERIES: [(Feature, Query); 11] = [
-    (Feature::ProLogicMode, Query::ProLogicMode),
-    (Feature::SurroundBackMode, Query::SurroundBackMode),
-    (Feature::FrontHeight, Query::FrontHeight),
-    (Feature::DynamicCompression, Query::DynamicCompression),
-    (Feature::AutoFlagDetect, Query::AutoFlagDetect),
-    (Feature::DialogLevel, Query::DialogLevel),
-    (Feature::AudysseyDsx, Query::AudysseyDsx),
-    (Feature::AudysseyDsx, Query::StageWidth),
-    (Feature::AudysseyDsx, Query::StageHeight),
-    (Feature::HeightGain, Query::HeightGain),
-    (Feature::InstaPrevue, Query::InstaPrevue),
+/// The values of older receivers. The library tells which ones the receiver has.
+pub(crate) const OLDER_QUERIES: [Query; 11] = [
+    Query::ProLogicMode,
+    Query::SurroundBackMode,
+    Query::FrontHeight,
+    Query::DynamicCompression,
+    Query::AutoFlagDetect,
+    Query::DialogLevel,
+    Query::AudysseyDsx,
+    Query::StageWidth,
+    Query::StageHeight,
+    Query::HeightGain,
+    Query::InstaPrevue,
 ];
 
-/// What the receiver of a configuration has of the values of older receivers.
+/// What the receiver of a configuration has of the names that are read once per connection.
 #[derive(Debug, Clone, Copy)]
 pub struct ExtraReads {
-    older: [bool; OLDER_QUERIES.len()],
     /// The names of the network favorites.
     favorites: bool,
     /// The tuner presets.
@@ -452,44 +451,22 @@ pub struct ExtraReads {
 }
 
 impl ExtraReads {
-    pub const fn new(cfg: &DeviceConfig) -> Self {
-        let mut older = [false; OLDER_QUERIES.len()];
-        let mut i = 0;
-        while i < older.len() {
-            older[i] = cfg.offers(OLDER_QUERIES[i].0);
-            i += 1;
-        }
+    pub fn new(cfg: &DeviceConfig) -> Self {
         Self {
-            older,
-            favorites: cfg.offers(Feature::NetworkAudio),
+            favorites: cfg.offers(Feature::Spec(SpecFeature::NetworkAudio)),
             tuner_presets: cfg.offers(Feature::Tuner),
         }
     }
 }
 
-/// Returns false for a query of a feature that `Deviceinfo.xml` does not list. The library skips
-/// such queries too. Receivers without a feature list are asked all.
-pub fn listed(features: Option<DeviceFeatures>, query: Query) -> bool {
-    features.is_none_or(|features| {
-        query
-            .device_feature()
-            .is_none_or(|feature| features.has(feature))
-    })
-}
-
 /// Queue the extra values and the values of older receivers that the receiver may have. It does
 /// not wait for the answers.
-pub async fn read_extra_values(avr: &Avr, reads: ExtraReads) {
-    let brand = avr.info().brand;
-    let older = OLDER_QUERIES
-        .iter()
-        .zip(reads.older)
-        .filter(|((_, query), wanted)| *wanted && query.text(brand).is_some())
-        .map(|((_, query), _)| *query);
+pub async fn read_extra_values(avr: &Avr) {
+    let info = avr.info();
     let asks: Vec<Ask<'_>> = EXTRA_QUERIES
         .into_iter()
-        .chain(older)
-        .filter(|&query| listed(avr.info().features, query))
+        .chain(OLDER_QUERIES)
+        .filter(|&query| query.text(info.brand).is_some() && info.offers(query))
         .map(Ask::from)
         .collect();
     // An empty ask clears the filter of repeated events in the library.
@@ -507,15 +484,15 @@ pub async fn read_extra_values(avr: &Avr, reads: ExtraReads) {
 pub async fn after_start(
     avr: Arc<Avr>,
     mut started: Started,
-    telnet: Option<ExtraReads>,
+    telnet: bool,
     name: String,
     delay: Duration,
     changed: impl FnOnce(Info),
     synced: impl FnOnce(),
 ) {
     // The extra values are queued before the wait: it covers the queries that wait at the call.
-    if let Some(reads) = telnet {
-        read_extra_values(&avr, reads).await;
+    if telnet {
+        read_extra_values(&avr).await;
     }
     match started.info_check().await {
         InfoCheck::Changed(info) => changed(Info::clone(info)),
@@ -523,7 +500,7 @@ pub async fn after_start(
         _ => {}
     }
     // With HTTP only, a page read could delay a command: the pages are not read again.
-    if telnet.is_none() {
+    if !telnet {
         return;
     }
     let report = started.all_synced().await;
@@ -901,7 +878,6 @@ pub fn receiver_kind(info: &Info) -> config_store::ReceiverKind {
         receiver_type: receiver_type(info),
         update_method: update_method(info),
         hdmi_output_over_http: Some(info.hdmi_output_over_http),
-        quick_select_count: info.quick_select_count,
         listed_queries: info.queries.as_ref().map(|q| config_store::HttpQueries {
             tone_control: q.tone_control,
             audyssey: q.audyssey,
@@ -941,22 +917,6 @@ const fn update_method(info: &Info) -> Option<config_store::HttpReadMethod> {
         UpdateMethod::AppCommand => Some(config_store::HttpReadMethod::AppCommand),
         UpdateMethod::StatusPages => Some(config_store::HttpReadMethod::StatusPages),
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod query_tests {
-    use super::*;
-    use denon_marantz::DeviceFeature;
-
-    #[test]
-    fn a_query_of_a_feature_that_is_not_listed_is_left_out() {
-        let listed_picture = DeviceFeatures::default().with(DeviceFeature::PictureMode);
-        assert!(listed(None, Query::PictureMode));
-        assert!(listed(Some(listed_picture), Query::PictureMode));
-        assert!(!listed(Some(DeviceFeatures::default()), Query::PictureMode));
-        // A query that needs no feature is always asked.
-        assert!(listed(Some(DeviceFeatures::default()), Query::Sleep));
     }
 }
 
