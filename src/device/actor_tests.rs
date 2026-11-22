@@ -420,6 +420,36 @@ async fn names_are_asked_only_while_they_are_used_and_then_stored() {
 }
 
 #[actix::test]
+async fn a_new_configuration_keeps_the_names_that_the_actor_learned() {
+    let learned = vec!["Radio 1".to_owned()];
+    let first = DeviceConfig {
+        network_favorite_names: learned.clone(),
+        tuner_presets_lettered: Some(true),
+        ..cfg()
+    };
+    let rig = rig_with(move |_| first, answers_all, QUICK).await;
+    until("the stored values", 5, || {
+        stored_info(&rig.events).is_some()
+    })
+    .await;
+    let count = configs(&rig.events).len();
+    // A setup with older names. Another poll time connects again, and the connect saves the
+    // receiver values.
+    let setup = DeviceConfig {
+        network_favorite_names: vec!["Old".into()],
+        signal_poll_secs: 5,
+        ..cfg()
+    };
+    rig.actor.send(UpdateConfig(setup)).await.expect("update");
+    until("saved again", 5, || configs(&rig.events).len() > count).await;
+    let saved = configs(&rig.events).pop().expect("saved");
+    assert_eq!(
+        (learned, Some(true)),
+        (saved.network_favorite_names, saved.tuner_presets_lettered)
+    );
+}
+
+#[actix::test]
 async fn a_new_source_reads_only_the_digital_codec_again() {
     let rig = rig(answers_all, QUICK).await;
     after_the_extra_values(&rig).await;
@@ -840,6 +870,12 @@ async fn a_receiver_with_a_new_address_is_found_by_its_serial_number() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     until("the new connection", 5, || new_telnet.connections() >= 1).await;
+    // The address and the receiver values are saved together.
+    let first = configs(&events)
+        .into_iter()
+        .find(|c| c.address == NEW)
+        .expect("saved");
+    assert!(first.info.is_some_and(|i| i.host == NEW));
 }
 
 /// The last state of an entity that the actor sent.
@@ -1870,6 +1906,48 @@ async fn changed_receiver_values_are_stored_before_the_start_ends() {
 }
 
 #[actix::test]
+async fn changed_receiver_values_of_a_connect_before_a_new_configuration_are_not_used() {
+    let mut info = fake_info().await;
+    info.friendly_name = "Old name".into();
+    let http = Fake::start(true).await;
+    let stored = DeviceConfig {
+        info: Some(Info {
+            port: http.port(),
+            ..info
+        }),
+        missing: denon_marantz::MissingSources {
+            video_page: true,
+            ..denon_marantz::MissingSources::default()
+        },
+        ..cfg()
+    };
+    let first = stored.clone();
+    let rig = rig_on(http, move |_| first, answers_all, QUICK).await;
+    // A new name does not connect again. The connect that runs has the old version.
+    let renamed = DeviceConfig {
+        name: "New name".into(),
+        ..stored
+    };
+    rig.actor.send(UpdateConfig(renamed)).await.expect("update");
+    until("connected", 5, || {
+        status_count(&rig.events, DeviceStatus::Connected) >= 1
+    })
+    .await;
+    // The start reads the signal after the check of the stored values.
+    until("the signal read", 5, || rig.http.audyssey_reads() >= 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(1, status_count(&rig.events, DeviceStatus::Connected));
+    let saved = configs(&rig.events);
+    assert!(
+        saved.iter().all(|c| c.missing.video_page
+            && c.info
+                .as_ref()
+                .is_some_and(|i| i.friendly_name == "Old name")),
+        "{saved:?}"
+    );
+}
+
+#[actix::test]
 async fn another_receiver_at_the_stored_address_is_looked_up() {
     const OTHER_MAC: &str = "AABBCCDDEEFF";
     let mut info = fake_info().await;
@@ -1959,19 +2037,20 @@ async fn a_command_that_does_not_read_the_state_is_sent_before_the_start_ends() 
     );
 }
 
-/// A free port. It refuses connections until `open` passes them to `target`.
-async fn closed_port() -> u16 {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
+/// A free port. It refuses connections until `open` passes them to `target`. The socket is bound
+/// but does not listen: no other test can take the port meanwhile.
+fn closed_port() -> (tokio::net::TcpSocket, u16) {
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    socket
+        .bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
         .expect("bind");
-    listener.local_addr().expect("address").port()
+    let port = socket.local_addr().expect("address").port();
+    (socket, port)
 }
 
-/// Pass the connections to `port` on to `target`.
-async fn open(port: u16, target: u16) {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-        .await
-        .expect("bind again");
+/// Pass the connections to the port of `socket` on to `target`.
+fn open(socket: tokio::net::TcpSocket, target: u16) {
+    let listener = socket.listen(16).expect("listen");
     tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
             tokio::spawn(forward(socket, target));
@@ -2000,7 +2079,7 @@ async fn avr_on(fake: &Fake, port: u16, retry: Duration) -> denon_marantz::Avr {
 #[actix::test]
 async fn a_command_before_the_start_ends_is_sent_once_the_network_is_up() {
     let fake = Fake::start(true).await;
-    let port = closed_port().await;
+    let (socket, port) = closed_port();
     let (cfg, expected) = (cfg(), commands::Expected::default());
     let msg = media_command("volume_down");
     let at_once = avr_on(&fake, port, Duration::ZERO).await;
@@ -2014,7 +2093,7 @@ async fn a_command_before_the_start_ends_is_sent_once_the_network_is_up() {
     let send = send_command(&avr, None, &cfg, &expected, &msg, Some(attempt), "AVR");
     let opened = async {
         tokio::time::sleep(Duration::from_millis(200)).await;
-        open(port, fake.port()).await;
+        open(socket, fake.port());
     };
     let (result, ()) = tokio::join!(send, opened);
     result.expect("volume down");
@@ -2028,7 +2107,7 @@ async fn a_command_before_the_start_ends_is_sent_once_the_network_is_up() {
 #[actix::test]
 async fn a_command_is_not_sent_after_a_new_wakeup() {
     let fake = Fake::start(true).await;
-    let port = closed_port().await;
+    let (socket, port) = closed_port();
     let avr = avr_on(&fake, port, Duration::from_secs(3)).await;
     let (cfg, expected) = (cfg(), commands::Expected::default());
     let msg = media_command("volume_down");
@@ -2042,7 +2121,7 @@ async fn a_command_is_not_sent_after_a_new_wakeup() {
         attempts.send_modify(|a| *a += 1);
         tokio::time::sleep(Duration::from_millis(100)).await;
         // The receiver can be reached again: a command that still runs gets there.
-        open(port, fake.port()).await;
+        open(socket, fake.port());
     };
     let (result, ()) = tokio::join!(send, stopped);
     // The user cannot do anything about it: no error.

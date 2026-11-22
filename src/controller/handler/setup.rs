@@ -9,7 +9,7 @@ use crate::config_store::{
 };
 use crate::controller::handler::AbortDriverSetup;
 use crate::controller::{Controller, operation_mode};
-use crate::device::{UpdateConfig, discovery};
+use crate::device::discovery;
 use crate::entities::EntityKind;
 use crate::errors::ServiceError;
 use crate::logging;
@@ -670,8 +670,8 @@ impl Controller {
                         act.remove_other_devices(cfg.key());
                     }
                     if let Some(device) = act.devices.get_mut(cfg.key()) {
-                        device.cfg = cfg.clone();
-                        device.addr.do_send(UpdateConfig(cfg));
+                        device.cfg = cfg;
+                        device.send_config();
                         act.purge_entities();
                     } else {
                         act.add_device(cfg, ctx);
@@ -928,7 +928,7 @@ impl Controller {
         if let Some(address) = address {
             cfg.address = address;
         }
-        device.addr.do_send(UpdateConfig(cfg.clone()));
+        device.send_config();
         // Entities can come or go, for example when the connection mode changes.
         self.purge_entities();
         self.save_devices().map_err(|e| {

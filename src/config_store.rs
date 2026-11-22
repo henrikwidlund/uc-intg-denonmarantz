@@ -435,18 +435,33 @@ impl DeviceConfig {
     /// presets and favorites. The other fields are settings and keep their values. `None` if
     /// nothing changed, else whether the receiver kind, the receiver values or, in HTTP mode, the
     /// missing sources changed: then the receiver can have other entities.
-    pub fn take_found(&mut self, found: Self) -> Option<bool> {
-        let kind = found.kind();
-        let new_kind = kind != self.kind();
-        let new_ids = self.add_ids(found.serial.as_deref(), found.mac.as_deref());
-        let new_info = found.info.is_some() && self.info != found.info;
-        let new_missing = self.missing != found.missing;
+    ///
+    /// Without `current`, `found` was sent before the newest setup: only the names and the form of
+    /// the tuner presets are taken, since a setup does not set them.
+    pub fn take_found(&mut self, found: Self, current: bool) -> Option<bool> {
         let new_form = found.tuner_presets_lettered.is_some()
             && self.tuner_presets_lettered != found.tuner_presets_lettered;
         let new_presets = !found.tuner_preset_names.is_empty()
             && self.tuner_preset_names != found.tuner_preset_names;
         let new_favorites = !found.network_favorite_names.is_empty()
             && self.network_favorite_names != found.network_favorite_names;
+        if !current {
+            if new_form {
+                self.tuner_presets_lettered = found.tuner_presets_lettered;
+            }
+            if new_presets {
+                self.tuner_preset_names = found.tuner_preset_names;
+            }
+            if new_favorites {
+                self.network_favorite_names = found.network_favorite_names;
+            }
+            return (new_form || new_presets || new_favorites).then_some(false);
+        }
+        let kind = found.kind();
+        let new_kind = kind != self.kind();
+        let new_ids = self.add_ids(found.serial.as_deref(), found.mac.as_deref());
+        let new_info = found.info.is_some() && self.info != found.info;
+        let new_missing = self.missing != found.missing;
         if self.address == found.address
             && !new_kind
             && !new_ids
@@ -1206,32 +1221,32 @@ mod tests {
             serde_json::from_str(r#"{"id":"A","name":"C","address":"h","use_telnet":false}"#)
                 .expect("json");
         let mut cfg = old.clone();
-        assert_eq!(None, cfg.take_found(old.clone()));
+        assert_eq!(None, cfg.take_found(old.clone(), true));
         let mut found = old;
         found.use_telnet = true;
         found.address = "h2".into();
         found.receiver_type = Some(ReceiverGeneration::AvrX);
-        assert_eq!(Some(true), cfg.take_found(found));
+        assert_eq!(Some(true), cfg.take_found(found, true));
         assert_eq!(("h2", false), (cfg.address.as_str(), cfg.use_telnet));
         let info =
             r#"{"id":"A","name":"C","address":"h2","receiver_type":"avr_x","info":{"host":"h2"}}"#;
         // A value that does not load is not taken: `None` keeps the stored one.
         let found: DeviceConfig = serde_json::from_str(info).expect("json");
-        assert_eq!(None, cfg.take_found(found.clone()));
+        assert_eq!(None, cfg.take_found(found.clone(), true));
         // The form of the tuner presets is taken, and `None` keeps it.
         let lettered = DeviceConfig {
             tuner_presets_lettered: Some(true),
             ..found.clone()
         };
-        assert_eq!(Some(false), cfg.take_found(lettered));
-        assert_eq!(None, cfg.take_found(found.clone()));
+        assert_eq!(Some(false), cfg.take_found(lettered, true));
+        assert_eq!(None, cfg.take_found(found.clone(), true));
         assert_eq!(Some(true), cfg.tuner_presets_lettered);
         // New receiver values can change the entities.
         let read = DeviceConfig {
             info: read_with_version(found.clone(), "0301").info,
             ..found
         };
-        assert_eq!(Some(true), cfg.take_found(read.clone()));
+        assert_eq!(Some(true), cfg.take_found(read.clone(), true));
         // Missing sources are taken, also when they are cleared, and can change the entities.
         let missing = DeviceConfig {
             missing: MissingSources {
@@ -1240,14 +1255,31 @@ mod tests {
             },
             ..read.clone()
         };
-        assert_eq!(Some(true), cfg.take_found(missing.clone()));
+        assert_eq!(Some(true), cfg.take_found(missing.clone(), true));
         assert_eq!(missing.missing, cfg.missing);
-        assert_eq!(Some(true), cfg.take_found(read));
+        assert_eq!(Some(true), cfg.take_found(read, true));
         assert_eq!(MissingSources::default(), cfg.missing);
         // With telnet they are taken, but the entities stay the same.
         cfg.use_telnet = true;
-        assert_eq!(Some(false), cfg.take_found(missing.clone()));
+        assert_eq!(Some(false), cfg.take_found(missing.clone(), true));
         assert_eq!(missing.missing, cfg.missing);
+        // From before the newest setup, only the names and the preset form are taken.
+        let before = cfg.clone();
+        let old = DeviceConfig {
+            address: "h3".into(),
+            missing: MissingSources::default(),
+            tuner_presets_lettered: Some(false),
+            network_favorite_names: vec!["Radio".into()],
+            ..missing
+        };
+        assert_eq!(Some(false), cfg.take_found(old.clone(), false));
+        assert_eq!(None, cfg.take_found(old, false));
+        let expected = DeviceConfig {
+            tuner_presets_lettered: Some(false),
+            network_favorite_names: vec!["Radio".into()],
+            ..before
+        };
+        assert_eq!(expected, cfg);
     }
 
     #[test]

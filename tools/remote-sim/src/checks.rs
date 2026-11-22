@@ -868,6 +868,9 @@ pub async fn sound_mode(ctx: &mut Ctx) -> Check {
 /// Select the old mode again. The receiver can report a name that is not in the list.
 async fn restore_sound(ctx: &mut Ctx, old: &str, list: &[String]) -> String {
     let mp = ctx.mp();
+    if old.is_empty() {
+        return "no sound mode was shown before, not restored".into();
+    }
     let Some(name) = list.iter().find(|m| m.eq_ignore_ascii_case(old)) else {
         return format!("the old mode {old} is not in the list, not restored");
     };
@@ -1037,7 +1040,20 @@ async fn refresh_remote(ctx: &mut Ctx) -> Result<usize, Fail> {
 
 pub async fn http_mode(ctx: &mut Ctx) -> Check {
     ensure_on(ctx).await?;
-    let old_sound = ctx.client.text(&ctx.mp(), "sound_mode");
+    let mp = ctx.mp();
+    // After a connect, the driver can show the sound mode a few seconds later: it waits for the
+    // list of the receiver.
+    let start = Instant::now();
+    let old_sound = ctx
+        .client
+        .wait_attr(&mp, "sound_mode", 10, |v| {
+            v.as_str().is_some_and(|m| !m.is_empty())
+        })
+        .await
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    let waited = start.elapsed().as_millis();
     let result = http_checks(ctx).await;
     // Always go back to telnet, also after a failure.
     let address = ctx.opt.address.clone();
@@ -1049,7 +1065,6 @@ pub async fn http_mode(ctx: &mut Ctx) -> Check {
     .await;
     match (result, back) {
         (Ok(note), Ok(_)) => {
-            let mp = ctx.mp();
             // The list of the receiver comes over telnet after the connect. Until then the list has
             // the groups of HTTP mode, which do not have every mode.
             let has_old = |v: &Value| {
@@ -1070,7 +1085,14 @@ pub async fn http_mode(ctx: &mut Ctx) -> Check {
                 .unwrap_or(Value::Null);
             let list = strings(&list);
             let restored = restore_sound(ctx, &old_sound, &list).await;
-            Ok(format!("{note}, {restored}"))
+            let shown = if old_sound.is_empty() {
+                "not shown".to_owned()
+            } else {
+                format!("shown after {waited} ms")
+            };
+            Ok(format!(
+                "{note}, {restored} (sound mode with telnet {shown})"
+            ))
         }
         (Err(e), _) => Err(e),
         (Ok(_), Err(e)) => Err(Fail::new(format!("back to telnet: {e}"))),
@@ -2098,7 +2120,7 @@ async fn sweep_one(ctx: &mut Ctx, kind: &str, option: &Value) -> Result<Outcome,
     if kind == "speaker_preset"
         && let Some(oracle) = &ctx.oracle
     {
-        oracle.ask_dirac().await?;
+        oracle.ask_after_preset().await?;
     }
     if SENSORS.contains(&kind) {
         let sensor = ctx.sensor(kind);
@@ -2326,9 +2348,11 @@ async fn send_simple_commands(ctx: &mut Ctx) -> Check {
         if i % 10 == 9 {
             if preset_sent
                 && let Some(oracle) = &ctx.oracle
-                && let Err(e) = oracle.ask_dirac().await
+                && let Err(e) = oracle.ask_after_preset().await
             {
-                problems.push(format!("after {name}: Dirac values not asked: {e}"));
+                problems.push(format!(
+                    "after {name}: values of the speaker preset not asked: {e}"
+                ));
             }
             preset_sent = false;
             if let Err(e) = verify_all(ctx, 6).await {

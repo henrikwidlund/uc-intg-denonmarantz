@@ -5,7 +5,9 @@
 
 use crate::config_store::{DeviceConfig, SaveWait};
 use crate::controller::{Controller, R2RequestMsg, SendWsMessage};
-use crate::device::{Command, Connect, DenonActor, DeviceEvent, DeviceStatus, Disconnect, Stop};
+use crate::device::{
+    Command, Connect, DenonActor, DeviceEvent, DeviceStatus, Disconnect, Stop, UpdateConfig,
+};
 use crate::entities::{self, EntityKind, media_player};
 use crate::errors::ServiceError;
 use crate::util::{DeserializeMsgData, return_fut_err};
@@ -84,6 +86,16 @@ pub(super) struct Device {
     pub status: DeviceStatus,
     /// An awake Remote uses the device, see [`Controller::update_connections`].
     pub wanted: bool,
+    /// The number of `UpdateConfig` messages sent to the actor.
+    cfg_version: u64,
+}
+
+impl Device {
+    /// Send `cfg` to the actor and count it in `cfg_version`.
+    pub fn send_config(&mut self) {
+        self.cfg_version += 1;
+        self.addr.do_send(UpdateConfig(self.cfg.clone()));
+    }
 }
 
 impl Controller {
@@ -102,6 +114,7 @@ impl Controller {
                 addr,
                 status: DeviceStatus::Disconnected,
                 wanted: false,
+                cfg_version: 0,
             },
         );
     }
@@ -548,12 +561,19 @@ impl Handler<DeviceEvent> for Controller {
         }
         match msg {
             DeviceEvent::Changes { key, changes } => self.apply_changes(&key, changes),
-            DeviceEvent::Config { key, cfg } => {
+            DeviceEvent::Config { key, version, cfg } => {
                 let Some(device) = self.devices.get_mut(&*key) else {
                     return;
                 };
+                // Sent before the actor got the newest configuration: only the learned names and
+                // the form of the tuner presets are taken, the rest would undo a setup or the
+                // options. The actor learns it again at the next connect.
+                let current = version == device.cfg_version;
+                if !current {
+                    debug!("[{}] old configuration of the actor", device.cfg.name);
+                }
                 // The event can be older than the settings of the controller.
-                let Some(new_entities) = device.cfg.take_found(*cfg) else {
+                let Some(new_entities) = device.cfg.take_found(*cfg, current) else {
                     return;
                 };
                 info!("[{}] saving what the receiver reported", device.cfg.name);
@@ -741,6 +761,7 @@ mod tests {
                 addr,
                 status: DeviceStatus::Disconnected,
                 wanted: false,
+                cfg_version: 0,
             },
         );
     }
@@ -811,6 +832,36 @@ mod tests {
         controller.sessions.remove("b");
         controller.update_connections(false);
         assert_eq!(Vec::<&str>::new(), wanted(&controller));
+    }
+
+    #[actix::test]
+    async fn a_configuration_that_the_actor_sent_before_a_setup_saves_only_the_names() {
+        let mut controller = new_controller();
+        add_idle_device(&mut controller, "A");
+        let (key, device) = controller.devices.get_key_value("A").expect("device");
+        let key = Arc::clone(key);
+        let mut found = device.cfg.clone();
+        found.missing.video_page = true;
+        found.tuner_preset_names = vec!["A1 Radio".into()];
+        let event = |version| DeviceEvent::Config {
+            key: Arc::clone(&key),
+            version,
+            cfg: Box::new(found.clone()),
+        };
+        // A setup sends a new configuration while an event of the actor is on its way.
+        controller
+            .devices
+            .get_mut("A")
+            .expect("device")
+            .send_config();
+        let mut ctx = Context::new();
+        controller.handle(event(0), &mut ctx);
+        // Names that the actor learned are kept: a setup does not set them.
+        let cfg = &controller.devices["A"].cfg;
+        assert!(!cfg.missing.video_page);
+        assert_eq!(found.tuner_preset_names, cfg.tuner_preset_names);
+        controller.handle(event(1), &mut ctx);
+        assert!(controller.devices["A"].cfg.missing.video_page);
     }
 
     fn map(v: Value) -> Map<String, Value> {

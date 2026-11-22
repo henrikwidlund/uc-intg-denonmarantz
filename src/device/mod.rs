@@ -41,9 +41,11 @@ pub enum DeviceEvent {
         key: Arc<str>,
         changes: Vec<(EntityKind, Map<String, Value>)>,
     },
-    /// The configuration changed and must be saved.
+    /// The configuration changed and must be saved. `version` counts the `UpdateConfig`
+    /// messages that the actor got before it sent this.
     Config {
         key: Arc<str>,
+        version: u64,
         cfg: Box<DeviceConfig>,
     },
     Status {

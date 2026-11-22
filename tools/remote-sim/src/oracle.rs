@@ -39,18 +39,33 @@ impl Oracle {
         Ok(())
     }
 
-    /// Ask again for the Dirac slots and filter: the receiver does not send them after a speaker
-    /// preset change. Nothing is asked if the receiver gave no Dirac filter.
-    pub async fn ask_dirac(&self) -> Result<(), Fail> {
-        if self.state().device().dirac_filter.is_none() {
-            return Ok(());
+    /// Ask again for the values that a speaker preset change changes: the receiver does not send
+    /// them. The same values and wait as the driver (the `RELOAD_PRESET` entry of
+    /// `RELOAD_QUERIES`, and `RELOAD_DELAY`, in `src/device/actor.rs`): the receiver needs time to
+    /// take the preset.
+    pub async fn ask_after_preset(&self) -> Result<(), Fail> {
+        const QUERIES: [Query; 9] = [
+            Query::DiracSlots,
+            Query::DiracFilter,
+            Query::ToneControl,
+            Query::Bass,
+            Query::Treble,
+            Query::MultEq,
+            Query::DynamicEq,
+            Query::ReferenceLevel,
+            Query::DynamicVolume,
+        ];
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let info = self.avr.info();
+        let asks: Vec<Ask<'_>> = QUERIES
+            .into_iter()
+            .filter(|&q| info.offers(q))
+            .map(Ask::from)
+            .collect();
+        // An empty ask clears the filter of repeated events in the library.
+        if !asks.is_empty() {
+            self.avr.telnet_ask(&asks).await?;
         }
-        self.avr
-            .telnet_ask(&[
-                Ask::Query(Query::DiracSlots),
-                Ask::Query(Query::DiracFilter),
-            ])
-            .await?;
         Ok(())
     }
 

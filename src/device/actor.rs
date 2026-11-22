@@ -168,7 +168,7 @@ struct Timers {
 #[allow(clippy::struct_excessive_bools)]
 pub struct DenonActor {
     cfg: DeviceConfig,
-    /// Incremented on each configuration change.
+    /// Incremented on each `UpdateConfig`.
     cfg_version: u64,
     key: Arc<str>,
     controller: Recipient<DeviceEvent>,
@@ -615,10 +615,14 @@ impl DenonActor {
         // The list of the receiver can be another one now. With telnet, the list can still come.
         self.sound_mode = None;
         self.sound_groups = !self.cfg.use_telnet;
-        self.update_address(address, version);
+        let mut changed = self.update_address(address, version);
         // After `update_address`: `took` is a time of the new address.
         self.connect_times.add(took);
-        self.update_receiver_info(avr.info(), version);
+        changed |= self.update_receiver_info(avr.info(), version);
+        // One save for the address and the values.
+        if changed {
+            self.send_config();
+        }
 
         ctx.add_message_stream(
             BroadcastStream::new(changes).map(move |change| Changed(generation, change.ok())),
@@ -791,6 +795,16 @@ impl DenonActor {
         ))
     }
 
+    /// Send the configuration to the controller, which saves it. The version lets the
+    /// controller drop a configuration that is older than its own.
+    fn send_config(&self) {
+        self.controller.do_send(DeviceEvent::Config {
+            key: self.key.clone(),
+            version: self.cfg_version,
+            cfg: Box::new(self.cfg.clone()),
+        });
+    }
+
     /// Store the form of the tuner presets when the receiver shows a new one. The controller saves
     /// it. A new connection does not know the form until the receiver reports a preset.
     fn save_preset_form(&mut self) {
@@ -800,10 +814,7 @@ impl DenonActor {
             return;
         }
         self.cfg.tuner_presets_lettered = lettered;
-        self.controller.do_send(DeviceEvent::Config {
-            key: self.key.clone(),
-            cfg: Box::new(self.cfg.clone()),
-        });
+        self.send_config();
     }
 
     /// Ask the names of the tuner presets or network favorites once per telnet connection, when the
@@ -865,22 +876,20 @@ impl DenonActor {
         self.dirty_labels = true;
         self.dirty_full = true;
         self.flush_emit();
-        self.controller.do_send(DeviceEvent::Config {
-            key: self.key.clone(),
-            cfg: Box::new(self.cfg.clone()),
-        });
+        self.send_config();
     }
 
     /// Take what the configuration keeps of the receiver: the generation, the HTTP read method,
     /// `CommApiVers`, the tuner, the receiver values for the next connect, and the serial number
     /// and MAC address if they are not stored yet. A configuration of the Python integration does
-    /// not have them. The controller saves them.
+    /// not have them.
     ///
     /// The receiver kind is not taken if the answers do not prove the type: it can be wrong, and
-    /// a new kind removes entities.
-    fn update_receiver_info(&mut self, info: &Info, version: u64) {
+    /// a new kind removes entities. Returns true if the configuration changed: the caller sends it
+    /// to the controller, which saves it.
+    fn update_receiver_info(&mut self, info: &Info, version: u64) -> bool {
         if self.cfg_version != version {
-            return;
+            return false;
         }
         let kind = discovery::receiver_kind(info);
         let new_kind = info.type_proof.is_proven() && kind != self.cfg.kind();
@@ -897,14 +906,14 @@ impl DenonActor {
         let new_info = info.type_proof.is_proven() && self.cfg.info.as_ref() != Some(info);
         if new_info {
             self.cfg.info = Some(info.clone());
-            // New values can come with other sources. A look-up connect did not use the missing
-            // sources. A connect with the stored values at a new address used them:
-            // `note_missing` adds them again.
+            // New values can come with other sources. At a connect, only a look-up connect
+            // gives new values, also with a new address: it did not use the missing sources and
+            // asks them again. `note_missing` stores the ones that are missing.
             // `info_changed` connects again.
             self.cfg.missing = MissingSources::default();
         }
         if !new_kind && !new_ids && !new_info {
-            return;
+            return false;
         }
         if new_kind {
             info!("[{}] receiver: {kind:?}", self.cfg.name);
@@ -916,10 +925,7 @@ impl DenonActor {
                 self.cfg.name, self.cfg.serial, self.cfg.mac
             );
         }
-        self.controller.do_send(DeviceEvent::Config {
-            key: self.key.clone(),
-            cfg: Box::new(self.cfg.clone()),
-        });
+        true
     }
 
     /// Store the HTTP sources that the receiver showed it does not have. Only new ones are added:
@@ -933,10 +939,7 @@ impl DenonActor {
         }
         info!("[{}] missing over HTTP: {missing:?}", self.cfg.name);
         self.cfg.missing = missing;
-        self.controller.do_send(DeviceEvent::Config {
-            key: self.key.clone(),
-            cfg: Box::new(self.cfg.clone()),
-        });
+        self.send_config();
     }
 
     /// The receiver gave other values than the stored ones. Another receiver at the address is
@@ -973,18 +976,21 @@ impl DenonActor {
             info.port,
             info.update_method
         );
-        self.update_receiver_info(&info, version);
+        if self.update_receiver_info(&info, version) {
+            self.send_config();
+        }
         if reconnect {
             self.lost_connection(ctx);
             self.connect(ctx);
         }
     }
 
-    /// Take the address that was found by the search. The controller saves it.
-    fn update_address(&mut self, address: Option<String>, version: u64) {
-        let Some(address) = address else { return };
+    /// Take the address that was found by the search. Returns true if the configuration changed:
+    /// the caller sends it to the controller, which saves it.
+    fn update_address(&mut self, address: Option<String>, version: u64) -> bool {
+        let Some(address) = address else { return false };
         if self.cfg_version != version || address == self.cfg.address {
-            return;
+            return false;
         }
         info!(
             "[{}] address changed: {} -> {address}",
@@ -993,10 +999,7 @@ impl DenonActor {
         self.cfg.address = address;
         // The times of the old address do not apply.
         self.connect_times = discovery::ConnectTimes::default();
-        self.controller.do_send(DeviceEvent::Config {
-            key: self.key.clone(),
-            cfg: Box::new(self.cfg.clone()),
-        });
+        true
     }
 
     /// Read the state over HTTP and show if the receiver answers. It does nothing while telnet
@@ -1864,7 +1867,18 @@ impl Handler<UpdateConfig> for DenonActor {
     type Result = ();
 
     fn handle(&mut self, msg: UpdateConfig, ctx: &mut Self::Context) {
-        let cfg = msg.0;
+        let mut cfg = msg.0;
+        // A setup copies the names and the form of the tuner presets from the controller. They
+        // come from this actor, and the controller can still have older ones.
+        if !self.cfg.tuner_preset_names.is_empty() {
+            cfg.tuner_preset_names = std::mem::take(&mut self.cfg.tuner_preset_names);
+        }
+        if !self.cfg.network_favorite_names.is_empty() {
+            cfg.network_favorite_names = std::mem::take(&mut self.cfg.network_favorite_names);
+        }
+        if self.cfg.tuner_presets_lettered.is_some() {
+            cfg.tuner_presets_lettered = self.cfg.tuner_presets_lettered;
+        }
         let new_address = cfg.address != self.cfg.address;
         // A new setup clears the missing sources: the connection still has them.
         let reconnect = new_address
