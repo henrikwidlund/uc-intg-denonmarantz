@@ -3,7 +3,7 @@
 
 //! Switch entities: settings that are on or off.
 
-use crate::config_store::DeviceConfig;
+use crate::config_store::{BeforeRead, DeviceConfig};
 use crate::entities::{SwitchKind, View, availability};
 use crate::errors::ServiceError;
 use denon_marantz::proto::Trigger;
@@ -45,21 +45,11 @@ pub(super) const fn query(kind: SwitchKind) -> Query {
     }
 }
 
-/// The receiver may have the value (see `DeviceConfig::offers_query`), and the connection allows
-/// it.
+/// The receiver may have the value (see `DeviceConfig::offers_query`), and the driver gets it (see
+/// `DeviceConfig::reads_value`).
 pub fn available(cfg: &DeviceConfig, kind: SwitchKind) -> bool {
-    cfg.offers_query(query(kind)) && allowed(cfg, kind)
-}
-
-/// The values come with telnet. Tone control and Dynamic EQ also come with `AppCommand` over HTTP, if
-/// the receiver lists the query.
-const fn allowed(cfg: &DeviceConfig, kind: SwitchKind) -> bool {
-    cfg.use_telnet
-        || match kind {
-            SwitchKind::ToneControl => cfg.reads_tone_control(),
-            SwitchKind::DynamicEq => cfg.reads_audyssey(),
-            _ => false,
-        }
+    let query = query(kind);
+    cfg.offers_query(query) && cfg.reads_value(query, BeforeRead::Hidden)
 }
 
 /// The setting is on or off. `None` if the receiver did not report it.

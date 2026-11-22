@@ -611,7 +611,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=ac399c569d53cedcc2bf95d9412798e88ace6b21#ac399c569d53cedcc2bf95d9412798e88ace6b21"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=8482c872d305df36f68d89714816941b47b5db17#8482c872d305df36f68d89714816941b47b5db17"
 dependencies = [
  "bytes",
  "denon-marantz-discovery",
@@ -632,7 +632,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz-discovery"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=ac399c569d53cedcc2bf95d9412798e88ace6b21#ac399c569d53cedcc2bf95d9412798e88ace6b21"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=8482c872d305df36f68d89714816941b47b5db17#8482c872d305df36f68d89714816941b47b5db17"
 dependencies = [
  "http 1.5.0",
 ]
@@ -640,7 +640,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz-heos"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=ac399c569d53cedcc2bf95d9412798e88ace6b21#ac399c569d53cedcc2bf95d9412798e88ace6b21"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=8482c872d305df36f68d89714816941b47b5db17#8482c872d305df36f68d89714816941b47b5db17"
 dependencies = [
  "denon-marantz-heos-proto",
  "serde",
@@ -652,7 +652,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz-heos-proto"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=ac399c569d53cedcc2bf95d9412798e88ace6b21#ac399c569d53cedcc2bf95d9412798e88ace6b21"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=8482c872d305df36f68d89714816941b47b5db17#8482c872d305df36f68d89714816941b47b5db17"
 dependencies = [
  "serde",
  "serde_json",
@@ -662,7 +662,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz-proto"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=ac399c569d53cedcc2bf95d9412798e88ace6b21#ac399c569d53cedcc2bf95d9412798e88ace6b21"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=8482c872d305df36f68d89714816941b47b5db17#8482c872d305df36f68d89714816941b47b5db17"
 dependencies = [
  "quick-xml",
  "serde",

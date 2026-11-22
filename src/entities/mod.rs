@@ -476,19 +476,32 @@ pub(crate) mod tests {
         assert_eq!(12, sensors(true, true, "none").len());
     }
 
+    /// HTTP mode, as after a read of a receiver with this update method, these listed queries and
+    /// the HDMI output over HTTP or not.
+    fn http_read(
+        update_method: denon_marantz::UpdateMethod,
+        queries: Option<denon_marantz::ListedQueries>,
+        hdmi_output_over_http: bool,
+    ) -> DeviceConfig {
+        let mut c = crate::config_store::read_with_version(cfg(false, true), "0301");
+        if let Some(info) = &mut c.info {
+            info.update_method = update_method;
+            info.queries = queries;
+            info.hdmi_output_over_http = hdmi_output_over_http;
+        }
+        c
+    }
+
+    /// The entities of `c` that HTTP mode does not have before the receiver is read.
+    fn extra(c: &DeviceConfig) -> Vec<EntityKind> {
+        EntityKind::all(c)
+            .filter(|k| !EntityKind::all(&cfg(false, true)).any(|base| base == *k))
+            .collect()
+    }
+
     #[test]
     fn http_mode_offers_what_the_receiver_reads_over_http() {
-        use crate::config_store::{HttpReadMethod, ReceiverGeneration};
-        let http = |receiver_type, update_method| DeviceConfig {
-            receiver_type,
-            update_method,
-            ..cfg(false, true)
-        };
-        let extra = |c: &DeviceConfig| {
-            EntityKind::all(c)
-                .filter(|k| !EntityKind::all(&cfg(false, true)).any(|base| base == *k))
-                .collect::<Vec<_>>()
-        };
+        use denon_marantz::UpdateMethod;
         let app_command = [
             EntityKind::Select(SelectKind::MultiEq),
             EntityKind::Switch(SwitchKind::ToneControl),
@@ -506,85 +519,107 @@ pub(crate) mod tests {
         ]
         .map(EntityKind::Sensor);
 
-        let x2016 = extra(&http(
-            Some(ReceiverGeneration::AvrX2016),
-            Some(HttpReadMethod::AppCommand),
-        ));
-        assert_eq!(app_command.len() + signal.len(), x2016.len(), "{x2016:?}");
-        assert!(app_command.iter().chain(&signal).all(|k| x2016.contains(k)));
+        let read = extra(&http_read(UpdateMethod::AppCommand, None, false));
+        assert_eq!(app_command.len() + signal.len(), read.len(), "{read:?}");
+        assert!(app_command.iter().chain(&signal).all(|k| read.contains(k)));
 
-        let avr_x = extra(&http(
-            Some(ReceiverGeneration::AvrX),
-            Some(HttpReadMethod::AppCommand),
-        ));
-        assert_eq!(app_command.as_slice(), avr_x.as_slice());
-
-        for (receiver_type, update_method) in [
-            (
-                Some(ReceiverGeneration::AvrX),
-                Some(HttpReadMethod::StatusPages),
-            ),
-            (
-                Some(ReceiverGeneration::Avr),
-                Some(HttpReadMethod::StatusPages),
-            ),
-            (None, None),
+        // Without the signal timer the signal pages are not read again. The status pages have no
+        // dimmer and no Audyssey values.
+        let pages = http_read(UpdateMethod::StatusPages, None, false);
+        assert_eq!(Vec::<EntityKind>::new(), extra(&pages));
+        // With the signal timer, the values of the signal pages come.
+        let timer = DeviceConfig {
+            signal_poll_secs: 10,
+            ..pages.clone()
+        };
+        let with_timer = extra(&timer);
+        for kind in [
+            SensorKind::VideoHdmiSignalIn,
+            SensorKind::InputChannels,
+            SensorKind::HdrInput,
+            SensorKind::ColorspaceOutput,
         ] {
-            let c = http(receiver_type, update_method);
-            assert!(extra(&c).is_empty(), "{receiver_type:?} {update_method:?}");
+            assert!(
+                with_timer.contains(&EntityKind::Sensor(kind)),
+                "{kind:?} {with_timer:?}"
+            );
         }
+        assert!(
+            with_timer
+                .iter()
+                .all(|k| matches!(k, EntityKind::Sensor(_))),
+            "{with_timer:?}"
+        );
+        let left_out: Vec<EntityKind> = EntityKind::all(&cfg(false, true))
+            .filter(|k| !EntityKind::all(&pages).any(|o| o == *k))
+            .collect();
+        assert_eq!(
+            vec![
+                EntityKind::Select(SelectKind::ReferenceLevelOffset),
+                EntityKind::Select(SelectKind::DynamicVolume),
+                EntityKind::Select(SelectKind::Dimmer),
+                EntityKind::Sensor(SensorKind::Dimmer),
+            ],
+            left_out
+        );
     }
 
     #[test]
     fn http_mode_offers_the_monitor_output_if_the_receiver_reads_it() {
-        let base = cfg(false, true);
-        let c = DeviceConfig {
-            hdmi_output_over_http: Some(true),
-            ..cfg(false, true)
-        };
-        let extra: Vec<EntityKind> = EntityKind::all(&c)
-            .filter(|k| !EntityKind::all(&base).any(|b| b == *k))
-            .collect();
+        use denon_marantz::{ListedQueries, UpdateMethod};
+        let mut listed = ListedQueries::default();
+        assert_eq!(
+            Vec::<EntityKind>::new(),
+            extra(&http_read(UpdateMethod::AppCommand, Some(listed), true))
+        );
+        // Without a list, the library does not ask for the output settings.
+        let unlisted = extra(&http_read(UpdateMethod::AppCommand, None, true));
+        assert!(
+            !unlisted.contains(&EntityKind::Select(SelectKind::MonitorOutput)),
+            "{unlisted:?}"
+        );
+        // The library follows the listed output settings, not the stored flag.
+        listed.output_settings = true;
         assert_eq!(
             vec![
                 EntityKind::Select(SelectKind::MonitorOutput),
                 EntityKind::Sensor(SensorKind::MonitorOutput)
             ],
-            extra
+            extra(&http_read(UpdateMethod::AppCommand, Some(listed), false))
         );
     }
 
     #[test]
     fn http_mode_leaves_out_what_the_receiver_does_not_list() {
-        use crate::config_store::{HttpQueries, HttpReadMethod, ReceiverGeneration};
-        let http = |listed_queries| DeviceConfig {
-            receiver_type: Some(ReceiverGeneration::AvrX2016),
-            update_method: Some(HttpReadMethod::AppCommand),
-            listed_queries,
-            ..cfg(false, true)
-        };
+        use denon_marantz::{ListedQueries, UpdateMethod};
+        let http = |queries| http_read(UpdateMethod::AppCommand, queries, false);
         let all: Vec<EntityKind> = EntityKind::all(&http(None)).collect();
-        let listed: Vec<EntityKind> = EntityKind::all(&http(Some(HttpQueries {
-            tone_control: true,
-            audyssey: true,
-            video_info: true,
-            audio_info: true,
-            input_signal: true,
-            active_speaker: true,
-            output_settings: false,
-        })))
-        .collect();
+        let mut signal = ListedQueries::default();
+        signal.tone_control = true;
+        signal.audyssey = true;
+        signal.video_info = true;
+        signal.audio_info = true;
+        signal.input_signal = true;
+        signal.active_speaker = true;
+        let listed: Vec<EntityKind> = EntityKind::all(&http(Some(signal))).collect();
         assert_eq!(all, listed);
+        let none = http(Some(ListedQueries::default()));
         let missing: Vec<EntityKind> = all
             .iter()
             .copied()
-            .filter(|k| !EntityKind::all(&http(Some(HttpQueries::default()))).any(|o| o == *k))
+            .filter(|k| !EntityKind::all(&none).any(|o| o == *k))
             .collect();
         assert_eq!(
             vec![
+                EntityKind::Select(SelectKind::ReferenceLevelOffset),
+                EntityKind::Select(SelectKind::DynamicVolume),
                 EntityKind::Select(SelectKind::MultiEq),
                 EntityKind::Sensor(SensorKind::AudioSignal),
                 EntityKind::Sensor(SensorKind::AudioSamplingRate),
+                EntityKind::Sensor(SensorKind::VideoHdmiSignalIn),
+                EntityKind::Sensor(SensorKind::VideoHdmiSignalOut),
+                EntityKind::Sensor(SensorKind::InputChannels),
+                EntityKind::Sensor(SensorKind::OutputChannels),
                 EntityKind::Switch(SwitchKind::ToneControl),
                 EntityKind::Switch(SwitchKind::DynamicEq),
                 EntityKind::Number(NumberKind::Bass),
@@ -592,14 +627,17 @@ pub(crate) mod tests {
             ],
             missing
         );
-        // Telnet mode does not use the list.
-        let telnet = DeviceConfig {
-            listed_queries: Some(HttpQueries::default()),
-            ..cfg(true, true)
+        // Telnet mode does not use the HTTP list.
+        let telnet = |queries| {
+            let mut c = crate::config_store::read_with_version(cfg(true, true), "0301");
+            if let Some(info) = &mut c.info {
+                info.queries = queries;
+            }
+            c
         };
         assert_eq!(
-            EntityKind::all(&cfg(true, true)).count(),
-            EntityKind::all(&telnet).count()
+            EntityKind::all(&telnet(None)).collect::<Vec<_>>(),
+            EntityKind::all(&telnet(Some(ListedQueries::default()))).collect::<Vec<_>>()
         );
     }
 

@@ -3,7 +3,7 @@
 
 //! Sensor entities. Names, values and units are the ones of the Python integration.
 
-use crate::config_store::{DeviceConfig, Feature};
+use crate::config_store::{BeforeRead, DeviceConfig, Feature};
 use crate::entities::{SelectKind, SensorKind, View, availability, is_off, select};
 use denon_marantz::proto::{InOut, Sleep};
 use denon_marantz::{Query, Volume, Zone};
@@ -144,7 +144,8 @@ pub(super) const fn query(kind: SensorKind) -> Option<Query> {
     })
 }
 
-/// The values of older receivers. They come on telnet only.
+/// The values of older receivers.
+#[cfg(test)]
 pub(super) const fn is_older(kind: SensorKind) -> bool {
     use SensorKind as S;
     matches!(
@@ -170,45 +171,35 @@ pub fn available(cfg: &DeviceConfig, kind: SensorKind) -> bool {
     query(kind).is_none_or(|query| cfg.offers_query(query)) && allowed(cfg, kind)
 }
 
-/// The first seven sensors exist without telnet, the others only with a telnet connection. The
-/// sensors of older receivers and the sound mode category come on telnet only. The signal sensors
-/// and the HDMI output that `Avr::update_signal_and_settings` reads also come over HTTP. The audio
-/// signal and the sampling rate need the receiver to list the query.
+/// The setup allows the sensor: the Dirac filter needs the Dirac setup option and the tuner
+/// frequency a receiver that may have a tuner. The driver must get the value (see
+/// `DeviceConfig::reads_value`).
 fn allowed(cfg: &DeviceConfig, kind: SensorKind) -> bool {
-    if is_older(kind) || matches!(kind, SensorKind::SoundModeCategory) {
-        return cfg.use_telnet;
+    let setup = match kind {
+        SensorKind::DiracFilter => cfg.has_dirac(),
+        SensorKind::TunerFrequency => cfg.offers(Feature::Tuner),
+        _ => true,
+    };
+    // Without a query, the value comes on telnet only.
+    setup
+        && query(kind).map_or(cfg.use_telnet, |query| {
+            cfg.reads_value(query, before_read(kind))
+        })
+}
+
+/// The seven sensors that the Python integration has without telnet come before the receiver is
+/// read.
+const fn before_read(kind: SensorKind) -> BeforeRead {
+    match kind {
+        SensorKind::VolumeDb
+        | SensorKind::VolumeAbsolute
+        | SensorKind::SoundMode
+        | SensorKind::InputSource
+        | SensorKind::Mute
+        | SensorKind::Dimmer
+        | SensorKind::EcoMode => BeforeRead::Shown,
+        _ => BeforeRead::Hidden,
     }
-    if matches!(kind, SensorKind::DiracFilter) {
-        return cfg.use_telnet && cfg.has_dirac();
-    }
-    if matches!(kind, SensorKind::TunerFrequency) {
-        return cfg.use_telnet && cfg.offers(Feature::Tuner);
-    }
-    cfg.use_telnet
-        || (cfg.reads_hdmi_output() && matches!(kind, SensorKind::MonitorOutput))
-        || (cfg.reads_audio_info()
-            && matches!(
-                kind,
-                SensorKind::AudioSignal | SensorKind::AudioSamplingRate
-            ))
-        || (cfg.reads_signal()
-            && matches!(
-                kind,
-                SensorKind::VideoHdmiSignalIn
-                    | SensorKind::VideoHdmiSignalOut
-                    | SensorKind::InputChannels
-                    | SensorKind::OutputChannels
-            ))
-        || matches!(
-            kind,
-            SensorKind::VolumeDb
-                | SensorKind::VolumeAbsolute
-                | SensorKind::SoundMode
-                | SensorKind::InputSource
-                | SensorKind::Mute
-                | SensorKind::Dimmer
-                | SensorKind::EcoMode
-        )
 }
 
 /// Insert the attributes of a sensor.

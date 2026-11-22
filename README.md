@@ -156,20 +156,23 @@ Commands with a number are sent as raw text with the remote entity:
   is recommended.
 - Some old receivers allow only one telnet connection. If telnet does not work for you, use the connection
   mode _Use HTTP connection_. In this mode the driver reads the receiver every 10 seconds and after each
-  command. All receivers have the media player, the remote, 6 selects (sound mode, input source, reference
-  level, dynamic volume, dimmer, eco mode) and 7 sensors (volume in dB, absolute volume, sound mode, input
-  source, mute, dimmer, eco mode). Receivers that the driver reads with the newer HTTP interface also have
-  the MultEQ select, the tone control and Dynamic EQ switches, and the bass and treble numbers. Models from
-  2016 and later also have the sensors for the audio signal, sampling rate, HDMI video in and out, and the
-  input and output channels. Receivers that report the HDMI output over HTTP also have the monitor output
-  select and sensor. If the receiver lists the values it can send over HTTP, the driver offers only those:
-  tone control, bass and treble; MultEQ and Dynamic EQ; audio signal and sampling rate. The sound mode select
-  offers the sound mode groups, for example `MOVIE`. While the receiver is busy, mostly in the first seconds
-  after a connect, a changed dimmer or eco mode can take up to 10 seconds to show.
+  command. All receivers have the media player and the remote. The selects, sensors, switches and numbers
+  come only if the library reports that the driver reads their value over HTTP. Until the
+  receiver is read for the first time, there are 6 selects (sound mode, input source, reference level,
+  dynamic volume, dimmer, eco mode) and 7 sensors (volume in dB, absolute volume, sound mode, input source,
+  mute, dimmer, eco mode). Receivers with the newer HTTP interface can also have the MultEQ select, the tone
+  control and Dynamic EQ switches, the bass and treble numbers, the monitor output select and sensor, and
+  the sensors for the audio signal, sampling rate, HDMI video in and out, and the input and output channels.
+  Receivers with the older HTTP interface have no dimmer, reference level and dynamic volume. Receivers that
+  list their values but not the Audyssey values have no reference level and dynamic volume. If the signal
+  info is read every N seconds (setup option), the sensors of the signal web pages come too, for example
+  HDR and color space. The sound mode select offers the sound mode groups, for example `MOVIE`. While the
+  receiver is busy, mostly in the first seconds after a connect, a changed dimmer or eco mode can take up to
+  10 seconds to show.
 
-Changing the connection mode does not remove entities. If you add entities while using telnet and then change to
-HTTP only, the entities that need telnet stay in the integration as unavailable. Remove them in the web
-configurator of the Remote.
+Changing the connection mode or turning off the signal timer does not remove entities. If you add entities while
+using telnet and then change to HTTP only, the entities that need telnet stay in the integration as unavailable.
+Remove them in the web configurator of the Remote.
 
 ## Install on the Remote
 
@@ -279,7 +282,8 @@ Options:
   `metadata,setup,entities,states`: the other checks need them.
 - `--kinds a,b` limits the select sweep to these selects, for example `dirac_filter`.
 - `--avoid-sources a,b`: the checks never select a source whose name contains one of these, without case.
-  The simple command check then sends no source commands.
+  Without this option the checks select no source: the `source` check is skipped and `http_mode` does not
+  change the source. The simple command check never sends source commands.
 - `--no-power` skips the power check. The other checks still switch the receiver on if it is off.
 - `--no-oracle` does not open the second connection. The values are then not compared with the receiver.
 - `--driver <path>`, `--port <port>` and `--commands <path>` change the driver binary, the port and the

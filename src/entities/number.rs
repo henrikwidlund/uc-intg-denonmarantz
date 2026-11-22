@@ -3,7 +3,7 @@
 
 //! Number entities: the bass and treble levels of the main zone.
 
-use crate::config_store::DeviceConfig;
+use crate::config_store::{BeforeRead, DeviceConfig};
 use crate::entities::{NumberKind, View, availability};
 use crate::errors::ServiceError;
 use denon_marantz::{Avr, Query, State, Zone};
@@ -44,10 +44,11 @@ pub(super) const fn query(kind: NumberKind) -> Query {
     }
 }
 
-/// The receiver may have the value (see `DeviceConfig::offers_query`). The values come with telnet,
-/// or with `AppCommand` over HTTP if the receiver lists the query.
+/// The receiver may have the value (see `DeviceConfig::offers_query`), and the driver gets it (see
+/// `DeviceConfig::reads_value`).
 pub fn available(cfg: &DeviceConfig, kind: NumberKind) -> bool {
-    cfg.offers_query(query(kind)) && (cfg.use_telnet || cfg.reads_tone_control())
+    let query = query(kind);
+    cfg.offers_query(query) && cfg.reads_value(query, BeforeRead::Hidden)
 }
 
 /// The level in dB. `None` if the receiver did not report it.

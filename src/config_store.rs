@@ -9,7 +9,7 @@
 //! The data is serialized on the caller thread. One background thread writes the files in order,
 //! so the actor thread does not wait for the disk.
 
-use denon_marantz::{Brand, Query, SpecFeature, SpecGeneration};
+use denon_marantz::{Brand, HttpReads, Query, SpecFeature, SpecGeneration};
 use log::{error, info};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -23,6 +23,19 @@ use tokio::sync::oneshot;
 
 const CONFIG_FILE: &str = "config.json";
 const SETTINGS_FILE: &str = "settings.json";
+
+/// The `Avr` methods that the HTTP poll calls in HTTP mode: `update` and
+/// `update_signal_and_settings`.
+const POLL_READS: HttpReads = HttpReads::UPDATE.union(HttpReads::SIGNAL_AND_SETTINGS);
+
+/// What an entity gets in HTTP mode before the receiver is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BeforeRead {
+    /// The entity comes: the Python integration has it without telnet.
+    Shown,
+    /// The entity does not come.
+    Hidden,
+}
 
 /// One configured receiver.
 ///
@@ -107,7 +120,7 @@ pub struct DeviceConfig {
     )]
     pub update_method: Option<HttpReadMethod>,
     /// The receiver reads and sets the HDMI output over HTTP. It is found at the setup and checked
-    /// at each connect.
+    /// at each connect. Kept in the file: the entities follow `info`.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -115,7 +128,8 @@ pub struct DeviceConfig {
     )]
     pub hdmi_output_over_http: Option<bool>,
     /// The `AppCommand` queries that the receiver lists. `None` if it has no list: then it is asked
-    /// for all of them. It is found at the setup and checked at each connect.
+    /// for all of them. It is found at the setup and checked at each connect. Kept in the file:
+    /// the entities follow `info`.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -203,7 +217,8 @@ pub struct HttpQueries {
     pub output_settings: bool,
 }
 
-/// What the driver found on the receiver. Entities and their options depend on it.
+/// What the driver found on the receiver. A change makes the controller check the entities again.
+/// Which entities come follows `DeviceConfig::info`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ReceiverKind {
     pub receiver_type: Option<ReceiverGeneration>,
@@ -345,46 +360,27 @@ impl DeviceConfig {
         matches!(self.is_dirac_supported, Some(true))
     }
 
-    /// The receiver is read with `AppCommand`: tone control and Audyssey come over HTTP too.
-    pub const fn reads_app_command(&self) -> bool {
-        matches!(self.update_method, Some(HttpReadMethod::AppCommand))
+    /// The driver gets the value: telnet gives every value, and over HTTP a value comes if a
+    /// repeated read gives it (see `Info::http_reads` and `Self::http_reads`). Before the receiver is
+    /// read, `before_read` decides.
+    pub fn reads_value(&self, query: Query, before_read: BeforeRead) -> bool {
+        self.use_telnet
+            || self
+                .info
+                .as_ref()
+                .map_or(before_read == BeforeRead::Shown, |info| {
+                    info.http_reads(query).intersects(self.http_reads())
+                })
     }
 
-    /// The signal comes over HTTP. This is tested only on the 2016 generation.
-    pub const fn reads_signal(&self) -> bool {
-        self.reads_app_command() && matches!(self.receiver_type, Some(ReceiverGeneration::AvrX2016))
-    }
-
-    /// The HDMI output comes over HTTP.
-    pub const fn reads_hdmi_output(&self) -> bool {
-        matches!(self.hdmi_output_over_http, Some(true))
-    }
-
-    /// Tone control, bass and treble come over HTTP.
-    pub const fn reads_tone_control(&self) -> bool {
-        self.reads_app_command()
-            && match self.listed_queries {
-                Some(q) => q.tone_control,
-                None => true,
-            }
-    }
-
-    /// `MultEq` and Dynamic EQ come over HTTP.
-    pub const fn reads_audyssey(&self) -> bool {
-        self.reads_app_command()
-            && match self.listed_queries {
-                Some(q) => q.audyssey,
-                None => true,
-            }
-    }
-
-    /// The audio signal and the sampling rate come over HTTP.
-    pub const fn reads_audio_info(&self) -> bool {
-        self.reads_signal()
-            && match self.listed_queries {
-                Some(q) => q.audio_info,
-                None => true,
-            }
+    /// The reads that the driver repeats in HTTP mode: the poll (`POLL_READS`), and the signal
+    /// pages if the signal timer is on (`Avr::refresh_signal` reads them without telnet).
+    const fn http_reads(&self) -> HttpReads {
+        if self.signal_poll_secs > 0 {
+            POLL_READS.union(HttpReads::SIGNAL_PAGES)
+        } else {
+            POLL_READS
+        }
     }
 
     /// The receiver has a HEOS player.

@@ -964,7 +964,7 @@ impl DenonActor {
     /// reports the changes, or while an earlier read runs. In HTTP mode Audyssey, the signal and
     /// the HDMI output are read after the state: the library asks only receivers that use
     /// `AppCommand`. In telnet mode they are not: while telnet is down, a blank answer would clear
-    /// the values of telnet.
+    /// the values of telnet. `POLL_READS` in `config_store` names these reads: keep them the same.
     fn poll_http(&mut self, ctx: &mut Context<Self>) {
         if !self.needs_poll() || self.polling {
             return;
@@ -1024,6 +1024,8 @@ impl DenonActor {
         );
     }
 
+    /// Read the signal again. Without telnet this reads the signal pages:
+    /// `DeviceConfig::http_reads` counts them for the entities.
     fn poll_signal(&mut self, ctx: &mut Context<Self>) {
         // A slow receiver must not get a new read before the old one is done.
         if self.signal_polling {

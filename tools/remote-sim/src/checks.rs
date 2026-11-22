@@ -8,7 +8,7 @@ use crate::restore;
 use crate::ws::{field_ids, field_value};
 use crate::{Check, Ctx, Fail};
 use denon_marantz::proto::DiracFilter;
-use denon_marantz::{Command, Zone};
+use denon_marantz::{Command, Query, Zone};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -744,6 +744,9 @@ pub async fn mute(ctx: &mut Ctx) -> Check {
 }
 
 pub async fn source(ctx: &mut Ctx) -> Check {
+    if ctx.opt.avoid_sources.is_empty() {
+        return Err(Fail::skip("no --avoid-sources: no source is selected"));
+    }
     ensure_on(ctx).await?;
     let mp = ctx.mp();
     let old = ctx.client.text(&mp, "source");
@@ -1093,24 +1096,38 @@ async fn http_checks(ctx: &mut Ctx) -> Check {
         count("number."),
     );
     let config = read_config(ctx).await?;
-    let expected = http_counts(config_device(ctx, &config)?);
+    let (expected, info_note) = http_entities(config_device(ctx, &config)?);
+    let suffix = format!(".{}", ctx.key);
+    let shown: BTreeSet<&str> = list
+        .iter()
+        .filter_map(|id| id.strip_suffix(suffix.as_str()))
+        .filter(|id| id.contains('.'))
+        .collect();
+    let missing: Vec<_> = expected.difference(&shown).collect();
+    let unexpected: Vec<_> = shown.difference(&expected).collect();
     ensure!(
-        found == expected,
-        "selects, sensors, switches, numbers: {found:?}, expected {expected:?}"
+        missing.is_empty() && unexpected.is_empty(),
+        "HTTP mode entities missing: {missing:?}, not expected: {unexpected:?}"
     );
     wait_available(ctx, 20).await?;
     let (selects, sensors, switches, numbers) = found;
     let mut note = vec![format!(
         "{selects} selects, {sensors} sensors, {switches} switches, {numbers} numbers"
     )];
+    note.extend(info_note);
 
-    let start = Instant::now();
-    let (old, new) = change_select(ctx, "dimmer", 12).await?;
-    note.push(format!("dimmer {} ms", start.elapsed().as_millis()));
-    ctx.client
-        .wait_text(&ctx.sensor("dimmer"), "value", 12, &new)
-        .await?;
-    set_option(ctx, "dimmer", &old, 12).await?;
+    // Receivers read with the status pages have no dimmer over HTTP.
+    if expected.contains("select.dimmer") {
+        let start = Instant::now();
+        let (old, new) = change_select(ctx, "dimmer", 12).await?;
+        note.push(format!("dimmer {} ms", start.elapsed().as_millis()));
+        ctx.client
+            .wait_text(&ctx.sensor("dimmer"), "value", 12, &new)
+            .await?;
+        set_option(ctx, "dimmer", &old, 12).await?;
+    } else {
+        note.push("no dimmer over HTTP".to_owned());
+    }
 
     let old = ctx.client.text(&mp, "source");
     let list = strings(ctx.client.attr(&mp, "source_list").unwrap_or(&Value::Null));
@@ -1140,6 +1157,8 @@ async fn http_checks(ctx: &mut Ctx) -> Check {
             )
             .await?;
         ctx.client.wait_text(&mp, "source", 12, &old).await?;
+    } else {
+        note.push("source not changed".to_owned());
     }
 
     let old = ctx.client.text(&mp, "sound_mode");
@@ -1308,26 +1327,122 @@ fn config_device<'a>(ctx: &Ctx, config: &'a Value) -> Result<&'a Value, Fail> {
         .ok_or_else(|| Fail::new("the receiver is not in config.json"))
 }
 
-/// The selects, sensors, switches and numbers in HTTP mode for the receiver kind in
-/// `config.json`. Receivers read with `AppCommand` get MultEQ, tone control, Dynamic EQ, bass and
-/// treble. The 2016 generation also gets 6 signal sensors.
-fn http_counts(device: &Value) -> (usize, usize, usize, usize) {
-    let app_command = device["update_method"] == "app_command";
-    let signal = app_command && device["receiver_type"] == "avr_x2016";
-    // Without a list of queries, the receiver is asked for all of them.
-    let queries = &device["listed_queries"];
-    let listed = |name: &str| queries.is_null() || queries[name] == true;
-    let tone = usize::from(app_command && listed("tone_control"));
-    let audyssey = usize::from(app_command && listed("audyssey"));
-    let audio = usize::from(signal && listed("audio_info"));
-    // The monitor output select and sensor.
-    let hdmi = usize::from(device["hdmi_output_over_http"] == true);
-    (
-        6 + audyssey + hdmi,
-        7 + 2 * audio + 4 * usize::from(signal) + hdmi,
-        tone + audyssey,
-        2 * tone,
-    )
+/// Entities that have a value, with the query of the value and whether the Python integration
+/// has them without telnet. The tuner, network favorite and tuner frequency entities have no
+/// query: they come with telnet only.
+const QUERIED: [(&str, Query, bool); 65] = {
+    use Query as Q;
+    [
+        ("select.sound_mode", Q::SoundMode, true),
+        ("select.input_source", Q::Source, true),
+        ("select.reference_level_offset", Q::ReferenceLevel, true),
+        ("select.dynamic_volume", Q::DynamicVolume, true),
+        ("select.dimmer", Q::Dimmer, true),
+        ("select.eco_mode", Q::Eco, true),
+        ("select.monitor_output", Q::HdmiOutput, false),
+        ("select.speaker_preset", Q::SpeakerPreset, false),
+        ("select.picture_mode", Q::PictureMode, false),
+        ("select.digital_codec", Q::DigitalCodec, false),
+        ("select.dirac_filter", Q::DiracFilter, false),
+        ("select.multi_eq", Q::MultEq, false),
+        ("select.quick_select", Q::QuickSelect, false),
+        ("select.bluetooth_output", Q::BluetoothTransmitter, false),
+        ("sensor.volume_db", Q::Volume, true),
+        ("sensor.volume_absolute", Q::Volume, true),
+        ("sensor.sound_mode", Q::SoundMode, true),
+        ("sensor.input_source", Q::Source, true),
+        ("sensor.mute", Q::Mute, true),
+        ("sensor.dimmer", Q::Dimmer, true),
+        ("sensor.eco_mode", Q::Eco, true),
+        ("sensor.sleep_timer", Q::Sleep, false),
+        ("sensor.audio_delay", Q::AudioDelay, false),
+        ("sensor.audio_signal", Q::AudioSignal, false),
+        ("sensor.audio_sampling_rate", Q::SamplingRate, false),
+        ("sensor.monitor_output", Q::HdmiOutput, false),
+        ("sensor.video_hdmi_signal_in", Q::VideoInput, false),
+        ("sensor.video_hdmi_signal_out", Q::VideoOutput, false),
+        ("sensor.input_channels", Q::InputChannels, false),
+        ("sensor.output_channels", Q::OutputChannels, false),
+        ("sensor.max_resolution", Q::HdmiMaxResolution, false),
+        ("sensor.hdr_input", Q::HdrFormat, false),
+        ("sensor.hdr_output", Q::HdrFormat, false),
+        ("sensor.pixel_depth_input", Q::PixelDepth, false),
+        ("sensor.pixel_depth_output", Q::PixelDepth, false),
+        ("sensor.max_frl_input", Q::MaxFrl, false),
+        ("sensor.max_frl_output", Q::MaxFrl, false),
+        ("sensor.colorspace_input", Q::ColorSpace, false),
+        ("sensor.colorspace_output", Q::ColorSpace, false),
+        ("sensor.picture_mode", Q::PictureMode, false),
+        ("sensor.all_zone_stereo", Q::AllZoneStereo, false),
+        ("sensor.digital_codec", Q::DigitalCodec, false),
+        ("sensor.dirac_filter", Q::DiracFilter, false),
+        ("sensor.pro_logic_mode", Q::ProLogicMode, false),
+        ("sensor.surround_back_mode", Q::SurroundBackMode, false),
+        ("sensor.front_height", Q::FrontHeight, false),
+        ("sensor.dynamic_compression", Q::DynamicCompression, false),
+        ("sensor.auto_flag_detect", Q::AutoFlagDetect, false),
+        ("sensor.dialog_level_adjust", Q::DialogLevel, false),
+        ("sensor.dialog_level", Q::DialogLevel, false),
+        ("sensor.audyssey_dsx", Q::AudysseyDsx, false),
+        ("sensor.stage_width", Q::StageWidth, false),
+        ("sensor.stage_height", Q::StageHeight, false),
+        ("sensor.height_gain", Q::HeightGain, false),
+        ("sensor.insta_prevue", Q::InstaPrevue, false),
+        ("sensor.bluetooth_level", Q::BluetoothLevel, false),
+        ("sensor.sound_mode_category", Q::SoundModeCategory, false),
+        ("switch.tone_control", Q::ToneControl, false),
+        ("switch.dynamic_eq", Q::DynamicEq, false),
+        ("switch.trigger_1", Q::Trigger, false),
+        ("switch.trigger_2", Q::Trigger, false),
+        ("switch.trigger_3", Q::Trigger, false),
+        (
+            "switch.bluetooth_transmitter",
+            Q::BluetoothTransmitter,
+            false,
+        ),
+        ("number.bass", Q::Bass, false),
+        ("number.treble", Q::Treble, false),
+    ]
+};
+
+/// The selects, sensors, switches and numbers in HTTP mode for the `info` of the receiver in
+/// `config.json`, as ids without the key. With `info`, an entity comes if the receiver may have
+/// the value and the HTTP poll (`Avr::update` and `Avr::update_signal_and_settings`) reads it, or,
+/// with the signal timer on, `Avr::refresh_signal_pages`.
+/// Without `info`, the entities of the Python integration come. Dirac also needs the setup option,
+/// and the quick select its first slot. An `info` that does not load counts as none, as in the
+/// driver: the note says so.
+fn http_entities(device: &Value) -> (BTreeSet<&'static str>, Option<String>) {
+    use denon_marantz::{HttpReads, Info};
+    let (info, note) = match serde_json::from_value::<Option<Info>>(device["info"].clone()) {
+        Ok(info) => (info, None),
+        Err(e) => (None, Some(format!("info in config.json not read: {e}"))),
+    };
+    // The poll, and the signal pages if the signal timer is on.
+    let mut poll = HttpReads::UPDATE | HttpReads::SIGNAL_AND_SETTINGS;
+    if device["signal_poll_secs"]
+        .as_u64()
+        .is_some_and(|secs| secs > 0)
+    {
+        poll |= HttpReads::SIGNAL_PAGES;
+    }
+    let dirac = device["is_dirac_supported"] == true;
+    let entities = QUERIED
+        .iter()
+        .filter(|(name, query, base)| {
+            let setup = match *name {
+                "select.dirac_filter" | "sensor.dirac_filter" => dirac,
+                "select.quick_select" => info.as_ref().is_none_or(|i| i.has_quick_select(1)),
+                _ => true,
+            };
+            let read = info.as_ref().map_or(*base, |info| {
+                info.offers(*query) && info.http_reads(*query).intersects(poll)
+            });
+            setup && read
+        })
+        .map(|(name, _, _)| *name)
+        .collect();
+    (entities, note)
 }
 
 pub async fn config_file(ctx: &mut Ctx) -> Check {
@@ -2093,6 +2208,14 @@ pub async fn simple_commands(ctx: &mut Ctx) -> Check {
     }
 }
 
+/// Name, brand and text of a line of the command table.
+fn command_fields(line: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = line.split('\t');
+    let name = parts.next()?;
+    let brand = parts.nth(1)?;
+    Some((name, brand, parts.next().unwrap_or_default()))
+}
+
 async fn send_simple_commands(ctx: &mut Ctx) -> Check {
     let remote = ctx.remote();
     let list = entity_list(ctx).await?;
@@ -2105,18 +2228,20 @@ async fn send_simple_commands(ctx: &mut Ctx) -> Check {
     let table = tokio::fs::read_to_string(&ctx.opt.commands)
         .await
         .map_err(|e| Fail::new(format!("{}: {e}", ctx.opt.commands.display())))?;
-    // With sources to avoid, no command selects a source: the names do not tell which source a
-    // code is.
-    let avoid = !ctx.opt.avoid_sources.is_empty();
+    // No source (`SI`) command is sent: the names do not tell which source a code is. The table
+    // built into the driver counts too, in case `--commands` is another file.
+    let sources: BTreeSet<&str> = COMMANDS
+        .lines()
+        .chain(table.lines())
+        .filter_map(command_fields)
+        .filter(|(_, _, text)| text.starts_with("SI"))
+        .map(|(name, _, _)| name)
+        .collect();
     let names: Vec<&str> = table
         .lines()
-        .filter_map(|line| {
-            let mut parts = line.split('\t');
-            let name = parts.next()?;
-            let brand = parts.nth(1)?;
-            let text = parts.next().unwrap_or_default();
-            (brand != "marantz" && !(avoid && text.starts_with("SI"))).then_some(name)
-        })
+        .filter_map(command_fields)
+        .filter(|(name, brand, _)| *brand != "marantz" && !sources.contains(name))
+        .map(|(name, _, _)| name)
         .filter(|n| offered.iter().any(|o| o == n) && !skipped(n))
         .collect();
     ensure!(names.len() > 250, "only {} commands to send", names.len());

@@ -3,7 +3,7 @@
 
 //! Select entities.
 
-use crate::config_store::{DeviceConfig, Feature};
+use crate::config_store::{BeforeRead, DeviceConfig, Feature};
 use crate::entities::sensor::EMPTY;
 use crate::entities::{SelectKind, View, availability, is_off};
 use crate::errors::ServiceError;
@@ -129,33 +129,36 @@ pub fn available(cfg: &DeviceConfig, kind: SelectKind) -> bool {
     query(kind).is_none_or(|query| cfg.offers_query(query)) && allowed(cfg, kind)
 }
 
-/// Six selects exist without telnet. With a telnet connection there are more, the Dirac filter if
-/// the receiver supports it, the network favorites on receivers before HEOS, and the tuner band and
-/// presets if the receiver may have a tuner. Over HTTP, the `MultEq` select also comes with
-/// `AppCommand` if the receiver lists the query, and the monitor output if the receiver reads it
-/// over HTTP.
+/// The setup and the receiver allow the select: the Dirac filter needs the Dirac setup option, the
+/// quick select its first slot (see `Info::has_quick_select`), the network favorites a receiver
+/// before HEOS, and the tuner band and presets a receiver that may have a tuner. The driver must get
+/// the value (see `DeviceConfig::reads_value`).
 fn allowed(cfg: &DeviceConfig, kind: SelectKind) -> bool {
+    let setup = match kind {
+        SelectKind::DiracFilter => cfg.has_dirac(),
+        SelectKind::QuickSelect => cfg.has_quick_select(1),
+        SelectKind::NetworkFavorite => cfg.offers(Feature::Spec(SpecFeature::NetworkAudio)),
+        SelectKind::TunerBand | SelectKind::TunerPreset => cfg.offers(Feature::Tuner),
+        _ => true,
+    };
+    // Without a query, the value comes on telnet only.
+    setup
+        && query(kind).map_or(cfg.use_telnet, |query| {
+            cfg.reads_value(query, before_read(kind))
+        })
+}
+
+/// The six selects that the Python integration has without telnet come before the receiver is
+/// read.
+const fn before_read(kind: SelectKind) -> BeforeRead {
     match kind {
         SelectKind::SoundMode
         | SelectKind::InputSource
         | SelectKind::ReferenceLevelOffset
         | SelectKind::DynamicVolume
         | SelectKind::Dimmer
-        | SelectKind::EcoMode => true,
-        SelectKind::MonitorOutput => cfg.use_telnet || cfg.reads_hdmi_output(),
-        SelectKind::QuickSelect => cfg.use_telnet && cfg.has_quick_select(1),
-        SelectKind::SpeakerPreset
-        | SelectKind::PictureMode
-        | SelectKind::DigitalCodec
-        | SelectKind::BluetoothOutput => cfg.use_telnet,
-        SelectKind::MultiEq => cfg.use_telnet || cfg.reads_audyssey(),
-        SelectKind::DiracFilter => cfg.use_telnet && cfg.has_dirac(),
-        SelectKind::NetworkFavorite => {
-            cfg.use_telnet && cfg.offers(Feature::Spec(SpecFeature::NetworkAudio))
-        }
-        SelectKind::TunerBand | SelectKind::TunerPreset => {
-            cfg.use_telnet && cfg.offers(Feature::Tuner)
-        }
+        | SelectKind::EcoMode => BeforeRead::Shown,
+        _ => BeforeRead::Hidden,
     }
 }
 

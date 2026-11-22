@@ -70,13 +70,17 @@ pub struct Options {
     /// Selects for the sweep. Empty: all.
     pub kinds: Vec<String>,
     /// Sources that the checks never select: a source whose name contains one of these, without
-    /// case.
+    /// case. Empty: the checks select no source at all.
     pub avoid_sources: Vec<String>,
 }
 
 impl Options {
-    /// A source that the checks may select.
+    /// A source that the checks may select. Without sources to avoid, none: a source must never be
+    /// selected by mistake.
     pub fn may_select(&self, source: &str) -> bool {
+        if self.avoid_sources.is_empty() {
+            return false;
+        }
         let source = source.to_lowercase();
         !self
             .avoid_sources
@@ -189,6 +193,7 @@ fn parse() -> Result<Options, String> {
     let list = |v: Option<String>| -> Vec<String> {
         v.unwrap_or_default()
             .split(',')
+            .filter(|item| !item.is_empty())
             .map(str::to_owned)
             .collect()
     };
@@ -318,4 +323,32 @@ async fn run(ctx: &mut Ctx) {
     ctx.step("simple_commands", checks::simple_commands).await;
     ctx.step("restore_power", checks::restore_power).await;
     ctx.step("log", checks::log).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(avoid: &[&str]) -> Options {
+        Options {
+            address: String::new(),
+            bin: PathBuf::new(),
+            only: Vec::new(),
+            skip: Vec::new(),
+            no_power: false,
+            no_oracle: false,
+            port: 0,
+            commands: PathBuf::new(),
+            kinds: Vec::new(),
+            avoid_sources: avoid.iter().map(|a| (*a).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn without_sources_to_avoid_no_source_is_selected() {
+        assert!(!options(&[]).may_select("Apple TV"));
+        let opt = options(&["Oppo"]);
+        assert!(opt.may_select("Apple TV"));
+        assert!(!opt.may_select("OPPO Blu-ray"));
+    }
 }
