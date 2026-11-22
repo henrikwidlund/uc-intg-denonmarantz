@@ -594,6 +594,11 @@ async fn a_command_sends_only_the_media_player_and_only_when_the_pause_changes()
         media_state(&rig.events) == Some("PLAYING".into())
     })
     .await;
+    // The new source reads the digital codec again later. Its answer sends all entities.
+    until("the codec after the source", 5, || {
+        rig.telnet.count("DC?") >= 2
+    })
+    .await;
     until_quiet(&rig.events).await;
     let command = |cmd_id: &str| Command {
         kind: EntityKind::MediaPlayer,
