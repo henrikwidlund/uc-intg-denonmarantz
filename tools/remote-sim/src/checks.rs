@@ -2319,20 +2319,8 @@ async fn send_simple_commands(ctx: &mut Ctx) -> Check {
         }
         ctx.client.listen_ms(300).await?;
         preset_sent |= name.starts_with("SPEAKER_PRESET");
-        // The driver refuses tone control commands until it sees the new filter.
-        if let Some(filter) = dirac_filter(name)
-            && response["code"] == 200
-            && oracle_dirac(ctx).is_some()
-            && !empty_slot(ctx, filter)
-        {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while oracle_dirac(ctx) != Some(filter) && Instant::now() < deadline {
-                ctx.client.listen_ms(200).await?;
-            }
-            if oracle_dirac(ctx) != Some(filter) {
-                problems.push(format!("{name}: the receiver did not select the filter"));
-            }
-            ctx.client.listen_ms(300).await?;
+        if response["code"] == 200 && !wait_for_filter(ctx, name).await? {
+            problems.push(format!("{name}: the receiver did not select the filter"));
         }
         if let Some(v) = current_volume(ctx).filter(|v| *v > MAX_VOLUME) {
             ctx.client
@@ -2346,24 +2334,8 @@ async fn send_simple_commands(ctx: &mut Ctx) -> Check {
             problems.push(format!("{name}: the volume went to {v}, it was lowered"));
         }
         if i % 10 == 9 {
-            if preset_sent
-                && let Some(oracle) = &ctx.oracle
-                && let Err(e) = oracle.ask_after_preset().await
-            {
-                problems.push(format!(
-                    "after {name}: values of the speaker preset not asked: {e}"
-                ));
-            }
+            compare_group(ctx, name, preset_sent, &mut problems).await?;
             preset_sent = false;
-            if let Err(e) = verify_all(ctx, 6).await {
-                problems.push(format!("after {name}: {e}"));
-            }
-            if let Err(e) = ensure_on(ctx).await {
-                return Err(Fail::new(format!(
-                    "after {name}: {e}. Earlier problems: {}",
-                    problems.join(" | ")
-                )));
-            }
         }
     }
     verify_fresh(ctx)
@@ -2385,6 +2357,51 @@ async fn send_simple_commands(ctx: &mut Ctx) -> Check {
             problems.join(" | ")
         )))
     }
+}
+
+/// After a Dirac filter command, wait until the receiver has the filter: the driver refuses tone
+/// control commands until it sees the new filter. False if the receiver did not select it.
+async fn wait_for_filter(ctx: &mut Ctx, name: &str) -> Result<bool, Fail> {
+    let Some(filter) = dirac_filter(name) else {
+        return Ok(true);
+    };
+    if oracle_dirac(ctx).is_none() || empty_slot(ctx, filter) {
+        return Ok(true);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while oracle_dirac(ctx) != Some(filter) && Instant::now() < deadline {
+        ctx.client.listen_ms(200).await?;
+    }
+    let selected = oracle_dirac(ctx) == Some(filter);
+    ctx.client.listen_ms(300).await?;
+    Ok(selected)
+}
+
+/// Compare the entities with the receiver after a group of commands. Fails if the receiver is
+/// not on anymore.
+async fn compare_group(
+    ctx: &mut Ctx,
+    name: &str,
+    preset_sent: bool,
+    problems: &mut Vec<String>,
+) -> Result<(), Fail> {
+    if preset_sent
+        && let Some(oracle) = &ctx.oracle
+        && let Err(e) = oracle.ask_after_preset().await
+    {
+        problems.push(format!(
+            "after {name}: values of the speaker preset not asked: {e}"
+        ));
+    }
+    if let Err(e) = verify_all(ctx, 6).await {
+        problems.push(format!("after {name}: {e}"));
+    }
+    ensure_on(ctx).await.map_err(|e| {
+        Fail::new(format!(
+            "after {name}: {e}. Earlier problems: {}",
+            problems.join(" | ")
+        ))
+    })
 }
 
 // ---------------------------------------------------------------- extra entities
