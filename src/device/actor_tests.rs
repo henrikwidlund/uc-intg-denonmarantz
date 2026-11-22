@@ -5,7 +5,7 @@
 //! The tests check what the actor asks for and shows when the receiver answers, does not answer,
 //! sends events or closes the connection.
 
-use super::actor::{CurrentAvr, read_differently, send_command};
+use super::actor::{CurrentAvr, Refreshing, read_differently, send_command};
 use super::commands;
 use super::discovery::{self, Known, TEST_BUILDER, TEST_DISCOVERY, TestBuilder};
 use super::heos::TEST_HEOS;
@@ -110,10 +110,25 @@ async fn rig_on(
     answers: impl Fn(&str) -> Vec<String> + Send + Sync + 'static,
     retry: Duration,
 ) -> Rig {
+    rig_on_timeout(http, cfg, answers, retry, quick_http().request_timeout).await
+}
+
+/// As [`rig_on`], with the request timeout `timeout` for HTTP.
+async fn rig_on_timeout(
+    http: Fake,
+    cfg: impl FnOnce(u16) -> DeviceConfig,
+    answers: impl Fn(&str) -> Vec<String> + Send + Sync + 'static,
+    retry: Duration,
+    timeout: Duration,
+) -> Rig {
     let telnet = FakeTelnet::start(answers).await;
     let (http_port, telnet_port) = (http.port(), telnet.port);
-    let setup: TestBuilder =
-        Rc::new(move |_, builder| test_builder(http_port, telnet_port, builder));
+    let setup: TestBuilder = Rc::new(move |_, builder| {
+        test_builder(http_port, telnet_port, builder).http_config(denon_marantz::HttpConfig {
+            request_timeout: timeout,
+            ..quick_http()
+        })
+    });
     TEST_BUILDER.with(|slot| *slot.borrow_mut() = Some(setup));
     let events = Arc::new(Mutex::new(Vec::new()));
     let collector = Collector(events.clone()).start();
@@ -561,6 +576,36 @@ async fn a_lost_telnet_connection_is_read_over_http_and_read_again_when_it_is_ba
         rig.telnet.count("SLP?") > queries
     })
     .await;
+}
+
+#[actix::test]
+async fn a_disconnect_during_the_read_after_a_telnet_reconnect_drops_the_receiver_at_once() {
+    let http = Fake::start(true).await;
+    let rig = rig_on_timeout(http, |_| cfg(), answers_all, QUICK, Duration::from_secs(30)).await;
+    until("the first read", 5, || rig.telnet.count("SLP?") >= 1).await;
+    // The start tasks of the library read the state too: let them end first.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Reads of the state get no answer for 60 s from now on.
+    rig.http.set_read_delay(Duration::from_secs(60));
+    rig.telnet.close();
+    until("a new connection", 5, || rig.telnet.connections() >= 2).await;
+    let mut refreshing = false;
+    for _ in 0..100 {
+        refreshing = rig.actor.send(Refreshing).await.expect("send");
+        if refreshing {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(refreshing, "the read after the reconnect did not start");
+    let avr = rig
+        .actor
+        .send(CurrentAvr)
+        .await
+        .expect("send")
+        .expect("avr");
+    rig.actor.send(Disconnect).await.expect("disconnect");
+    until("the receiver is dropped", 3, || avr.upgrade().is_none()).await;
 }
 
 #[actix::test]
@@ -2230,10 +2275,28 @@ async fn http_actor_with_web(
     cfg: DeviceConfig,
     web: &FakeWeb,
 ) -> (Addr<DenonActor>, Arc<Mutex<Vec<DeviceEvent>>>, Fake) {
+    http_actor_with_timeout(cfg, web, quick_http().request_timeout).await
+}
+
+/// As [`http_actor_with_web`], with the request timeout `timeout` for HTTP and the web
+/// interface.
+async fn http_actor_with_timeout(
+    cfg: DeviceConfig,
+    web: &FakeWeb,
+    timeout: Duration,
+) -> (Addr<DenonActor>, Arc<Mutex<Vec<DeviceEvent>>>, Fake) {
     let http = Fake::start(true).await;
     let (http_port, web_port) = (http.port(), web.port());
-    let setup: TestBuilder =
-        Rc::new(move |_, builder| test_builder(http_port, 1, builder).web_interface_port(web_port));
+    let setup: TestBuilder = Rc::new(move |_, builder| {
+        let config = denon_marantz::HttpConfig {
+            request_timeout: timeout,
+            ..quick_http()
+        };
+        test_builder(http_port, 1, builder)
+            .web_interface_port(web_port)
+            .http_config(config)
+            .web_interface_config(config)
+    });
     TEST_BUILDER.with(|slot| *slot.borrow_mut() = Some(setup));
     TEST_DISCOVERY.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -2311,6 +2374,40 @@ async fn a_web_interface_that_does_not_answer_does_not_delay_the_http_poll() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
     let reads = http.app_commands() - before;
     assert!(reads >= 6, "{reads} reads of the state in 1.5 s");
+}
+
+#[actix::test]
+async fn a_disconnect_during_a_signal_read_drops_the_receiver_at_once() {
+    // The start reads the video page twice: the library asks again after an answer that it
+    // cannot read. Later reads of it are signal reads and get no answer for 60 s. The other pages
+    // answer at once: the start tasks of the library also hold the receiver, and the driver
+    // cannot stop them.
+    let web = FakeWeb::start_slow_after(200, Duration::from_secs(60), Some((VIDEO_PAGE, 2))).await;
+    let (actor, _events, _http) =
+        http_actor_with_timeout(cfg(), &web, Duration::from_secs(30)).await;
+    until("the signal read", 10, || web.requests(VIDEO_PAGE) >= 3).await;
+    let avr = actor.send(CurrentAvr).await.expect("send").expect("avr");
+    actor.send(Disconnect).await.expect("disconnect");
+    until("the receiver is dropped", 3, || avr.upgrade().is_none()).await;
+}
+
+#[actix::test]
+async fn a_disconnect_during_a_read_of_the_state_drops_the_receiver_at_once() {
+    let web = FakeWeb::start(404).await;
+    let (actor, events, http) = http_actor_with_timeout(cfg(), &web, Duration::from_secs(30)).await;
+    until("connected", 5, || {
+        status_count(&events, DeviceStatus::Connected) == 1
+    })
+    .await;
+    // The start tasks of the library read the state too: let them end first.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // The next read of the state gets no answer for 60 s.
+    http.set_read_delay(Duration::from_secs(60));
+    let reads = http.app_commands();
+    until("a read of the state", 5, || http.app_commands() > reads).await;
+    let avr = actor.send(CurrentAvr).await.expect("send").expect("avr");
+    actor.send(Disconnect).await.expect("disconnect");
+    until("the receiver is dropped", 3, || avr.upgrade().is_none()).await;
 }
 
 #[actix::test]

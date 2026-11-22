@@ -135,6 +135,12 @@ const POSITION_JUMP: u64 = 2;
 #[rtype(result = "Option<std::sync::Weak<Avr>>")]
 pub struct CurrentAvr;
 
+/// True while the read after a telnet reconnect runs, for the tests.
+#[cfg(test)]
+#[derive(Message)]
+#[rtype(result = "bool")]
+pub struct Refreshing;
+
 /// Result of a connect: the receiver, its changes and its address.
 struct Connected {
     avr: Arc<Avr>,
@@ -153,7 +159,13 @@ struct Timers {
     connect: Option<SpawnHandle>,
     reconnect: Option<SpawnHandle>,
     poll: Option<SpawnHandle>,
+    /// The running read of `poll_http`. Cancelling it drops its copy of the old `Avr`.
+    poll_read: Option<SpawnHandle>,
     signal: Option<SpawnHandle>,
+    /// The running read of `poll_signal`. Cancelling it drops its copy of the old `Avr`.
+    signal_read: Option<SpawnHandle>,
+    /// The running read after a telnet reconnect. Cancelling it drops its copy of the old `Avr`.
+    refresh: Option<SpawnHandle>,
     /// The reads after a connect: missing web pages and toggles. Cancelling it drops its copy of
     /// the old `Avr`.
     pages: Option<SpawnHandle>,
@@ -1019,13 +1031,14 @@ impl DenonActor {
         self.polling = true;
         let generation = self.generation;
         let settings = !self.cfg.use_telnet;
-        ctx.spawn(async move { avr.update().await }.into_actor(self).map(
+        let handle = ctx.spawn(async move { avr.update().await }.into_actor(self).map(
             move |result, act, ctx| {
                 // A result of an older connection must not clear the flag of the new one.
                 if act.generation != generation {
                     return;
                 }
                 act.polling = false;
+                act.timers.poll_read = None;
                 act.note_missing();
                 let ok = result.is_ok();
                 if let Err(e) = &result {
@@ -1060,6 +1073,7 @@ impl DenonActor {
                 }
             },
         ));
+        self.timers.poll_read = Some(handle);
     }
 
     /// Read the signal again. While telnet is not open, also in telnet mode, this reads the signal
@@ -1073,7 +1087,7 @@ impl DenonActor {
         let Some(avr) = self.avr.clone() else { return };
         self.signal_polling = true;
         let generation = self.generation;
-        ctx.spawn(
+        let handle = ctx.spawn(
             async move { avr.refresh_signal().await }
                 .into_actor(self)
                 .map(move |result, act, _| {
@@ -1085,10 +1099,12 @@ impl DenonActor {
                     }
                     if act.generation == generation {
                         act.signal_polling = false;
+                        act.timers.signal_read = None;
                         act.note_missing();
                     }
                 }),
         );
+        self.timers.signal_read = Some(handle);
     }
 
     /// Drop the connection and mark the entities unavailable.
@@ -1099,7 +1115,8 @@ impl DenonActor {
         self.emit();
     }
 
-    /// Close the connection and stop all tasks of it.
+    /// Close the connection and cancel the timers and reads of it. Commands, telnet asks and the
+    /// tasks of the library end on their own.
     fn close(&mut self, ctx: &mut Context<Self>) {
         // Names that came before the close are saved now: the next connection may not ask again.
         if let Some(handle) = self.timers.names.take() {
@@ -1128,7 +1145,10 @@ impl DenonActor {
         self.cancel_connect(ctx);
         for handle in [
             self.timers.poll.take(),
+            self.timers.poll_read.take(),
             self.timers.signal.take(),
+            self.timers.signal_read.take(),
+            self.timers.refresh.take(),
             self.timers.pages.take(),
             self.timers.telnet.take(),
         ]
@@ -1145,14 +1165,18 @@ impl DenonActor {
         }
     }
 
-    /// Cancel the timers of the receiver connection.
+    /// Cancel the timers and reads of the receiver connection. It does not reset the flags of the
+    /// reads: call `close` first.
     fn cancel_timers(&mut self, ctx: &mut Context<Self>) {
         let t = std::mem::take(&mut self.timers);
         for handle in [
             t.connect,
             t.reconnect,
             t.poll,
+            t.poll_read,
             t.signal,
+            t.signal_read,
+            t.refresh,
             t.pages,
             t.telnet,
             t.heos,
@@ -1716,7 +1740,7 @@ impl Handler<LinkChanged> for DenonActor {
         {
             self.refreshing = true;
             let generation = self.generation;
-            ctx.spawn(
+            let handle = ctx.spawn(
                 async move {
                     if let Err(e) = avr.update().await {
                         debug!("read after reconnect failed: {e}");
@@ -1727,9 +1751,11 @@ impl Handler<LinkChanged> for DenonActor {
                 .map(move |(), act, _| {
                     if act.generation == generation {
                         act.refreshing = false;
+                        act.timers.refresh = None;
                     }
                 }),
             );
+            self.timers.refresh = Some(handle);
         }
         // While telnet is down, the state is read over HTTP.
         if !msg.1 {
@@ -1849,6 +1875,15 @@ impl Handler<CurrentAvr> for DenonActor {
 
     fn handle(&mut self, _: CurrentAvr, _: &mut Self::Context) -> Self::Result {
         self.avr.as_ref().map(Arc::downgrade)
+    }
+}
+
+#[cfg(test)]
+impl Handler<Refreshing> for DenonActor {
+    type Result = bool;
+
+    fn handle(&mut self, _: Refreshing, _: &mut Self::Context) -> Self::Result {
+        self.timers.refresh.is_some()
     }
 }
 

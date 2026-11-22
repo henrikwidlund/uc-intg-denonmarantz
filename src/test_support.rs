@@ -451,7 +451,8 @@ async fn read_head(
 }
 
 /// A fake web interface (port 11080 of a receiver). It answers every page with one status and
-/// records the paths. `start_slow` answers after a delay.
+/// records the paths. `start_slow` answers after a delay, `start_slow_after` only for later
+/// requests of one page.
 pub struct FakeWeb {
     port: u16,
     paths: Arc<Mutex<Vec<String>>>,
@@ -463,20 +464,39 @@ impl FakeWeb {
     }
 
     pub async fn start_slow(status: u16, delay: Duration) -> Self {
+        Self::start_slow_after(status, delay, None).await
+    }
+
+    /// With `slow_after` = `Some((page, fast))`: answers the first `fast` requests of `page` at
+    /// once, its later requests after `delay` and other pages at once. With `None`: answers all
+    /// requests after `delay`.
+    pub async fn start_slow_after(
+        status: u16,
+        delay: Duration,
+        slow_after: Option<(&'static str, usize)>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind the fake web interface");
         let port = listener.local_addr().expect("address").port();
         let paths = Arc::new(Mutex::new(Vec::new()));
         let seen = paths.clone();
+        let page_requests = Arc::new(AtomicUsize::new(0));
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let seen = seen.clone();
+                let page_requests = page_requests.clone();
                 tokio::spawn(async move {
                     let mut buffer = Vec::new();
                     while let Some((_, path, _)) = read_head(&mut socket, &mut buffer).await {
+                        let slow = match slow_after {
+                            None => true,
+                            Some((page, fast)) => {
+                                page == path && page_requests.fetch_add(1, Ordering::SeqCst) >= fast
+                            }
+                        };
                         seen.lock().expect("lock").push(path);
-                        if !delay.is_zero() {
+                        if !delay.is_zero() && slow {
                             tokio::time::sleep(delay).await;
                         }
                         let head = format!("HTTP/1.1 {status} X\r\nContent-Length: 0\r\n\r\n");
