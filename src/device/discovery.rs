@@ -163,13 +163,16 @@ pub async fn connect_known(
 /// The builder of a connection, with the signal check every `signal_secs`. A test can change it,
 /// so that the library talks to a fake receiver.
 fn builder(host: &str, known: Option<Known>, signal_secs: u16) -> AvrBuilder {
+    let telnet = telnet_config(signal_secs);
+    #[cfg(test)]
+    TEST_SIGNAL_CHECKS.with(|s| s.borrow_mut().push(telnet.signal_check));
     let mut builder = Avr::builder(host)
         .http_config(HttpConfig {
             connect_timeout: CONNECT_TIMEOUT,
             connect_retry: CONNECT_RETRY,
             ..HttpConfig::default()
         })
-        .telnet_config(telnet_config(signal_secs));
+        .telnet_config(telnet);
     if let Some(known) = known {
         builder = builder.brand(known.brand);
         if let Some(receiver_type) = known.receiver_type {
@@ -202,6 +205,10 @@ pub type TestBuilder = std::rc::Rc<dyn Fn(&str, AvrBuilder) -> AvrBuilder>;
 thread_local! {
     pub static TEST_BUILDER: std::cell::RefCell<Option<TestBuilder>> = const {
         std::cell::RefCell::new(None)
+    };
+    /// The signal check time of the library for each `builder` call on this thread.
+    pub static TEST_SIGNAL_CHECKS: std::cell::RefCell<Vec<Option<Duration>>> = const {
+        std::cell::RefCell::new(Vec::new())
     };
     /// The receivers that the search finds in the tests on this thread.
     pub static TEST_DISCOVERY: std::cell::RefCell<Option<Vec<DiscoveredReceiver>>> = const {

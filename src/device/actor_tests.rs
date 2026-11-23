@@ -7,7 +7,9 @@
 
 use super::actor::{CurrentAvr, Refreshing, read_differently, send_command};
 use super::commands;
-use super::discovery::{self, Known, TEST_BUILDER, TEST_DISCOVERY, TestBuilder};
+use super::discovery::{
+    self, Known, TEST_BUILDER, TEST_DISCOVERY, TEST_SIGNAL_CHECKS, TestBuilder,
+};
 use super::heos::TEST_HEOS;
 use super::{Command, Connect, DenonActor, DeviceEvent, DeviceStatus, Disconnect, UpdateConfig};
 use crate::config_store::{self, CommApiVersion, DEFAULT_SIGNAL_SECS, DeviceConfig};
@@ -2320,6 +2322,25 @@ async fn http_actor_with_signal(
     timeout: Duration,
     signal_poll_secs: Option<u16>,
 ) -> (Addr<DenonActor>, Arc<Mutex<Vec<DeviceEvent>>>, Fake) {
+    http_actor_with_poll(
+        cfg,
+        web,
+        timeout,
+        signal_poll_secs,
+        Duration::from_millis(100),
+    )
+    .await
+}
+
+/// As [`http_actor_with_signal`], with the state read every `poll`. The signal timer starts
+/// `poll / 2` after the connect.
+async fn http_actor_with_poll(
+    cfg: DeviceConfig,
+    web: &FakeWeb,
+    timeout: Duration,
+    signal_poll_secs: Option<u16>,
+    poll: Duration,
+) -> (Addr<DenonActor>, Arc<Mutex<Vec<DeviceEvent>>>, Fake) {
     let http = Fake::start(true).await;
     let (http_port, web_port) = (http.port(), web.port());
     let setup: TestBuilder = Rc::new(move |_, builder| {
@@ -2343,7 +2364,7 @@ async fn http_actor_with_signal(
     };
     let actor = DenonActor::new(cfg.id.as_str().into(), cfg, collector.recipient())
         .with_retry_delay(Duration::from_secs(60))
-        .with_poll_interval(Duration::from_millis(100))
+        .with_poll_interval(poll)
         .with_signal_interval(Duration::from_millis(100))
         .start();
     actor.send(Connect).await.expect("connect");
@@ -2441,6 +2462,125 @@ async fn the_signal_timer_reads_over_http_while_telnet_is_down() {
         http.audyssey_reads() >= reads + 2
     })
     .await;
+}
+
+#[actix::test]
+async fn the_signal_timer_waits_for_a_state_read_after_telnet_drops() {
+    let (_actor, http, telnet) = telnet_actor_with_signal_timer().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The state reads time out after 500 ms. `http_ok` is still true from the connect.
+    http.set_read_delay(Duration::from_secs(60));
+    // The start sends 2 `AppCommand0300` requests, one after the other.
+    until("no open AppCommand0300 request", 5, || {
+        let answers = http.audyssey_answers();
+        answers >= 2 && answers == http.audyssey_reads()
+    })
+    .await;
+    let reads = http.audyssey_reads();
+    let polls = http.app_commands();
+    telnet.leave();
+    // The actor reads the state at once when telnet goes down.
+    until("a read of the state", 5, || http.app_commands() > polls).await;
+    // The read fails after 500 ms. Then `http_ok` is false, which also blocks the signal reads,
+    // so check before that.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(reads, http.audyssey_reads());
+}
+
+#[actix::test]
+async fn the_signal_timer_starts_half_a_poll_time_after_the_connect() {
+    // A signal time of 0: each timer read is one `AppCommand0300` request.
+    let web = FakeWeb::start(404).await;
+    let (_actor, events, http) = http_actor_with_poll(
+        cfg(),
+        &web,
+        quick_http().request_timeout,
+        Some(0),
+        Duration::from_secs(4),
+    )
+    .await;
+    let connected = Instant::now();
+    until("connected", 5, || {
+        status_count(&events, DeviceStatus::Connected) == 1
+    })
+    .await;
+    // The start can read `AppCommand0300` too. The fake answers it after 400 ms.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let reads = http.audyssey_reads();
+    tokio::time::sleep(Duration::from_millis(1600).saturating_sub(connected.elapsed())).await;
+    assert_eq!(reads, http.audyssey_reads(), "a timer read before 2 s");
+    // The timer reads at about 2.1 s and 2.6 s; with a delay of a full poll time, at about 4.1 s
+    // and 4.6 s.
+    until("timer reads", 2, || http.audyssey_reads() >= reads + 2).await;
+}
+
+#[actix::test]
+async fn no_signal_read_after_a_disconnect_during_the_start_delay() {
+    let web = FakeWeb::start(404).await;
+    let (actor, events, http) = http_actor_with_poll(
+        cfg(),
+        &web,
+        quick_http().request_timeout,
+        Some(0),
+        Duration::from_secs(4),
+    )
+    .await;
+    until("connected", 5, || {
+        status_count(&events, DeviceStatus::Connected) == 1
+    })
+    .await;
+    actor.send(Disconnect).await.expect("disconnect");
+    // A read of the start ends 400 ms after its request.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let reads = http.audyssey_reads();
+    // The timer would start 2 s after the connect.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(reads, http.audyssey_reads());
+}
+
+/// Connect with `cfg` (address of the fake receiver set by the rig). Gives the signal check times
+/// that `builder` set up and the reads of the description.
+async fn signal_checks_of(cfg: impl FnOnce(u16) -> DeviceConfig) -> (Vec<Option<Duration>>, usize) {
+    TEST_SIGNAL_CHECKS.with(|s| s.borrow_mut().clear());
+    let rig = rig_with(cfg, answers_all, QUICK).await;
+    until("connected", 5, || {
+        status_count(&rig.events, DeviceStatus::Connected) == 1
+    })
+    .await;
+    rig.actor.send(Disconnect).await.expect("disconnect");
+    let checks = TEST_SIGNAL_CHECKS.with(|s| std::mem::take(&mut *s.borrow_mut()));
+    (checks, rig.http.description_reads())
+}
+
+#[actix::test]
+async fn a_look_up_gives_the_signal_time_to_the_library() {
+    for (secs, check) in [(7, Some(Duration::from_secs(7))), (0, None)] {
+        let (checks, reads) = signal_checks_of(|_| DeviceConfig {
+            signal_poll_secs: Some(secs),
+            ..cfg()
+        })
+        .await;
+        assert!(reads >= 1, "not looked up");
+        assert_ne!(checks, []);
+        assert!(checks.iter().all(|c| *c == check), "{secs}: {checks:?}");
+    }
+}
+
+#[actix::test]
+async fn a_connect_with_stored_values_gives_the_signal_time_to_the_library() {
+    let info = fake_info().await;
+    for (secs, check) in [(7, Some(Duration::from_secs(7))), (0, None)] {
+        let info = info.clone();
+        let (checks, reads) = signal_checks_of(|port| DeviceConfig {
+            signal_poll_secs: Some(secs),
+            info: Some(Info { port, ..info }),
+            ..cfg()
+        })
+        .await;
+        assert_eq!(0, reads, "looked up");
+        assert_ne!(checks, []);
+        assert!(checks.iter().all(|c| *c == check), "{secs}: {checks:?}");
+    }
 }
 
 #[actix::test]

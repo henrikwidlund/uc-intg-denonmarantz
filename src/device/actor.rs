@@ -216,6 +216,9 @@ pub struct DenonActor {
     telnet_up: bool,
     /// The last read over HTTP worked.
     http_ok: bool,
+    /// A read over HTTP worked since the connect or since telnet went down. Used in telnet mode:
+    /// `http_ok` is not updated while telnet is up.
+    http_checked: bool,
     /// A read over HTTP is running.
     polling: bool,
     /// Reads over HTTP in a row that failed while telnet was down.
@@ -317,6 +320,7 @@ impl DenonActor {
             want: false,
             telnet_up: false,
             http_ok: false,
+            http_checked: false,
             polling: false,
             poll_failures: 0,
             signal_polling: false,
@@ -637,6 +641,7 @@ impl DenonActor {
         self.look_up = false;
         self.keep_state = false;
         self.http_ok = true;
+        self.http_checked = true;
         self.telnet_up =
             self.cfg.use_telnet && *avr.telnet_status().borrow() == TelnetStatus::Connected;
         self.names_asked = 0;
@@ -1068,6 +1073,7 @@ impl DenonActor {
                 act.http_ok = ok;
                 if ok {
                     act.poll_failures = 0;
+                    act.http_checked = true;
                 } else {
                     act.poll_failures += 1;
                     // The receiver can have a new address. Connect again: this searches for its
@@ -1108,11 +1114,15 @@ impl DenonActor {
     /// receivers with `CommApiVers` 0301 or higher the library checks it
     /// (`TelnetConfig::signal_check`). While telnet is down, a blank answer clears values that
     /// telnet gave, for example the Audyssey values of a receiver with Dirac Live; telnet gives
-    /// them again after a reconnect. It reads only while the state read works. It runs on its own,
-    /// so a web interface that does not answer does not delay the state. One read runs at a time.
+    /// them again after a reconnect. It reads only while the state read works; in telnet mode,
+    /// only after a state read that worked since telnet went down. It runs on its own, so a web
+    /// interface that does not answer does not delay the state. One read runs at a time.
     fn poll_signal(&mut self, ctx: &mut Context<Self>) {
         // A slow receiver must not get a new read before the old one is done.
-        if self.signal_polling || !self.http_ok || (self.cfg.use_telnet && self.telnet_up) {
+        if self.signal_polling
+            || !self.http_ok
+            || (self.cfg.use_telnet && (self.telnet_up || !self.http_checked))
+        {
             return;
         }
         let Some(avr) = self.avr.clone() else { return };
@@ -1175,6 +1185,7 @@ impl DenonActor {
         self.drop_heos(ctx);
         self.telnet_up = false;
         self.http_ok = false;
+        self.http_checked = false;
         self.polling = false;
         self.signal_polling = false;
         self.refreshing = false;
@@ -1798,8 +1809,10 @@ impl Handler<LinkChanged> for DenonActor {
             );
             self.timers.refresh = Some(handle);
         }
-        // While telnet is down, the state is read over HTTP.
+        // While telnet is down, the state is read over HTTP. The signal waits for a read that
+        // works: `http_ok` can be old.
         if !msg.1 {
+            self.http_checked = false;
             self.poll_http(ctx);
         }
         self.schedule_emit(ctx);
