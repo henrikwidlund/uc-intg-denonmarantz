@@ -261,6 +261,8 @@ pub struct DenonActor {
     page_retry_delay: Duration,
     /// Time between reads over HTTP while telnet is down.
     poll_interval: Duration,
+    /// Time between signal reads in place of the one from the configuration. For tests.
+    signal_interval: Option<Duration>,
     /// Commands run one after the other.
     cmd_lock: Arc<tokio::sync::Mutex<()>>,
     /// Incremented by `stop_send`. A remote run stops when it changed since the run started.
@@ -284,6 +286,13 @@ impl DenonActor {
     #[cfg(test)]
     pub const fn with_poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
+        self
+    }
+
+    /// Set the time between signal reads. For tests.
+    #[cfg(test)]
+    pub const fn with_signal_interval(mut self, interval: Duration) -> Self {
+        self.signal_interval = Some(interval);
         self
     }
 
@@ -330,6 +339,7 @@ impl DenonActor {
             paused: false,
             page_retry_delay: discovery::PAGE_RETRY_DELAY,
             poll_interval: HTTP_POLL_INTERVAL,
+            signal_interval: None,
             cmd_lock: Arc::default(),
             run_stop: Arc::default(),
             expected: Arc::default(),
@@ -686,9 +696,14 @@ impl DenonActor {
         // Without telnet events, the state is read over HTTP. This also covers a telnet connection
         // that is down.
         self.timers.poll = Some(ctx.run_interval(self.poll_interval, Self::poll_http));
-        if self.cfg.signal_poll_secs > 0 {
-            let every = Duration::from_secs(u64::from(self.cfg.signal_poll_secs));
-            self.timers.signal = Some(ctx.run_interval(every, Self::poll_signal));
+        if let Some(every) = self.signal_every() {
+            // Half a poll time after the reads of the state, so that their requests do not wait
+            // for each other. `signal_every` is a multiple of the poll time.
+            self.timers.signal = Some(ctx.run_later(self.poll_interval / 2, move |act, ctx| {
+                if act.generation == generation {
+                    act.timers.signal = Some(ctx.run_interval(every, Self::poll_signal));
+                }
+            }));
         }
 
         self.avr = Some(avr);
@@ -1026,14 +1041,8 @@ impl DenonActor {
     }
 
     /// Read the state over HTTP and show if the receiver answers. It does nothing while telnet
-    /// reports the changes, or while an earlier read runs. In HTTP mode a read of the state that
-    /// worked starts `poll_signal`: it reads Audyssey, the signal and the HDMI output
-    /// (`update_signal_and_settings`, only on receivers that use `AppCommand`) and the signal pages.
-    /// HDR, pixel depth, color space and FRL come only from the video page. It runs on its own, so
-    /// a web interface that does not answer does not delay the state. In telnet mode the poll does
-    /// not read them: while telnet is down, a blank answer would clear the values of telnet. Only the
-    /// signal timer reads the signal pages then. `POLL_READS` in `config_store` names these reads:
-    /// keep them the same.
+    /// reports the changes, or while an earlier read runs. The signal has its own timer, see
+    /// `poll_signal`.
     fn poll_http(&mut self, ctx: &mut Context<Self>) {
         if !self.needs_poll() || self.polling {
             return;
@@ -1041,7 +1050,6 @@ impl DenonActor {
         let Some(avr) = self.avr.clone() else { return };
         self.polling = true;
         let generation = self.generation;
-        let settings = !self.cfg.use_telnet;
         let handle = ctx.spawn(async move { avr.update().await }.into_actor(self).map(
             move |result, act, ctx| {
                 // A result of an older connection must not clear the flag of the new one.
@@ -1060,9 +1068,6 @@ impl DenonActor {
                 act.http_ok = ok;
                 if ok {
                     act.poll_failures = 0;
-                    if settings {
-                        act.poll_signal(ctx);
-                    }
                 } else {
                     act.poll_failures += 1;
                     // The receiver can have a new address. Connect again: this searches for its
@@ -1087,33 +1092,55 @@ impl DenonActor {
         self.timers.poll_read = Some(handle);
     }
 
-    /// Read the signal again. While telnet is not open, also in telnet mode, this reads the signal
-    /// pages (`POLL_READS`). The HTTP poll and the signal timer both start it; one read runs at a
-    /// time.
+    /// The time of the signal timer, see [`signal_every`].
+    fn signal_every(&self) -> Option<Duration> {
+        let every = signal_every(&self.cfg, self.poll_interval)?;
+        Some(self.signal_interval.unwrap_or(every))
+    }
+
+    /// Read the signal over HTTP: Audyssey, the signal and the HDMI output
+    /// (`update_signal_and_settings`, only on receivers that use `AppCommand`) and the signal
+    /// pages. HDR, pixel depth, color space and FRL come only from the video page. With a signal
+    /// time of 0, only `update_signal_and_settings`. `POLL_READS` in `config_store` names these
+    /// reads: keep them the same.
+    ///
+    /// In telnet mode it reads only while telnet is down: telnet reports the signal, and on
+    /// receivers with `CommApiVers` 0301 or higher the library checks it
+    /// (`TelnetConfig::signal_check`). While telnet is down, a blank answer clears values that
+    /// telnet gave, for example the Audyssey values of a receiver with Dirac Live; telnet gives
+    /// them again after a reconnect. It reads only while the state read works. It runs on its own,
+    /// so a web interface that does not answer does not delay the state. One read runs at a time.
     fn poll_signal(&mut self, ctx: &mut Context<Self>) {
         // A slow receiver must not get a new read before the old one is done.
-        if self.signal_polling {
+        if self.signal_polling || !self.http_ok || (self.cfg.use_telnet && self.telnet_up) {
             return;
         }
         let Some(avr) = self.avr.clone() else { return };
         self.signal_polling = true;
         let generation = self.generation;
+        let pages = self.cfg.signal_secs() > 0;
         let handle = ctx.spawn(
-            async move { avr.refresh_signal().await }
-                .into_actor(self)
-                .map(move |result, act, _| {
-                    // `NothingRead`: no page gave values, for example all answered 404.
-                    if let Err(e) = result
-                        && !matches!(e, AvrError::NothingRead)
-                    {
-                        debug!("[{}] signal not read: {e}", act.cfg.name);
-                    }
-                    if act.generation == generation {
-                        act.signal_polling = false;
-                        act.timers.signal_read = None;
-                        act.note_missing();
-                    }
-                }),
+            async move {
+                if pages {
+                    avr.refresh_signal_pages().await
+                } else {
+                    avr.update_signal_and_settings().await.map(|_| ())
+                }
+            }
+            .into_actor(self)
+            .map(move |result, act, _| {
+                // `NothingRead`: no page gave values, for example all answered 404.
+                if let Err(e) = result
+                    && !matches!(e, AvrError::NothingRead)
+                {
+                    debug!("[{}] signal not read: {e}", act.cfg.name);
+                }
+                if act.generation == generation {
+                    act.signal_polling = false;
+                    act.timers.signal_read = None;
+                    act.note_missing();
+                }
+            }),
         );
         self.timers.signal_read = Some(handle);
     }
@@ -1364,7 +1391,7 @@ async fn connect_avr(
     let deadline = Instant::now() + discovery::NETWORK_RETRY_TIMEOUT;
     let mut stall = discovery::Stall::new(last);
     if let Some(info) = known {
-        let avr = discovery::connect_known(&cfg.address, info, cfg.missing)
+        let avr = discovery::connect_known(&cfg.address, info, cfg.missing, cfg.signal_secs())
             .await
             .map_err(Some)?;
         match start_avr(avr, None, cfg.use_telnet, deadline, &mut stall, &early).await {
@@ -1930,7 +1957,7 @@ impl Handler<UpdateConfig> for DenonActor {
         // A new setup clears the missing sources: the connection still has them.
         let reconnect = new_address
             || cfg.use_telnet != self.cfg.use_telnet
-            || cfg.signal_poll_secs != self.cfg.signal_poll_secs
+            || cfg.signal_secs() != self.cfg.signal_secs()
             || (cfg.missing == MissingSources::default()
                 && self.cfg.missing != MissingSources::default());
         if new_address {
@@ -2129,9 +2156,47 @@ impl Handler<Command> for DenonActor {
     }
 }
 
+/// The time of the signal timer, see `DeviceConfig::signal_secs`, rounded up to a multiple of the
+/// HTTP poll time (`poll`), at least one. It reads over HTTP, so the reads of the state and of the
+/// signal stay apart. In telnet mode, 0 turns it off.
+fn signal_every(cfg: &DeviceConfig, poll: Duration) -> Option<Duration> {
+    let secs = cfg.signal_secs();
+    if cfg.use_telnet && secs == 0 {
+        return None;
+    }
+    let poll_ms = u64::try_from(poll.as_millis()).unwrap_or(u64::MAX).max(1);
+    let steps = (u64::from(secs) * 1000).div_ceil(poll_ms).max(1);
+    Some(Duration::from_millis(steps.saturating_mul(poll_ms)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_signal_timer_is_a_multiple_of_the_http_poll() {
+        let every = |use_telnet, secs| {
+            let cfg: DeviceConfig =
+                serde_json::from_str(r#"{"id":"A","name":"N","address":"h"}"#).expect("json");
+            let cfg = DeviceConfig {
+                use_telnet,
+                signal_poll_secs: secs,
+                ..cfg
+            };
+            signal_every(&cfg, HTTP_POLL_INTERVAL)
+        };
+        let secs = |s| Some(Duration::from_secs(s));
+        assert_eq!(None, every(true, Some(0)));
+        assert_eq!(secs(10), every(true, None));
+        assert_eq!(secs(30), every(true, Some(30)));
+        // A multiple of the poll time.
+        assert_eq!(secs(20), every(true, Some(15)));
+        assert_eq!(secs(20), every(false, Some(11)));
+        // In HTTP mode 0 still reads `AppCommand0300`.
+        assert_eq!(secs(10), every(false, Some(0)));
+        assert_eq!(secs(10), every(false, Some(5)));
+        assert_eq!(secs(30), every(false, Some(30)));
+    }
 
     #[test]
     fn the_log_names_the_remote_command_else_the_command_id() {
@@ -2210,7 +2275,7 @@ mod tests {
             timeout: 2000,
             is_denon: true,
             is_dirac_supported: Some(true),
-            signal_poll_secs: 0,
+            signal_poll_secs: Some(0),
             receiver_type: None,
             update_method: None,
             comm_api_version: None,

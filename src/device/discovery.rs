@@ -9,7 +9,8 @@ use denon_marantz::proto::{NetworkAudioCommand, PlayingKind, Power};
 use denon_marantz::{
     Ask, Avr, AvrBuilder, Brand, Command, DiscoveredReceiver, DiscoveryConfig, Error, HttpConfig,
     Info, InfoCheck, MissingSources, PageStatus, Query, ReceiverType, SpecFeature, StartOptions,
-    StartReport, Started, State, TelnetSync, TunerInfo, UpdateMethod, Zone, discover_all,
+    StartReport, Started, State, TelnetConfig, TelnetSync, TunerInfo, UpdateMethod, Zone,
+    discover_all,
 };
 use log::debug;
 use std::borrow::Cow;
@@ -69,6 +70,8 @@ pub struct Known {
     pub receiver_type: Option<ReceiverType>,
     /// Used if the device description does not name a brand.
     pub brand: Brand,
+    /// See `DeviceConfig::signal_secs`.
+    pub signal_secs: u16,
 }
 
 impl Known {
@@ -86,6 +89,7 @@ impl Known {
             } else {
                 Brand::Marantz
             },
+            signal_secs: cfg.signal_secs(),
         }
     }
 }
@@ -137,27 +141,35 @@ pub async fn identify(host: &str, known: Option<Known>) -> Result<Avr, Error> {
 }
 
 async fn identify_with(host: &str, known: Option<Known>) -> Result<Avr, Error> {
-    builder(host, known).connect().await
+    let signal_secs = known.map_or(config_store::DEFAULT_SIGNAL_SECS, |k| k.signal_secs);
+    builder(host, known, signal_secs).connect().await
 }
 
 /// Connect with the values of an earlier connect. It sends no request: the start checks the
 /// values, see [`Started::info_check`]. The sources in `missing` are not asked.
-pub async fn connect_known(host: &str, info: Info, missing: MissingSources) -> Result<Avr, Error> {
-    builder(host, None)
+pub async fn connect_known(
+    host: &str,
+    info: Info,
+    missing: MissingSources,
+    signal_secs: u16,
+) -> Result<Avr, Error> {
+    builder(host, None, signal_secs)
         .known(info)
         .missing(missing)
         .connect()
         .await
 }
 
-/// The builder of a connection. A test can change it, so that the library talks to a fake
-/// receiver.
-fn builder(host: &str, known: Option<Known>) -> AvrBuilder {
-    let mut builder = Avr::builder(host).http_config(HttpConfig {
-        connect_timeout: CONNECT_TIMEOUT,
-        connect_retry: CONNECT_RETRY,
-        ..HttpConfig::default()
-    });
+/// The builder of a connection, with the signal check every `signal_secs`. A test can change it,
+/// so that the library talks to a fake receiver.
+fn builder(host: &str, known: Option<Known>, signal_secs: u16) -> AvrBuilder {
+    let mut builder = Avr::builder(host)
+        .http_config(HttpConfig {
+            connect_timeout: CONNECT_TIMEOUT,
+            connect_retry: CONNECT_RETRY,
+            ..HttpConfig::default()
+        })
+        .telnet_config(telnet_config(signal_secs));
     if let Some(known) = known {
         builder = builder.brand(known.brand);
         if let Some(receiver_type) = known.receiver_type {
@@ -169,6 +181,17 @@ fn builder(host: &str, known: Option<Known>) -> AvrBuilder {
         return configure(host, builder);
     }
     builder
+}
+
+/// The telnet settings with the signal check of the library every `signal_secs` (see
+/// `DeviceConfig::signal_secs`). 0 turns the check off. Less than `MIN_SIGNAL_SECS` counts as
+/// `MIN_SIGNAL_SECS`: the library does not accept it.
+fn telnet_config(signal_secs: u16) -> TelnetConfig {
+    let secs = signal_secs.max(config_store::MIN_SIGNAL_SECS);
+    TelnetConfig {
+        signal_check: (signal_secs > 0).then(|| Duration::from_secs(u64::from(secs))),
+        ..TelnetConfig::default()
+    }
 }
 
 /// A function that sets up the builder of the tests on this thread. It gets the host.
@@ -1056,6 +1079,23 @@ mod page_tests {
         .await;
         drop(held);
         assert_eq!(1, web.requests(AUDIO_PAGE));
+    }
+}
+
+#[cfg(test)]
+mod telnet_config_tests {
+    use super::*;
+    use crate::config_store::MIN_SIGNAL_SECS;
+
+    #[test]
+    fn the_signal_time_goes_to_the_library() {
+        assert_eq!(None, telnet_config(0).signal_check);
+        assert_eq!(Some(Duration::from_secs(7)), telnet_config(7).signal_check);
+        // The lowest time must be above the answer wait of the library.
+        for secs in [1, MIN_SIGNAL_SECS] {
+            let lowest = telnet_config(secs);
+            assert!(lowest.signal_check.is_some_and(|c| c > lowest.answer_quiet));
+        }
     }
 }
 

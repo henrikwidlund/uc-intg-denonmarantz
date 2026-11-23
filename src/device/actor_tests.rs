@@ -10,7 +10,7 @@ use super::commands;
 use super::discovery::{self, Known, TEST_BUILDER, TEST_DISCOVERY, TestBuilder};
 use super::heos::TEST_HEOS;
 use super::{Command, Connect, DenonActor, DeviceEvent, DeviceStatus, Disconnect, UpdateConfig};
-use crate::config_store::{self, CommApiVersion, DeviceConfig};
+use crate::config_store::{self, CommApiVersion, DEFAULT_SIGNAL_SECS, DeviceConfig};
 use crate::entities::sensor::EMPTY;
 use crate::entities::{EntityKind, SelectKind, SensorKind, SwitchKind};
 use crate::errors::ServiceError;
@@ -71,7 +71,7 @@ fn cfg() -> DeviceConfig {
         timeout: 2000,
         is_denon: true,
         is_dirac_supported: Some(true),
-        signal_poll_secs: 0,
+        signal_poll_secs: Some(0),
         receiver_type: None,
         update_method: None,
         comm_api_version: None,
@@ -452,7 +452,7 @@ async fn a_new_configuration_keeps_the_names_that_the_actor_learned() {
     // receiver values.
     let setup = DeviceConfig {
         network_favorite_names: vec!["Old".into()],
-        signal_poll_secs: 5,
+        signal_poll_secs: Some(5),
         ..cfg()
     };
     rig.actor.send(UpdateConfig(setup)).await.expect("update");
@@ -462,6 +462,28 @@ async fn a_new_configuration_keeps_the_names_that_the_actor_learned() {
         (learned, Some(true)),
         (saved.network_favorite_names, saved.tuner_presets_lettered)
     );
+}
+
+#[actix::test]
+async fn the_same_signal_time_in_another_form_does_not_connect_again() {
+    let first = DeviceConfig {
+        signal_poll_secs: None,
+        ..cfg()
+    };
+    let rig = rig_with(move |_| first, answers_all, QUICK).await;
+    until("connected", 5, || {
+        status_count(&rig.events, DeviceStatus::Connected) == 1
+    })
+    .await;
+    // No value and 5 are the same time.
+    let setup = DeviceConfig {
+        signal_poll_secs: Some(DEFAULT_SIGNAL_SECS),
+        ..cfg()
+    };
+    rig.actor.send(UpdateConfig(setup)).await.expect("update");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(0, status_count(&rig.events, DeviceStatus::Disconnected));
+    assert_eq!(1, status_count(&rig.events, DeviceStatus::Connected));
 }
 
 #[actix::test]
@@ -1173,7 +1195,7 @@ async fn a_connect_during_the_disconnect_wait_keeps_the_connection_like_a_new_on
 }
 
 #[actix::test]
-async fn the_http_poll_reads_audyssey_and_the_signal() {
+async fn http_mode_reads_audyssey_and_the_signal() {
     let http = Fake::start(true).await;
     let http_port = http.port();
     let setup: TestBuilder = Rc::new(move |_, builder| test_builder(http_port, 1, builder));
@@ -1372,6 +1394,7 @@ async fn a_changed_receiver_type_is_looked_up_again() {
     let known = |receiver_type| Known {
         receiver_type: Some(receiver_type),
         brand: Brand::Denon,
+        signal_secs: 0,
     };
 
     let avr = discovery::identify("127.0.0.1", Some(known(ReceiverType::AvrX)))
@@ -1402,6 +1425,7 @@ async fn an_error_answer_does_not_make_a_newer_receiver_the_oldest_type() {
     let known = |receiver_type| Known {
         receiver_type: Some(receiver_type),
         brand: Brand::Denon,
+        signal_secs: 0,
     };
 
     let error = discovery::identify("127.0.0.1", Some(known(ReceiverType::AvrX)))
@@ -1753,7 +1777,7 @@ async fn heos_is_opened_again_when_the_receiver_connects_again() {
     let connected = status_count(&rig.events, DeviceStatus::Connected);
     // A new poll setting connects to the receiver again, as after a lost connection.
     let cfg = DeviceConfig {
-        signal_poll_secs: 5,
+        signal_poll_secs: Some(5),
         ..cfg()
     };
     rig.actor.send(UpdateConfig(cfg)).await.expect("update");
@@ -2269,8 +2293,8 @@ async fn only_a_new_type_port_or_update_method_connects_again() {
 const VIDEO_PAGE: &str = "/ajax/info/get_config?type=3";
 const CHANNELS_PAGE: &str = "/ajax/info/get_config?type=2";
 
-/// An actor in HTTP mode without the signal timer, connected to a fake receiver with the web
-/// interface `web`. The HTTP poll runs every 100 ms and reads the signal pages.
+/// An actor in HTTP mode with the default signal time, connected to a fake receiver with the web
+/// interface `web`. The HTTP poll and the signal timer run every 100 ms.
 async fn http_actor_with_web(
     cfg: DeviceConfig,
     web: &FakeWeb,
@@ -2284,6 +2308,17 @@ async fn http_actor_with_timeout(
     cfg: DeviceConfig,
     web: &FakeWeb,
     timeout: Duration,
+) -> (Addr<DenonActor>, Arc<Mutex<Vec<DeviceEvent>>>, Fake) {
+    http_actor_with_signal(cfg, web, timeout, None).await
+}
+
+/// As [`http_actor_with_timeout`], with the signal time `signal_poll_secs`. The signal timer
+/// runs every 100 ms.
+async fn http_actor_with_signal(
+    cfg: DeviceConfig,
+    web: &FakeWeb,
+    timeout: Duration,
+    signal_poll_secs: Option<u16>,
 ) -> (Addr<DenonActor>, Arc<Mutex<Vec<DeviceEvent>>>, Fake) {
     let http = Fake::start(true).await;
     let (http_port, web_port) = (http.port(), web.port());
@@ -2303,12 +2338,13 @@ async fn http_actor_with_timeout(
     let collector = Collector(events.clone()).start();
     let cfg = DeviceConfig {
         use_telnet: false,
-        signal_poll_secs: 0,
+        signal_poll_secs,
         ..cfg
     };
     let actor = DenonActor::new(cfg.id.as_str().into(), cfg, collector.recipient())
         .with_retry_delay(Duration::from_secs(60))
         .with_poll_interval(Duration::from_millis(100))
+        .with_signal_interval(Duration::from_millis(100))
         .start();
     actor.send(Connect).await.expect("connect");
     (actor, events, http)
@@ -2353,15 +2389,105 @@ async fn learn_missing_pages(
 }
 
 #[actix::test]
-async fn the_http_poll_reads_the_video_page_without_the_signal_timer() {
-    // A 500 does not mark the page as missing, so each poll reads it again. Each read asks twice
-    // (library retry), and the start reads it once.
+async fn the_signal_timer_reads_the_video_page_in_http_mode() {
+    // A 500 does not mark the page as missing, so each signal read reads it again. Each read asks
+    // twice (library retry), and the start reads it once.
     let web = FakeWeb::start(500).await;
     let (_actor, _events, _http) = http_actor_with_web(cfg(), &web).await;
     until("more reads of the video page", 10, || {
         web.requests(VIDEO_PAGE) > 6
     })
     .await;
+}
+
+#[actix::test]
+async fn the_signal_timer_does_not_read_over_http_while_telnet_is_open() {
+    let (_actor, http, _telnet) = telnet_actor_with_signal_timer().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let reads = http.audyssey_reads();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(reads, http.audyssey_reads());
+}
+
+/// A telnet-mode actor with the default signal time and the signal timer every 100 ms.
+async fn telnet_actor_with_signal_timer() -> (Addr<DenonActor>, Fake, FakeTelnet) {
+    let http = Fake::start(true).await;
+    let telnet = FakeTelnet::start(answers_all).await;
+    let (http_port, telnet_port) = (http.port(), telnet.port);
+    let setup: TestBuilder =
+        Rc::new(move |_, builder| test_builder(http_port, telnet_port, builder));
+    TEST_BUILDER.with(|slot| *slot.borrow_mut() = Some(setup));
+    let collector = Collector(Arc::new(Mutex::new(Vec::new()))).start();
+    let cfg = DeviceConfig {
+        signal_poll_secs: None,
+        ..cfg()
+    };
+    let actor = DenonActor::new("SERIAL0000001".into(), cfg, collector.recipient())
+        .with_poll_interval(Duration::from_millis(100))
+        .with_signal_interval(Duration::from_millis(100))
+        .start();
+    actor.send(Connect).await.expect("connect");
+    until("the picture mode", 10, || telnet.count("PV?") >= 1).await;
+    (actor, http, telnet)
+}
+
+#[actix::test]
+async fn the_signal_timer_reads_over_http_while_telnet_is_down() {
+    let (_actor, http, telnet) = telnet_actor_with_signal_timer().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let reads = http.audyssey_reads();
+    telnet.leave();
+    until("signal reads over HTTP", 5, || {
+        http.audyssey_reads() >= reads + 2
+    })
+    .await;
+}
+
+#[actix::test]
+async fn http_mode_reads_no_signal_while_the_state_read_fails() {
+    let web = FakeWeb::start(404).await;
+    let (_actor, events, http) =
+        http_actor_with_signal(cfg(), &web, Duration::from_secs(2), Some(0)).await;
+    until("connected", 5, || {
+        status_count(&events, DeviceStatus::Connected) == 1
+    })
+    .await;
+    let reads = http.audyssey_reads();
+    until("signal reads", 5, || http.audyssey_reads() >= reads + 2).await;
+    // The state reads time out after 2 s. After 3 failed reads the receiver is searched again.
+    http.set_read_delay(Duration::from_secs(10));
+    until("unavailable", 5, || {
+        media_state(&events) == Some(Value::from("UNAVAILABLE"))
+    })
+    .await;
+    // A running signal read ends 400 ms after its request.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let reads = http.audyssey_reads();
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    assert_eq!(reads, http.audyssey_reads());
+    assert_eq!(0, status_count(&events, DeviceStatus::Disconnected));
+}
+
+#[actix::test]
+async fn a_signal_time_of_0_reads_only_appcommand0300_in_http_mode() {
+    let web = FakeWeb::start(500).await;
+    let (_actor, events, http) =
+        http_actor_with_signal(cfg(), &web, quick_http().request_timeout, Some(0)).await;
+    until("connected", 5, || {
+        status_count(&events, DeviceStatus::Connected) == 1
+    })
+    .await;
+    let audyssey = http.audyssey_reads();
+    until("more reads of AppCommand0300", 5, || {
+        http.audyssey_reads() >= audyssey + 3
+    })
+    .await;
+    // Only the start reads the video page: once, and once more by the library retry.
+    assert!(
+        web.requests(VIDEO_PAGE) <= 2,
+        "{}",
+        web.requests(VIDEO_PAGE)
+    );
 }
 
 #[actix::test]

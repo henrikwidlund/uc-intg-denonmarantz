@@ -250,7 +250,7 @@ mod tests {
             timeout: 2000,
             is_denon,
             is_dirac_supported: None,
-            signal_poll_secs: 0,
+            signal_poll_secs: Some(0),
             receiver_type: None,
             update_method: None,
             comm_api_version: None,

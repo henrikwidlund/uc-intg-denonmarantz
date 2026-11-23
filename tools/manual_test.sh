@@ -279,7 +279,8 @@ On the page 'Setup mode': leave the address empty. Press Next.
 Pick the receiver. Keep the defaults. Press Next." \
 "The page 'Setup mode' says that the address is optional and that the search finds receivers only on the
 same network as the Remote. A page 'Please choose your Denon or Marantz AVR' has the receiver and these
-fields: show all sources, manufacturer, connection mode, volume step, Dirac, signal read time.
+fields: show all sources, manufacturer, connection mode, volume step, Dirac, signal check time (5 s; not
+on receivers from before about 2016).
 'Device supports Dirac' shows the real value of the receiver.
 The setup ends with success in about a second." \
 "recent_log 'discovering|adding|not found|WARN|ERROR'"
@@ -305,15 +306,15 @@ PAUSED. Note what Bluetooth shows. A source without media shows its name as the 
 The tuner shows the frequency as the title and the band as the artist. The keys work on the receiver." \
 "$LOG_PROBLEMS"
 
-step "Signal sensors and the signal read option" \
+step "Signal sensors and the signal check option" \
 "A source with a video and audio signal is playing." \
 "Look at the sensors for audio and video signal, channels, resolution, HDR, pixel depth, FRL and color space.
-Play an HDR10 or Dolby Vision source, then an SDR source. On a receiver from before about 2016 with telnet, then
-set 'Read the signal info every N seconds' to 10 in the setup." \
+Play an HDR10 or Dolby Vision source, then an SDR source." \
 "The sensors show the signal of the receiver. With HDR the color space shows the BT.2020 part, for example
 4:2:2/BT.2020; with SDR it does not. They follow a change of source within about 10 seconds, also when the
-receiver does not report it (newer receivers with telnet: 5 seconds; HTTP only: 10 seconds; older receivers
-with telnet: only with the option on)." \
+receiver does not report it (newer receivers with telnet: the set time, 5 seconds by default; HTTP mode: the
+set time rounded up to a multiple of 10 seconds; older receivers with telnet: only when the receiver reports
+it, and they have no option)." \
 "recent_log 'signal|WARN|ERROR'"
 
 step "Simple commands and pages" \
@@ -344,11 +345,13 @@ The log shows 'connected in' and the time." \
 step "HTTP connection mode" \
 "The receiver is on. remote-sim checked the entity counts and the commands in HTTP mode." \
 "Configure the receiver with 'Use HTTP connection'. Look at the entities on the Remote. Change the bass (with
-the Dirac filter off). Switch back to telnet." \
-"On the AVC-A10H the Remote shows 14 sensors, 8 selects (with the monitor output), 2 switches (tone control,
+the Dirac filter off). Then configure it again with 'Check the signal info every N seconds' set to 0 and look
+at the sensors. Then set it back to 5 and switch back to telnet." \
+"On the AVC-A10H the Remote shows 22 sensors, 8 selects (with the monitor output), 2 switches (tone control,
 Dynamic EQ) and 2 numbers (bass, treble). MultEQ and Dynamic EQ show '--' (the receiver answers them
 blank). A new bass value shows within about a second. The sound mode select lists groups such as MOVIE and
-STEREO." \
+STEREO. With 0 the HDR, pixel depth, FRL and color space sensors are gone (14 sensors); with 5 they are
+back." \
 "$LOG_PROBLEMS"
 
 step "Check the log for errors again" \

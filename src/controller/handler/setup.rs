@@ -5,7 +5,8 @@
 //! Driver setup flow: discovery, options and reconfiguration.
 
 use crate::config_store::{
-    DeviceConfig, DriverSettings, Feature, SaveWait, backup_json, parse_backup,
+    DEFAULT_SIGNAL_SECS, DeviceConfig, DriverSettings, Feature, MIN_SIGNAL_SECS, SaveWait,
+    backup_json, parse_backup,
 };
 use crate::controller::handler::AbortDriverSetup;
 use crate::controller::{Controller, operation_mode};
@@ -58,6 +59,8 @@ pub struct Found {
     is_dirac_supported: bool,
     /// `None` if the setup could not find it out.
     has_tuner: Option<bool>,
+    /// See `DeviceConfig::has_signal_check`. True if the setup could not find it out.
+    signal_check: bool,
 }
 
 impl Found {
@@ -78,6 +81,7 @@ impl Found {
             is_denon: receiver.brand != denon_marantz::Brand::Marantz,
             is_dirac_supported: detected.dirac,
             has_tuner: detected.tuner,
+            signal_check: detected.signal_check,
         }
     }
 
@@ -92,6 +96,7 @@ impl Found {
             is_denon: id.is_denon,
             is_dirac_supported: id.is_dirac_supported,
             has_tuner,
+            signal_check: signal_check(&id.info),
         }
     }
 }
@@ -108,6 +113,9 @@ struct Options {
     /// The setup could not find out if the receiver has a tuner: the field asks the user.
     tuner_unknown: bool,
     signal_poll_secs: u16,
+    /// Show the signal field. Without the check of the library it applies only to the reads over
+    /// HTTP (HTTP mode, and telnet mode while telnet is down), which are in steps of 10 s.
+    signal_check: bool,
 }
 
 impl Options {
@@ -119,7 +127,9 @@ impl Options {
             is_dirac_supported: cfg.has_dirac(),
             has_tuner: cfg.offers(Feature::Tuner),
             tuner_unknown: cfg.tuner.is_none() && cfg.has_tuner.is_none(),
-            signal_poll_secs: cfg.signal_poll_secs,
+            // A value from a backup or a changed file can be above the field limit.
+            signal_poll_secs: cfg.signal_secs().min(MAX_SIGNAL_POLL_SECS),
+            signal_check: cfg.has_signal_check(),
         }
     }
 
@@ -131,7 +141,8 @@ impl Options {
             is_dirac_supported: found.is_dirac_supported,
             has_tuner: !matches!(found.has_tuner, Some(false)),
             tuner_unknown: found.has_tuner.is_none(),
-            signal_poll_secs: 0,
+            signal_poll_secs: DEFAULT_SIGNAL_SECS,
+            signal_check: found.signal_check,
         }
     }
 
@@ -153,13 +164,17 @@ impl Options {
         if let Some(secs) = values.get("signal_poll_secs") {
             let secs = secs.trim();
             self.signal_poll_secs = if secs.is_empty() {
-                0
+                DEFAULT_SIGNAL_SECS
             } else {
                 secs.parse()
                     .ok()
-                    .filter(|s| *s <= MAX_SIGNAL_POLL_SECS)
+                    .filter(|s| {
+                        *s == 0 || (MIN_SIGNAL_SECS..=MAX_SIGNAL_POLL_SECS).contains(s)
+                    })
                     .ok_or_else(|| {
-                        format!("The signal read time must be from 0 to {MAX_SIGNAL_POLL_SECS}")
+                        format!(
+                            "The signal check time must be 0 or from {MIN_SIGNAL_SECS} to {MAX_SIGNAL_POLL_SECS}"
+                        )
                     })?
             };
         }
@@ -168,7 +183,7 @@ impl Options {
 
     /// The fields of the page, with the labels of the Python integration.
     fn fields(self) -> Vec<Value> {
-        vec![
+        let mut fields = vec![
             json!({
                 "id": "show_all_inputs",
                 "label": { "en": "Show all sources" },
@@ -223,21 +238,27 @@ impl Options {
                 } }
             }),
             json!({
-                "id": "signal_poll_secs",
-                "label": { "en": "Read the signal info every N seconds (0: no extra reads; without telnet it is read every 10 s)" },
-                "field": { "number": {
-                    "value": self.signal_poll_secs, "min": 0, "max": MAX_SIGNAL_POLL_SECS,
-                    "steps": 1, "decimals": 0, "unit": { "en": "s" }
-                } }
-            }),
-            json!({
                 "id": "info",
                 "label": { "en": "Please note:" },
                 "field": { "label": { "value": { "en":
                     "Using telnet provides realtime updates for many values but certain receivers allow a single connection only!"
                 } } }
             }),
-        ]
+        ];
+        // Without the check of the library, the field would apply only to the reads over HTTP.
+        if self.signal_check {
+            let signal = json!({
+                "id": "signal_poll_secs",
+                "label": { "en": "Check the signal info every N seconds (0: off, else 3 or more). Over HTTP (without telnet or while it is down): rounded up to steps of 10 s; without telnet 0 reads only the main signal values, not the signal web pages" },
+                "field": { "number": {
+                    "value": self.signal_poll_secs, "min": 0, "max": MAX_SIGNAL_POLL_SECS,
+                    "steps": 1, "decimals": 0, "unit": { "en": "s" }
+                } }
+            });
+            // Before the note.
+            fields.insert(fields.len() - 1, signal);
+        }
+        fields
     }
 }
 
@@ -651,7 +672,7 @@ impl Controller {
                         volume_step: old.map_or(0.5, |c| c.volume_step),
                         is_denon: options.is_denon,
                         is_dirac_supported: Some(identified.is_dirac_supported),
-                        signal_poll_secs: options.signal_poll_secs,
+                        signal_poll_secs: Some(options.signal_poll_secs),
                         receiver_type: identified.kind.receiver_type,
                         update_method: identified.kind.update_method,
                         comm_api_version: identified.kind.comm_api_version,
@@ -924,7 +945,7 @@ impl Controller {
         cfg.use_telnet = options.use_telnet;
         cfg.is_dirac_supported = Some(options.is_dirac_supported);
         cfg.tuner = Some(options.has_tuner);
-        cfg.signal_poll_secs = options.signal_poll_secs;
+        cfg.signal_poll_secs = Some(options.signal_poll_secs);
         if let Some(address) = address {
             cfg.address = address;
         }
@@ -1230,6 +1251,8 @@ struct Detected {
     dirac: bool,
     /// `None` if it could not be found out.
     tuner: Option<bool>,
+    /// See `DeviceConfig::has_signal_check`. True if it could not be found out.
+    signal_check: bool,
 }
 
 /// Ask the receiver if it supports Dirac Live and has a tuner. Without an answer: no Dirac, and
@@ -1238,6 +1261,7 @@ async fn detect(host: &str) -> Detected {
     detect_opt(host, true).await.unwrap_or(Detected {
         dirac: false,
         tuner: None,
+        signal_check: true,
     })
 }
 
@@ -1255,7 +1279,15 @@ async fn detect_opt(host: &str, ask_tuner: bool) -> Option<Detected> {
     Some(Detected {
         dirac: avr.info().dirac_live,
         tuner,
+        signal_check: signal_check(avr.info()),
     })
+}
+
+/// Telnet checks the signal itself (`CommApiVers` 0301 or higher), or the version is not known.
+/// The same rule as `DeviceConfig::has_signal_check` for the stored version: a receiver without
+/// `CommApiVers` has none, and a version that cannot be read is not known.
+fn signal_check(info: &denon_marantz::Info) -> bool {
+    discovery::receiver_kind(info).comm_api_version.is_none() || info.has_heos()
 }
 
 /// The default of the tuner option: from `Deviceinfo.xml`, else from the telnet check while the
@@ -1344,6 +1376,7 @@ mod tests {
             has_tuner: true,
             tuner_unknown: false,
             signal_poll_secs: 0,
+            signal_check: true,
         }
     }
 
@@ -1385,6 +1418,7 @@ mod tests {
                 is_denon: true,
                 is_dirac_supported: false,
                 has_tuner,
+                signal_check: true,
             };
             Options::for_found(&found)
                 .fields()
@@ -1402,6 +1436,86 @@ mod tests {
         let none = field(Some(false));
         assert_eq!("Receiver has an AM/FM tuner", none["label"]["en"]);
         assert_eq!("False", none["field"]["dropdown"]["value"]);
+    }
+
+    #[test]
+    fn the_signal_field_shows_only_with_the_check_of_the_library() {
+        let has_field = |signal_check| {
+            Options {
+                signal_check,
+                ..options()
+            }
+            .fields()
+            .iter()
+            .any(|f| f["id"] == "signal_poll_secs")
+        };
+        assert!(has_field(true));
+        assert!(!has_field(false));
+        // The note stays last.
+        let fields = options().fields();
+        assert_eq!(Some("info"), fields.last().and_then(|f| f["id"].as_str()));
+    }
+
+    #[test]
+    fn the_signal_field_comes_from_the_configuration_and_the_search() {
+        let of =
+            |json: &str| Options::of(&serde_json::from_str::<DeviceConfig>(json).expect("json"));
+        let old = of(r#"{"id":"A","name":"N","address":"h","comm_api_version":"0300"}"#);
+        assert!(!old.signal_check);
+        let low = of(r#"{"id":"A","name":"N","address":"h","signal_poll_secs":1}"#);
+        assert!(low.signal_check);
+        assert_eq!(MIN_SIGNAL_SECS, low.signal_poll_secs);
+        let high = of(r#"{"id":"A","name":"N","address":"h","signal_poll_secs":60000}"#);
+        assert_eq!(MAX_SIGNAL_POLL_SECS, high.signal_poll_secs);
+        let found = Found {
+            host: "h".into(),
+            name: "N".into(),
+            model: "M".into(),
+            serial: None,
+            mac: None,
+            is_denon: true,
+            is_dirac_supported: false,
+            has_tuner: None,
+            signal_check: false,
+        };
+        let options = Options::for_found(&found);
+        assert_eq!(DEFAULT_SIGNAL_SECS, options.signal_poll_secs);
+        assert!(!options.signal_check);
+    }
+
+    #[test]
+    fn the_search_uses_the_signal_check_rule_of_the_configuration() {
+        let check = |version: Option<&str>| {
+            let cfg: DeviceConfig =
+                serde_json::from_str(r#"{"id":"A","name":"N","address":"h"}"#).expect("json");
+            let mut info = crate::config_store::read_with_version(cfg, "0301")
+                .info
+                .expect("info");
+            info.comm_api_version = version.map(str::to_owned);
+            signal_check(&info)
+        };
+        assert!(check(Some("0301")));
+        assert!(!check(Some("0300")));
+        // A read without `CommApiVers` is an old receiver; a version that cannot be read is not
+        // known.
+        assert!(!check(None));
+        assert!(check(Some("abc")));
+    }
+
+    #[test]
+    fn the_signal_time_is_0_or_at_least_the_lowest_time() {
+        let read = |value| {
+            options()
+                .read(&values(&[("signal_poll_secs", value)]))
+                .map(|o| o.signal_poll_secs)
+        };
+        assert_eq!(Ok(0), read("0"));
+        assert_eq!(Ok(MIN_SIGNAL_SECS), read(" 3 "));
+        assert_eq!(Ok(DEFAULT_SIGNAL_SECS), read(""));
+        assert_eq!(Ok(MAX_SIGNAL_POLL_SECS), read("3600"));
+        for value in ["1", "2", "3601"] {
+            assert!(read(value).is_err(), "{value}");
+        }
     }
 
     #[test]

@@ -382,7 +382,7 @@ pub(crate) mod tests {
             timeout: 2000,
             is_denon: true,
             is_dirac_supported: Some(dirac),
-            signal_poll_secs: 0,
+            signal_poll_secs: None,
             receiver_type: None,
             update_method: None,
             comm_api_version: None,
@@ -528,11 +528,11 @@ pub(crate) mod tests {
         assert_eq!(app_command.len() + signal.len(), read.len(), "{read:?}");
         assert!(app_command.iter().chain(&signal).all(|k| read.contains(k)));
 
-        // The poll reads the signal pages, also without the signal timer. The status pages have no
-        // dimmer and no Audyssey values.
+        // The default signal time reads the signal pages, like a set time. The status pages have
+        // no dimmer and no Audyssey values.
         let pages = http_read(UpdateMethod::StatusPages, None);
         let timer = DeviceConfig {
-            signal_poll_secs: 10,
+            signal_poll_secs: Some(10),
             ..pages.clone()
         };
         let read_pages = extra(&pages);
@@ -656,6 +656,34 @@ pub(crate) mod tests {
             ],
             added
         );
+    }
+
+    #[test]
+    fn a_signal_time_of_0_leaves_out_the_sensors_of_the_video_signal_page() {
+        use denon_marantz::UpdateMethod;
+        let read = extra(&http_read(UpdateMethod::AppCommand, None));
+        let no_pages = extra(&DeviceConfig {
+            signal_poll_secs: Some(0),
+            ..http_read(UpdateMethod::AppCommand, None)
+        });
+        let video_page = [
+            SensorKind::HdrInput,
+            SensorKind::HdrOutput,
+            SensorKind::PixelDepthInput,
+            SensorKind::PixelDepthOutput,
+            SensorKind::MaxFrlInput,
+            SensorKind::MaxFrlOutput,
+            SensorKind::ColorspaceInput,
+            SensorKind::ColorspaceOutput,
+        ]
+        .map(EntityKind::Sensor);
+        let expected: Vec<EntityKind> = read
+            .iter()
+            .copied()
+            .filter(|k| !video_page.contains(k))
+            .collect();
+        assert_eq!(read.len() - video_page.len(), expected.len());
+        assert_eq!(expected, no_pages);
     }
 
     #[test]

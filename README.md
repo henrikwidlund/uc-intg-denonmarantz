@@ -120,8 +120,10 @@ Commands with a number are sent as raw text with the remote entity:
 - The receiver is read in a fraction of a second after the Remote wakes up. The values of telnet and the web
   pages follow in the background.
 - With telnet, values come from the receiver as events. Receivers from about 2016 and later are also asked for
-  the signal info every 5 seconds while they are on, because they do not report every change. The setup has an
-  option to read all signal info every N seconds, for older receivers.
+  the signal info every 5 seconds while they are on, because they do not report every change. The setup option
+  for the signal check sets this time; 0 turns the check off. While telnet is down, the signal is read over HTTP
+  at this time, rounded up to a step of 10 seconds. Older receivers have no such check, and the setup
+  does not show the option for them.
 - Entities keep their state while the Remote sleeps.
 - Only receivers with entities in use are connected. The Python integration connects all of them.
 
@@ -167,7 +169,10 @@ Commands with a number are sent as raw text with the remote entity:
   Receivers with the older HTTP interface have no dimmer, reference level and dynamic volume. Receivers that
   list their values but not the Audyssey values have no reference level and dynamic volume. The sensors of
   the signal web pages come too, for example HDR and color space, if the receiver has the pages. The signal
-  info is read every 10 seconds; set the signal read option only to read it more often. The sound mode
+  info is read at the time of the signal check option, rounded up to a step of 10 seconds. With 0, only
+  `AppCommand0300` is read every 10 seconds, on receivers that use it (Audyssey, HDMI output, audio signal,
+  sampling rate, HDMI signal and channels); the sensors of the signal web pages are not shown. Older receivers
+  do not show the option: they use 5, or the stored value. The sound mode
   select offers the sound mode groups, for example `MOVIE`. While the receiver is busy, mostly in the first
   seconds after a connect, a changed dimmer or eco mode can take up to 10 seconds to show.
 

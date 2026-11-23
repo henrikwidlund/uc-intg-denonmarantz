@@ -24,11 +24,20 @@ use tokio::sync::oneshot;
 const CONFIG_FILE: &str = "config.json";
 const SETTINGS_FILE: &str = "settings.json";
 
-/// The `Avr` methods that the HTTP poll calls in HTTP mode: `update` and
-/// `refresh_signal_pages` (it also does the read of `update_signal_and_settings`).
+/// The `Avr` methods that the HTTP mode calls on its timers: `update`, and
+/// `refresh_signal_pages` (it also does the read of `update_signal_and_settings`). With a signal
+/// time of 0, `update_signal_and_settings` comes in place of `refresh_signal_pages`.
 const POLL_READS: HttpReads = HttpReads::UPDATE
     .union(HttpReads::SIGNAL_AND_SETTINGS)
     .union(HttpReads::SIGNAL_PAGES);
+
+/// `POLL_READS` with a signal time of 0.
+const POLL_READS_NO_PAGES: HttpReads = HttpReads::UPDATE.union(HttpReads::SIGNAL_AND_SETTINGS);
+
+/// Signal time without a value in the configuration.
+pub const DEFAULT_SIGNAL_SECS: u16 = 5;
+/// Lowest signal time above 0: the library check must be above its answer wait of 2 s.
+pub const MIN_SIGNAL_SECS: u16 = 3;
 
 /// What an entity gets in HTTP mode before the receiver is read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,13 +109,10 @@ pub struct DeviceConfig {
     pub is_denon: bool,
     #[serde(default)]
     pub is_dirac_supported: Option<bool>,
-    /// Seconds between signal reads. 0 turns the timer off.
-    #[serde(
-        default,
-        skip_serializing_if = "is_zero",
-        deserialize_with = "zero_if_null"
-    )]
-    pub signal_poll_secs: u16,
+    /// Seconds between signal checks. `None`: `DEFAULT_SIGNAL_SECS`. Use `signal_secs` to read or
+    /// compare it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_poll_secs: Option<u16>,
     /// The receiver generation. It is found at the setup and checked at each connect.
     #[serde(
         default,
@@ -349,8 +355,36 @@ impl DeviceConfig {
                 .as_ref()
                 .map_or(before_read == BeforeRead::Shown, |info| {
                     info.http_reads_without(query, self.missing)
-                        .intersects(POLL_READS)
+                        .intersects(self.poll_reads())
                 })
+    }
+
+    /// The reads of the HTTP mode, see `POLL_READS`.
+    const fn poll_reads(&self) -> HttpReads {
+        if self.signal_secs() == 0 {
+            POLL_READS_NO_PAGES
+        } else {
+            POLL_READS
+        }
+    }
+
+    /// Seconds between signal checks. 0: off. A value of 1 or 2 counts as `MIN_SIGNAL_SECS`.
+    /// Telnet checks the signal itself on receivers with `CommApiVers` 0301 or higher. The
+    /// reads over HTTP are in steps of 10 s; there 0 reads only `AppCommand0300`, not the
+    /// signal pages.
+    pub const fn signal_secs(&self) -> u16 {
+        match self.signal_poll_secs {
+            None => DEFAULT_SIGNAL_SECS,
+            Some(0) => 0,
+            Some(secs) if secs < MIN_SIGNAL_SECS => MIN_SIGNAL_SECS,
+            Some(secs) => secs,
+        }
+    }
+
+    /// Telnet checks the signal itself (`CommApiVers` 0301 or higher), or the version is not
+    /// known yet.
+    pub fn has_signal_check(&self) -> bool {
+        self.heos().unwrap_or(true)
     }
 
     /// The receiver has a HEOS player.
@@ -571,10 +605,6 @@ fn timeout_if_null<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     Ok(Option::<u32>::deserialize(d)?.unwrap_or_else(default_timeout))
 }
 
-fn zero_if_null<'de, D: Deserializer<'de>>(d: D) -> Result<u16, D::Error> {
-    Ok(Option::<u16>::deserialize(d)?.unwrap_or(0))
-}
-
 const fn default_true() -> bool {
     true
 }
@@ -585,11 +615,6 @@ const fn default_volume_step() -> f32 {
 
 const fn default_timeout() -> u32 {
     2000
-}
-
-#[allow(clippy::trivially_copy_pass_by_ref)] // The signature that serde needs.
-const fn is_zero(v: &u16) -> bool {
-    *v == 0
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // The signature that serde needs.
@@ -994,7 +1019,7 @@ mod tests {
             timeout: 2000,
             is_denon: false,
             is_dirac_supported: Some(true),
-            signal_poll_secs: 10,
+            signal_poll_secs: Some(10),
             receiver_type: None,
             update_method: None,
             comm_api_version: None,
@@ -1019,7 +1044,10 @@ mod tests {
         assert_eq!("SERIAL0000001", d.key());
         assert_eq!("192.0.2.6", d.address);
         assert!(d.use_telnet && d.is_denon && d.has_dirac());
-        assert_eq!(0, d.signal_poll_secs);
+        assert_eq!(
+            (None, DEFAULT_SIGNAL_SECS),
+            (d.signal_poll_secs, d.signal_secs())
+        );
         // The driver writes the same fields, so the Python integration can read the file.
         let text = serde_json::to_string(&devices).expect("json");
         let python: serde_json::Value = serde_json::from_str(PYTHON_CONFIG).expect("json");
@@ -1330,6 +1358,46 @@ mod tests {
     }
 
     #[test]
+    fn the_signal_time_has_a_default_and_a_lowest_value() {
+        let secs = |value| {
+            DeviceConfig {
+                signal_poll_secs: value,
+                ..device()
+            }
+            .signal_secs()
+        };
+        assert_eq!(DEFAULT_SIGNAL_SECS, secs(None));
+        assert_eq!(0, secs(Some(0)));
+        assert_eq!(MIN_SIGNAL_SECS, secs(Some(1)));
+        assert_eq!(MIN_SIGNAL_SECS, secs(Some(2)));
+        assert_eq!(MIN_SIGNAL_SECS, secs(Some(MIN_SIGNAL_SECS)));
+        assert_eq!(60, secs(Some(60)));
+        // 0 is written: it differs from the default.
+        let text = serde_json::to_string(&DeviceConfig {
+            signal_poll_secs: Some(0),
+            ..device()
+        })
+        .expect("json");
+        assert!(text.contains(r#""signal_poll_secs":0"#));
+    }
+
+    #[test]
+    fn only_receivers_from_0301_have_the_signal_check() {
+        let check = |version: Option<&str>| {
+            DeviceConfig {
+                comm_api_version: version.and_then(CommApiVersion::parse),
+                ..device()
+            }
+            .has_signal_check()
+        };
+        assert!(check(None));
+        assert!(check(Some("0301")));
+        assert!(!check(Some("0300")));
+        assert!(!read_with_version(device(), "0300").has_signal_check());
+        assert!(read_with_version(device(), "0301").has_signal_check());
+    }
+
+    #[test]
     fn null_fields_get_the_defaults_like_in_the_python_integration() {
         let text = r#"{"id":"A","name":"C","address":"h","support_sound_mode":null,
             "show_all_inputs":null,"use_telnet":null,"update_audyssey":null,"zone2":null,
@@ -1339,7 +1407,7 @@ mod tests {
         assert!(d.support_sound_mode && d.use_telnet && d.is_denon);
         assert!(!d.show_all_inputs && !d.update_audyssey && !d.zone2 && !d.zone3);
         assert!((d.volume_step - 0.5).abs() < f32::EPSILON);
-        assert_eq!((2000, 0), (d.timeout, d.signal_poll_secs));
+        assert_eq!((2000, None), (d.timeout, d.signal_poll_secs));
         assert!(!d.has_dirac());
     }
 
