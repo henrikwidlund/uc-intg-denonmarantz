@@ -366,7 +366,9 @@ impl Controller {
             params: command.params,
         });
         Box::pin(async move {
-            request.await.unwrap_or_else(|e| Err(e.into()))?;
+            request
+                .await
+                .unwrap_or_else(|e| Err(ServiceError::from_device_mailbox(e)))?;
             Ok(Some(WsMessage::response(
                 req_id,
                 "result",

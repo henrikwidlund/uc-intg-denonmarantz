@@ -1529,72 +1529,18 @@ mod tests {
     }
 
     mod flow {
-        use crate::config_store::{DriverSettings, backup_json};
-        use crate::configuration::{HeartbeatSettings, Settings};
+        use crate::config_store::backup_json;
         use crate::controller::handler::setup::{SetDriverUserDataMsg, SetupDriverMsg};
-        use crate::controller::{
-            Controller, NewR2Session, R2RequestMsg, R2SessionDisconnect, SendWsMessage,
+        use crate::controller::test_util::{
+            DeviceAddr, Subscribed, TestRemote, config_file, connect, controller, use_closed_port,
+            wait_stopped,
         };
-        use actix::{Actor, Addr, Context, Handler};
+        use crate::controller::{Controller, R2RequestMsg, R2SessionDisconnect};
+        use actix::Addr;
         use serde_json::{Value, json};
-        use std::sync::{Arc, Mutex};
         use std::time::Duration;
         use uc_api::intg::IntegrationSetup;
         use uc_api::intg::ws::R2Request;
-
-        /// Collects the events sent to a Remote.
-        struct Remote(Arc<Mutex<Vec<Value>>>);
-
-        impl Actor for Remote {
-            type Context = Context<Self>;
-        }
-
-        impl Handler<SendWsMessage> for Remote {
-            type Result = ();
-            fn handle(&mut self, msg: SendWsMessage, _: &mut Context<Self>) {
-                let SendWsMessage::Msg(msg) = msg else { return };
-                if let (Some("driver_setup_change"), Some(data)) =
-                    (msg.msg.as_deref(), msg.msg_data)
-                    && let Ok(mut events) = self.0.lock()
-                {
-                    events.push(data);
-                }
-            }
-        }
-
-        /// A controller with a new configuration folder. `config` is written to `config.json`.
-        fn controller(name: &str, config: Option<&str>) -> Addr<Controller> {
-            let dir = std::env::temp_dir().join(format!(
-                "uc-intg-denonmarantz-{name}-{}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("dir");
-            if let Some(config) = config {
-                std::fs::write(dir.join("config.json"), config).expect("config");
-            }
-            let settings = Settings {
-                interface: "127.0.0.1".into(),
-                http_port: 0,
-                config_home: dir,
-                heartbeat: HeartbeatSettings::default(),
-            };
-            let metadata = serde_json::from_value(json!({})).expect("metadata");
-            Controller::new(settings, DriverSettings::default(), metadata).start()
-        }
-
-        async fn connect(controller: &Addr<Controller>, id: &str) -> Arc<Mutex<Vec<Value>>> {
-            let events = Arc::default();
-            let addr = Remote(Arc::clone(&events)).start();
-            controller
-                .send(NewR2Session {
-                    addr: addr.recipient(),
-                    id: id.into(),
-                })
-                .await
-                .expect("send");
-            events
-        }
 
         fn values(ws_id: &str, values: &[(&str, &str)]) -> SetDriverUserDataMsg {
             let values = values
@@ -1617,22 +1563,18 @@ mod tests {
             }
         }
 
-        fn last(events: &Mutex<Vec<Value>>) -> Value {
-            events
-                .lock()
-                .expect("lock")
-                .last()
-                .cloned()
-                .unwrap_or_default()
+        /// The last setup event.
+        fn last(events: &TestRemote) -> Value {
+            events.last("driver_setup_change")
         }
 
-        async fn settle() {
+        async fn pause() {
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
 
         /// Wait until the last event has this setup state. The configuration is saved off the
-        /// actix thread, so the end of a setup can take longer than [`settle`] on a slow machine.
-        async fn wait_state(events: &Mutex<Vec<Value>>, state: &str) {
+        /// actix thread, so the end of a setup can take longer than [`pause`] on a slow machine.
+        async fn wait_state(events: &TestRemote, state: &str) {
             let end = std::time::Instant::now() + Duration::from_secs(5);
             while last(events)["state"] != state {
                 assert!(
@@ -1668,23 +1610,18 @@ mod tests {
                 .collect()
         }
 
-        /// Send a request and give its response.
+        /// Send a request of the Remote `a` and give its response.
         async fn request(
             controller: &Addr<Controller>,
             request: R2Request,
             msg_data: Option<Value>,
         ) -> Result<Option<uc_api::ws::WsMessage>, crate::errors::ServiceError> {
-            let msg = R2RequestMsg {
-                ws_id: "a".into(),
-                req_id: 1,
-                request,
-                msg_data,
-            };
-            controller.send(msg).await.expect("send")
+            crate::controller::test_util::request(controller, "a", request, msg_data).await
         }
 
         #[actix::test]
         async fn entity_requests_work_during_a_setup() {
+            use_closed_port();
             let controller = controller("requests-in-setup", Some(PYTHON_CONFIG));
             connect(&controller, "a").await;
             controller
@@ -1692,12 +1629,13 @@ mod tests {
                 .await
                 .expect("send")
                 .expect("setup started");
-            settle().await;
+            pause().await;
             assert_eq!(71, entity_ids(&controller).await.len());
         }
 
         #[actix::test]
         async fn an_aborted_first_setup_keeps_the_receivers() {
+            use_closed_port();
             let controller = controller("abort-first-setup", Some(PYTHON_CONFIG));
             connect(&controller, "a").await;
             controller
@@ -1705,7 +1643,7 @@ mod tests {
                 .await
                 .expect("send")
                 .expect("setup started");
-            settle().await;
+            pause().await;
             controller
                 .send(crate::controller::handler::AbortDriverSetup {
                     ws_id: "a".into(),
@@ -1713,12 +1651,13 @@ mod tests {
                 })
                 .await
                 .expect("send");
-            settle().await;
+            pause().await;
             assert_eq!(71, entity_ids(&controller).await.len());
         }
 
         #[actix::test]
         async fn the_filter_gives_only_one_entity_type() {
+            use_closed_port();
             let controller = controller("filter", Some(PYTHON_CONFIG));
             connect(&controller, "a").await;
             let filter = json!({ "filter": { "entity_type": "media_player" } });
@@ -1734,24 +1673,9 @@ mod tests {
             );
         }
 
-        /// Reads the subscriptions of a Remote in the controller.
-        struct Subscribed(&'static str);
-
-        impl actix::Message for Subscribed {
-            type Result = usize;
-        }
-
-        impl Handler<Subscribed> for Controller {
-            type Result = usize;
-            fn handle(&mut self, msg: Subscribed, _: &mut Context<Self>) -> usize {
-                self.sessions
-                    .get(msg.0)
-                    .map_or(0, |s| s.subscribed_entities.len())
-            }
-        }
-
         #[actix::test]
         async fn subscribe_and_unsubscribe_without_ids_mean_all_entities() {
+            use_closed_port();
             let controller = controller("subscribe-all", Some(PYTHON_CONFIG));
             connect(&controller, "a").await;
             request(&controller, R2Request::SubscribeEvents, Some(json!({})))
@@ -1767,6 +1691,7 @@ mod tests {
 
         #[actix::test]
         async fn a_python_configuration_gives_the_python_entities() {
+            use_closed_port();
             let controller = controller("python-config", Some(PYTHON_CONFIG));
             connect(&controller, "a").await;
             let ids = entity_ids(&controller).await;
@@ -1795,7 +1720,7 @@ mod tests {
                 .await
                 .expect("send")
                 .expect("setup started");
-            settle().await;
+            pause().await;
             assert_eq!(json!("WAIT_USER_ACTION"), last(&events)["state"]);
             assert_eq!(
                 json!("restore_from_backup"),
@@ -1817,7 +1742,7 @@ mod tests {
                 .await
                 .expect("send")
                 .expect("ok");
-            settle().await;
+            pause().await;
             assert_eq!(
                 json!("address"),
                 last(&events)["require_user_action"]["input"]["settings"][1]["id"]
@@ -1829,7 +1754,7 @@ mod tests {
                 .await
                 .expect("send")
                 .expect("ok");
-            settle().await;
+            pause().await;
             let event = last(&events);
             assert_eq!(json!("WAIT_USER_ACTION"), event["state"]);
             assert_eq!(json!("INVALID_INPUT"), event["error"]);
@@ -1863,14 +1788,14 @@ mod tests {
                 .await
                 .expect("send")
                 .expect("setup started");
-            settle().await;
+            pause().await;
 
             controller
                 .send(values("a", &[("restore_from_backup", "true")]))
                 .await
                 .expect("send")
                 .expect("ok");
-            settle().await;
+            pause().await;
             assert_eq!(
                 json!("restore_data"),
                 last(&events)["require_user_action"]["input"]["settings"][1]["id"]
@@ -1881,7 +1806,7 @@ mod tests {
                 .await
                 .expect("send")
                 .expect("ok");
-            settle().await;
+            pause().await;
             let event = last(&events);
             assert_eq!(json!("INVALID_INPUT"), event["error"]);
             assert!(!event.to_string().contains("secret-not-a-backup"));
@@ -1893,6 +1818,7 @@ mod tests {
 
         #[actix::test]
         async fn restore_replaces_the_receivers() {
+            use_closed_port();
             let controller = controller("restore-valid", None);
             let events = connect(&controller, "a").await;
             let devices: Vec<crate::config_store::DeviceConfig> =
@@ -1903,13 +1829,13 @@ mod tests {
                 .await
                 .expect("send")
                 .expect("setup started");
-            settle().await;
+            pause().await;
             controller
                 .send(values("a", &[("restore_from_backup", "true")]))
                 .await
                 .expect("send")
                 .expect("ok");
-            settle().await;
+            pause().await;
             controller
                 .send(values("a", &[("restore_data", &backup)]))
                 .await
@@ -1919,42 +1845,24 @@ mod tests {
             assert_eq!(71, entity_ids(&controller).await.len());
         }
 
-        /// The states that a Remote gets when it asks for them.
+        /// The states that the Remote `a` gets when it asks for them.
         async fn entity_states(controller: &Addr<Controller>) -> Vec<String> {
-            let msg = R2RequestMsg {
-                ws_id: "a".into(),
-                req_id: 2,
-                request: R2Request::GetEntityStates,
-                msg_data: None,
-            };
-            let response = controller
-                .send(msg)
-                .await
-                .expect("send")
-                .expect("ok")
-                .expect("response");
-            response
-                .msg_data
-                .expect("data")
-                .as_array()
-                .expect("list")
-                .iter()
-                .filter_map(|e| e["entity_id"].as_str().map(str::to_owned))
-                .collect()
+            crate::controller::test_util::entity_states(controller, "a").await
         }
 
         #[actix::test]
         async fn entities_that_go_away_are_forgotten() {
+            use_closed_port();
             let controller = controller("purge", Some(PYTHON_CONFIG));
             let events = connect(&controller, "a").await;
-            settle().await;
+            pause().await;
             assert_eq!(71, entity_states(&controller).await.len());
             controller
                 .send(start_setup("a", true))
                 .await
                 .expect("send")
                 .expect("setup started");
-            settle().await;
+            pause().await;
             controller
                 .send(values(
                     "a",
@@ -1963,9 +1871,9 @@ mod tests {
                 .await
                 .expect("send")
                 .expect("ok");
-            // The page comes after the check for Dirac, which waits for an address that does not
-            // answer.
-            tokio::time::sleep(Duration::from_millis(2500)).await;
+            // The page comes after the Dirac question. Nothing answers it, so the page shows the
+            // saved values.
+            wait_page(&events, "connection_mode").await;
             // A configuration without the receiver type, HTTP only: the media player, the remote,
             // 6 selects and 7 sensors.
             controller
@@ -1980,48 +1888,18 @@ mod tests {
             assert_eq!(15, entity_states(&controller).await.len());
         }
 
-        /// Collects the `entity_change` events sent to a Remote.
-        struct Changes(Arc<Mutex<Vec<String>>>);
-
-        impl Actor for Changes {
-            type Context = Context<Self>;
-        }
-
-        impl Handler<SendWsMessage> for Changes {
-            type Result = ();
-            fn handle(&mut self, msg: SendWsMessage, _: &mut Context<Self>) {
-                if let SendWsMessage::Text(text) = msg
-                    && text.contains(r#""msg":"entity_change""#)
-                    && let Ok(mut changes) = self.0.lock()
-                {
-                    changes.push(text.to_string());
-                }
+        /// Wait until the last setup event is a page with the field `id`.
+        async fn wait_page(events: &TestRemote, id: &str) {
+            let end = std::time::Instant::now() + Duration::from_secs(5);
+            let has_field = |event: &Value| {
+                event["require_user_action"]["input"]["settings"]
+                    .as_array()
+                    .is_some_and(|fields| fields.iter().any(|f| f["id"] == id))
+            };
+            while !has_field(&last(events)) {
+                assert!(std::time::Instant::now() < end, "no page with {id}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        }
-
-        async fn connect_changes(
-            controller: &Addr<Controller>,
-            id: &str,
-        ) -> Arc<Mutex<Vec<String>>> {
-            let changes = Arc::default();
-            let addr = Changes(Arc::clone(&changes)).start();
-            controller
-                .send(NewR2Session {
-                    addr: addr.recipient(),
-                    id: id.into(),
-                })
-                .await
-                .expect("send");
-            changes
-        }
-
-        fn count(changes: &Mutex<Vec<String>>, part: &str) -> usize {
-            changes
-                .lock()
-                .expect("lock")
-                .iter()
-                .filter(|c| c.contains(part))
-                .count()
         }
 
         async fn subscribe(controller: &Addr<Controller>, ws_id: &str, ids: &[String]) {
@@ -2036,32 +1914,39 @@ mod tests {
 
         #[actix::test]
         async fn a_new_session_gets_the_states_only_with_get_entity_states() {
+            use_closed_port();
             let controller = controller("subscribe", Some(PYTHON_CONFIG));
-            let changes = connect_changes(&controller, "a").await;
-            settle().await;
+            let changes = connect(&controller, "a").await;
+            pause().await;
             let (rest, first): (Vec<String>, Vec<String>) = entity_ids(&controller)
                 .await
                 .into_iter()
                 .partition(|id| id.starts_with("media_player."));
             // The start of a session: one event per entity can fill the event queue of the Remote.
             subscribe(&controller, "a", &first).await;
-            assert_eq!(0, count(&changes, ""));
+            assert_eq!(0, changes.filter("entity_change").len());
             assert_eq!(first.len(), entity_states(&controller).await.len());
             // An entity that is added later gets its state at once.
             subscribe(&controller, "a", &rest).await;
-            assert_eq!(1, count(&changes, ""));
+            assert_eq!(1, changes.filter("entity_change").len());
         }
 
         #[actix::test]
         async fn a_receiver_can_be_removed() {
+            use_closed_port();
             let controller = controller("remove", Some(PYTHON_CONFIG));
             let events = connect(&controller, "a").await;
+            let actor = controller
+                .send(DeviceAddr("SERIAL0000001"))
+                .await
+                .expect("send")
+                .expect("actor");
             controller
                 .send(start_setup("a", true))
                 .await
                 .expect("send")
                 .expect("setup started");
-            settle().await;
+            pause().await;
             // The page lists the receiver with its serial number.
             assert_eq!(
                 json!("SERIAL0000001"),
@@ -2077,6 +1962,8 @@ mod tests {
                 .expect("ok");
             wait_state(&events, "OK").await;
             assert_eq!(0, entity_ids(&controller).await.len());
+            wait_stopped(&controller, &actor).await;
+            assert_eq!(json!([]), config_file("remove"));
         }
 
         /// The address of the fake receiver in the setup.
@@ -2087,29 +1974,28 @@ mod tests {
             fake_receiver_from(crate::test_support::Fake::start(true).await)
         }
 
+        /// All receivers on this thread use the fake receiver, also the configured ones. The search
+        /// finds nothing.
         fn fake_receiver_from(http: crate::test_support::Fake) -> crate::test_support::Fake {
             let port = http.port();
-            let setup: crate::device::discovery::TestBuilder =
-                std::rc::Rc::new(move |_, builder| {
-                    crate::test_support::test_builder(port, 1, builder)
-                });
+            let setup: crate::device::discovery::TestBuilder = std::rc::Rc::new(move |_, _| {
+                crate::test_support::test_builder(port, 1, denon_marantz::Avr::builder(FAKE_HOST))
+            });
             crate::device::discovery::TEST_BUILDER.with(|slot| *slot.borrow_mut() = Some(setup));
+            crate::device::discovery::TEST_DISCOVERY
+                .with(|slot| *slot.borrow_mut() = Some(Vec::new()));
             http
         }
 
         /// Start the setup and give the address of the fake receiver. `reconfigure` keeps the
         /// configured receivers.
-        async fn setup_fake(
-            controller: &Addr<Controller>,
-            events: &Mutex<Vec<Value>>,
-            reconfigure: bool,
-        ) {
+        async fn setup_fake(controller: &Addr<Controller>, events: &TestRemote, reconfigure: bool) {
             controller
                 .send(start_setup("a", reconfigure))
                 .await
                 .expect("send")
                 .expect("setup started");
-            settle().await;
+            pause().await;
             let first = if reconfigure {
                 ("action", "add")
             } else {
@@ -2120,7 +2006,7 @@ mod tests {
                 .await
                 .expect("send")
                 .expect("ok");
-            settle().await;
+            pause().await;
             controller
                 .send(values("a", &[("address", FAKE_HOST)]))
                 .await
@@ -2134,15 +2020,6 @@ mod tests {
                 assert!(std::time::Instant::now() < end, "no answer to the address");
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        }
-
-        fn config_file(name: &str) -> Value {
-            let dir = std::env::temp_dir().join(format!(
-                "uc-intg-denonmarantz-{name}-{}",
-                std::process::id()
-            ));
-            let text = std::fs::read_to_string(dir.join("config.json")).expect("config.json");
-            serde_json::from_str(&text).expect("json")
         }
 
         #[actix::test]
@@ -2258,7 +2135,7 @@ mod tests {
         }
 
         /// Choose the fake receiver in HTTP mode and wait for the end of the setup.
-        async fn choose_fake(controller: &Addr<Controller>, events: &Mutex<Vec<Value>>) {
+        async fn choose_fake(controller: &Addr<Controller>, events: &TestRemote) {
             controller
                 .send(values(
                     "a",

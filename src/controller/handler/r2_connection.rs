@@ -5,8 +5,9 @@
 //! Handlers for Remote connection messages.
 
 use crate::controller::{Controller, NewR2Session, R2Session, R2SessionDisconnect, SendWsMessage};
+use actix::prelude::SendError;
 use actix::{Context, Handler};
-use log::{error, info};
+use log::{debug, error, info};
 use uc_api::ws::WsMessage;
 
 impl Handler<NewR2Session> for Controller {
@@ -16,8 +17,15 @@ impl Handler<NewR2Session> for Controller {
         let mut session = R2Session::new(msg.addr);
         // Get the version information of the Remote for the log.
         let request = WsMessage::simple_request(session.new_msg_id(), "get_version");
-        if let Err(e) = session.recipient.try_send(SendWsMessage::Msg(request)) {
-            error!("[{}] Error sending get_version: {e}", msg.id);
+        match session.recipient.try_send(SendWsMessage::Msg(request)) {
+            Ok(()) => {}
+            // The sender of the Remote stopped, for example after a disconnect.
+            Err(SendError::Closed(_)) => {
+                debug!("[{}] Remote sender stopped, get_version dropped", msg.id);
+            }
+            Err(SendError::Full(_)) => {
+                error!("[{}] Remote queue full, get_version dropped", msg.id);
+            }
         }
         info!("[{}] Remote connected", msg.id);
         self.sessions.insert(msg.id.clone(), session);

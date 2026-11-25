@@ -13,6 +13,8 @@ pub mod discovery;
 pub mod heos;
 
 pub use actor::DenonActor;
+#[cfg(test)]
+pub use actor::Wants;
 
 use crate::config_store::DeviceConfig;
 use crate::entities::EntityKind;

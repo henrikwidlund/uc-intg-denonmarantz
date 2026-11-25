@@ -7,6 +7,10 @@
 mod devices;
 mod handler;
 mod messages;
+#[cfg(test)]
+pub(crate) mod test_util;
+#[cfg(test)]
+mod tests;
 
 pub(crate) use handler::driver_version;
 pub use messages::*;
@@ -17,7 +21,7 @@ use crate::controller::devices::Device;
 use crate::controller::handler::{AbortDriverSetup, SetupState};
 use crate::entities::EntityKind;
 use crate::errors::ServiceError;
-use actix::prelude::{Actor, Context, Recipient};
+use actix::prelude::{Actor, Context, Recipient, SendError};
 use actix::{AsyncContext, SpawnHandle};
 use log::{debug, error, info, warn};
 use rust_fsm::state_machine;
@@ -185,8 +189,15 @@ impl Controller {
                 }
                 return;
             }
-            if let Err(e) = session.recipient.try_send(message) {
-                error!("[{ws_id}] Internal message send error: {e}");
+            match session.recipient.try_send(message) {
+                Ok(()) => {}
+                // The sender of the Remote stopped, for example after a disconnect.
+                Err(SendError::Closed(_)) => {
+                    debug!("[{ws_id}] Remote sender stopped, message dropped");
+                }
+                Err(SendError::Full(_)) => {
+                    error!("[{ws_id}] Remote queue full, message dropped");
+                }
             }
         } else {
             warn!("Attempting to send message but couldn't find session: {ws_id}");

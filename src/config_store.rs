@@ -705,6 +705,12 @@ impl ConfigStore {
         }
     }
 
+    /// Wait until all queued writes are done. For tests.
+    #[cfg(test)]
+    pub(crate) fn flush(&self) {
+        self.writer.flush();
+    }
+
     /// Load the configured devices. A missing file gives an empty list.
     ///
     /// A broken file is moved to `config.json.bad-<unix time>`, so the next save does not

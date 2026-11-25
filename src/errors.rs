@@ -55,8 +55,19 @@ impl From<std::io::Error> for ServiceError {
     }
 }
 
+/// For a message to a receiver actor, use [`ServiceError::from_device_mailbox`].
 impl From<MailboxError> for ServiceError {
     fn from(e: MailboxError) -> Self {
+        match e {
+            MailboxError::Closed => Self::InternalServerError("Internal message error".into()),
+            MailboxError::Timeout => Self::Timeout,
+        }
+    }
+}
+
+impl ServiceError {
+    /// Error for a message to a receiver actor that was not handled.
+    pub fn from_device_mailbox(e: MailboxError) -> Self {
         match e {
             // The receiver actor was stopped, for example because the receiver was removed.
             MailboxError::Closed => Self::NotFound("The receiver is not configured".into()),
@@ -140,9 +151,21 @@ mod tests {
 
     #[test]
     fn a_stopped_receiver_is_not_found() {
+        assert_eq!(
+            ServiceError::NotFound("The receiver is not configured".into()),
+            ServiceError::from_device_mailbox(MailboxError::Closed)
+        );
+        assert_eq!(
+            ServiceError::Timeout,
+            ServiceError::from_device_mailbox(MailboxError::Timeout)
+        );
+    }
+
+    #[test]
+    fn a_stopped_controller_is_an_internal_error() {
         assert!(matches!(
             ServiceError::from(MailboxError::Closed),
-            ServiceError::NotFound(_)
+            ServiceError::InternalServerError(_)
         ));
         assert_eq!(
             ServiceError::Timeout,

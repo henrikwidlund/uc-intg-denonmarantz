@@ -7,10 +7,9 @@ use crate::config_store::{self, DeviceConfig, Feature};
 use denon_marantz::proto::source::playing_kind;
 use denon_marantz::proto::{NetworkAudioCommand, PlayingKind, Power};
 use denon_marantz::{
-    Ask, Avr, AvrBuilder, Brand, Command, DiscoveredReceiver, DiscoveryConfig, Error, HttpConfig,
-    Info, InfoCheck, MissingSources, PageStatus, Query, ReceiverType, SpecFeature, StartOptions,
-    StartReport, Started, State, TelnetConfig, TelnetSync, TunerInfo, UpdateMethod, Zone,
-    discover_all,
+    Ask, Avr, AvrBuilder, Brand, Command, DiscoveredReceiver, Error, HttpConfig, Info, InfoCheck,
+    MissingSources, PageStatus, Query, ReceiverType, SpecFeature, StartOptions, StartReport,
+    Started, State, TelnetConfig, TelnetSync, TunerInfo, UpdateMethod, Zone,
 };
 use log::debug;
 use std::borrow::Cow;
@@ -43,12 +42,18 @@ pub(crate) const NETWORK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 pub const NETWORK_RETRY_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Discover all receivers. Takes about 3 seconds.
+#[cfg(not(test))]
 pub async fn discover() -> Result<Vec<DiscoveredReceiver>, Error> {
-    #[cfg(test)]
-    if let Some(found) = TEST_DISCOVERY.with(|slot| slot.borrow().clone()) {
-        return Ok(found);
-    }
-    discover_all(&DiscoveryConfig::default()).await
+    denon_marantz::discover_all(&denon_marantz::DiscoveryConfig::default()).await
+}
+
+/// Tests never search the network: they get [`TEST_DISCOVERY`], or no receivers.
+#[cfg(test)]
+#[expect(clippy::unused_async, reason = "same signature as the search")]
+pub async fn discover() -> Result<Vec<DiscoveredReceiver>, Error> {
+    Ok(TEST_DISCOVERY
+        .with(|slot| slot.borrow().clone())
+        .unwrap_or_default())
 }
 
 /// Find the receiver of a configuration in the discovered ones, by its MAC address or serial

@@ -141,6 +141,24 @@ pub struct CurrentAvr;
 #[rtype(result = "bool")]
 pub struct Refreshing;
 
+/// Asks for [`WantState`], for the tests.
+#[cfg(test)]
+#[derive(Message)]
+#[rtype(result = "WantState")]
+pub struct Wants;
+
+/// The connection state of the actor, for the tests.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub struct WantState {
+    /// The controller wants a connection.
+    pub want: bool,
+    /// A reconnect is planned.
+    pub reconnect: bool,
+    /// The status of the actor.
+    pub status: DeviceStatus,
+}
+
 /// Result of a connect: the receiver, its changes and its address.
 struct Connected {
     avr: Arc<Avr>,
@@ -537,7 +555,8 @@ impl DenonActor {
     fn set_status(&mut self, status: DeviceStatus) {
         self.status = status;
         if *self.status_tx.borrow() != status {
-            self.status_tx.send_replace(status);
+            let old = self.status_tx.send_replace(status);
+            debug!("[{}] status {old:?} -> {status:?}", self.cfg.name);
             self.controller.do_send(DeviceEvent::Status {
                 key: self.key.clone(),
                 status,
@@ -1719,6 +1738,23 @@ impl Handler<Changed> for DenonActor {
                 Setting::Source | Setting::Power
                     if change.zone.is_none_or(|z| z == denon_marantz::Zone::Main) =>
                 {
+                    // The library sends a change only when the value changed.
+                    if let Some(avr) = &self.avr {
+                        let main = denon_marantz::Zone::Main;
+                        if change.setting == Setting::Power {
+                            debug!(
+                                "[{}] power: {:?}",
+                                self.cfg.name,
+                                avr.state().borrow().zone(main).power
+                            );
+                        } else {
+                            debug!(
+                                "[{}] source: {:?}",
+                                self.cfg.name,
+                                avr.state().borrow().zone(main).source
+                            );
+                        }
+                    }
                     self.ask_names();
                 }
                 _ => {}
@@ -1833,6 +1869,15 @@ impl Handler<HeosChanged> for DenonActor {
         {
             return;
         }
+        // The library sends a play state change when the value changed, and after the library lost
+        // changes. Changes lost here come as `None` and are not logged.
+        if matches!(msg.1, Some(HeosChange::PlayState(_))) {
+            debug!(
+                "[{}] HEOS play state: {:?}",
+                self.cfg.name,
+                link.with_player(|player| player.play_state).flatten()
+            );
+        }
         // A position that the Remote counts on by itself is not sent.
         let progress = matches!(msg.1, Some(HeosChange::Progress(_)));
         if !self.update_position() && progress {
@@ -1860,14 +1905,20 @@ impl Handler<HeosStatusChanged> for DenonActor {
                     .and_then(|player| heos::Link::new(&player));
                 if link.is_some() {
                     info!("[{name}] HEOS connected");
+                } else if self.heos.is_some() {
+                    debug!("[{name}] HEOS player lost: {:?}", msg.1);
                 }
                 link
             }
-            HeosPlayerStatus::WaitingForPlayer => {
-                info!("[{name}] HEOS has no player with this address yet");
+            status => {
+                if matches!(status, HeosPlayerStatus::WaitingForPlayer) {
+                    info!("[{name}] HEOS has no player with this address yet");
+                }
+                if self.heos.is_some() {
+                    debug!("[{name}] HEOS player lost: {status:?}");
+                }
                 None
             }
-            _ => None,
         };
         self.set_heos(link, ctx);
     }
@@ -1938,6 +1989,19 @@ impl Handler<Refreshing> for DenonActor {
 
     fn handle(&mut self, _: Refreshing, _: &mut Self::Context) -> Self::Result {
         self.timers.refresh.is_some()
+    }
+}
+
+#[cfg(test)]
+impl Handler<Wants> for DenonActor {
+    type Result = MessageResult<Wants>;
+
+    fn handle(&mut self, _: Wants, _: &mut Self::Context) -> Self::Result {
+        MessageResult(WantState {
+            want: self.want,
+            reconnect: self.timers.reconnect.is_some(),
+            status: self.status,
+        })
     }
 }
 

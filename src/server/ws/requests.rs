@@ -26,12 +26,10 @@ impl WsConn {
     /// `msg_data` is taken from the request.
     pub(crate) fn on_request(
         session_id: &Arc<str>,
+        req_id: u32,
         request: &mut WsMessage,
         controller_addr: &Addr<Controller>,
     ) -> Result<Request<Controller, R2RequestMsg>, ServiceError> {
-        let id = request
-            .id
-            .ok_or_else(|| ServiceError::BadRequest("Missing property: id".into()))?;
         let msg = request
             .msg
             .as_deref()
@@ -42,7 +40,7 @@ impl WsConn {
         if let Ok(req_msg) = R2Request::from_str(msg) {
             Ok(controller_addr.send(R2RequestMsg {
                 ws_id: session_id.clone(),
-                req_id: id,
+                req_id,
                 request: req_msg,
                 msg_data: request.msg_data.take(),
             }))
