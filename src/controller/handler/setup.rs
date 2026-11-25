@@ -8,10 +8,10 @@ use crate::config_store::{
     DEFAULT_SIGNAL_SECS, DeviceConfig, DriverSettings, Feature, MIN_SIGNAL_SECS, SaveWait,
     backup_json, parse_backup,
 };
+use crate::controller::devices::ConnectTrigger;
 use crate::controller::handler::AbortDriverSetup;
 use crate::controller::{Controller, operation_mode};
 use crate::device::discovery;
-use crate::entities::EntityKind;
 use crate::errors::ServiceError;
 use crate::logging;
 use actix::{ActorFutureExt, AsyncContext, Context, Handler, Message, WrapFuture};
@@ -451,7 +451,7 @@ impl Controller {
         }
         if !self.devices.is_empty() {
             let _ = self.sm_consume(ws_id, &operation_mode::Input::ConfigurationAvailable, ctx);
-            self.update_connections(true);
+            self.update_connections(ConnectTrigger::Wake);
         }
     }
 
@@ -757,11 +757,6 @@ impl Controller {
             "remove" => {
                 let cfg = self.remove_device(key).ok_or_else(unknown_device)?;
                 info!("[{ws_id}] removed {}", cfg.name);
-                for session in self.sessions.values_mut() {
-                    session
-                        .subscribed_entities
-                        .retain(|id| EntityKind::parse(id).is_none_or(|(k, _)| k != key));
-                }
                 let save = self.save_devices().map_err(|e| {
                     warn!("[{ws_id}] saving the configuration failed: {e}");
                     IntegrationSetupError::Other
@@ -916,7 +911,8 @@ impl Controller {
         }
     }
 
-    /// Remove all devices but the one with `key`, and their entities. The caller saves.
+    /// Remove all devices but the one with `key`, and the cached states of their entities. The
+    /// caller saves.
     fn remove_other_devices(&mut self, key: &str) {
         let keys: Vec<String> = self
             .devices
@@ -926,11 +922,6 @@ impl Controller {
             .collect();
         for key in &keys {
             self.remove_device(key);
-        }
-        for session in self.sessions.values_mut() {
-            session
-                .subscribed_entities
-                .retain(|id| EntityKind::parse(id).is_some_and(|(k, _)| k == key));
         }
     }
 
@@ -947,7 +938,7 @@ impl Controller {
         for cfg in devices {
             self.add_device(cfg, ctx);
         }
-        // Receivers that are in the backup too keep their subscriptions.
+        // Forget the cached states of entities that are gone.
         self.purge_entities();
         self.save_devices()
     }
@@ -1063,7 +1054,7 @@ impl Controller {
             let _ = self.sm_consume(ws_id, &operation_mode::Input::ConfigurationAvailable, ctx);
         }
         if matches!(self.machine.state(), operation_mode::State::Running) {
-            self.update_connections(true);
+            self.update_connections(ConnectTrigger::Wake);
         }
         let state = if error.is_none() {
             IntegrationSetupState::Ok
@@ -1556,8 +1547,8 @@ mod tests {
         use crate::config_store::backup_json;
         use crate::controller::handler::setup::{SetDriverUserDataMsg, SetupDriverMsg};
         use crate::controller::test_util::{
-            DeviceAddr, Subscribed, TestRemote, config_file, connect, controller, settle,
-            use_closed_port, wait_stopped,
+            DeviceAddr, Subscribed, SubscribesAll, TestRemote, config_file, connect, controller,
+            settle, use_closed_port, wait_stopped,
         };
         use crate::controller::{Controller, R2RequestMsg, R2SessionDisconnect};
         use actix::Addr;
@@ -1705,15 +1696,28 @@ mod tests {
             use_closed_port();
             let controller = controller("subscribe-all", Some(PYTHON_CONFIG));
             connect(&controller, "a").await;
+            let subscribes_all = async || controller.send(SubscribesAll("a")).await.expect("send");
             request(&controller, R2Request::SubscribeEvents, Some(json!({})))
                 .await
                 .expect("subscribe");
-            let all = entity_ids(&controller).await.len();
-            assert_eq!(all, controller.send(Subscribed("a")).await.expect("send"));
+            assert!(subscribes_all().await);
+            // An empty list unsubscribes nothing.
+            let none = json!({ "entity_ids": [] });
+            request(&controller, R2Request::UnsubscribeEvents, Some(none))
+                .await
+                .expect("unsubscribe");
+            assert!(subscribes_all().await);
             request(&controller, R2Request::UnsubscribeEvents, Some(json!({})))
                 .await
                 .expect("unsubscribe");
+            assert!(!subscribes_all().await);
             assert_eq!(0, controller.send(Subscribed("a")).await.expect("send"));
+            // An empty list subscribes all entities.
+            let all = json!({ "entity_ids": [] });
+            request(&controller, R2Request::SubscribeEvents, Some(all))
+                .await
+                .expect("subscribe");
+            assert!(subscribes_all().await);
         }
 
         #[actix::test]
@@ -2072,6 +2076,7 @@ mod tests {
                 .await
                 .expect("send")
                 .expect("actor");
+            subscribe(&controller, "a", &["media_player.SERIAL0000001".into()]).await;
             controller
                 .send(start_setup("a", true))
                 .await
@@ -2093,6 +2098,8 @@ mod tests {
                 .expect("ok");
             wait_state(&events, "OK").await;
             assert_eq!(0, entity_ids(&controller).await.len());
+            // Only the Remote changes its subscriptions.
+            assert_eq!(1, controller.send(Subscribed("a")).await.expect("send"));
             wait_stopped(&controller, &actor).await;
             assert_eq!(json!([]), config_file("remove"));
         }

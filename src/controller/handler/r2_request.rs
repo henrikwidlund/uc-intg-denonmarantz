@@ -4,6 +4,7 @@
 
 //! Handler for [`R2RequestMsg`].
 
+use crate::controller::devices::ConnectTrigger;
 use crate::controller::handler::setup::{SetDriverUserDataMsg, SetupDriverMsg};
 use crate::controller::{Controller, R2RequestMsg, SendWsMessage, operation_mode};
 use crate::errors::ServiceError;
@@ -32,11 +33,21 @@ struct AvailableEntitiesRequest {
     filter: Option<AvailableEntitiesFilter>,
 }
 
-/// `msg_data` of `subscribe_events` and `unsubscribe_events`. No ids means all entities.
-#[derive(Deserialize)]
+/// `msg_data` of `subscribe_events` and `unsubscribe_events`. Without `msg_data` or without
+/// `entity_ids`: all entities. An empty list: all entities for subscribe, none for unsubscribe.
+#[derive(Default, Deserialize)]
 struct EntityIds {
-    #[serde(default)]
-    entity_ids: Vec<String>,
+    entity_ids: Option<Vec<String>>,
+}
+
+impl EntityIds {
+    /// Read the optional `msg_data`. `null` is the same as no `msg_data`.
+    fn from_msg_data(msg_data: Option<serde_json::Value>) -> Result<Self, serde_json::Error> {
+        match msg_data {
+            None | Some(serde_json::Value::Null) => Ok(Self::default()),
+            Some(data) => serde_json::from_value(data),
+        }
+    }
 }
 
 /// The name and the versions of the driver.
@@ -57,15 +68,20 @@ impl Handler<R2RequestMsg> for Controller {
     fn handle(&mut self, msg: R2RequestMsg, ctx: &mut Self::Context) -> Self::Result {
         debug!("R2RequestMsg: {:?}", msg.request);
         // A Remote that sends a request is not in standby. The core can send a command before
-        // `exit_standby`: the receivers it uses connect now.
+        // `exit_standby`: the receivers it uses connect now, and the Remote gets the states that
+        // changed during standby.
         let Some(session) = self.sessions.get_mut(&msg.ws_id) else {
             return_fut_err!(ServiceError::NotFound("No session found".into()));
         };
         let woke = !session.awake();
+        let was_standby = session.standby;
         session.standby = false;
         session.paused = false;
         if woke {
-            self.update_connections(false);
+            self.update_connections(ConnectTrigger::Wake);
+        }
+        if was_standby {
+            self.send_missed_states(&msg.ws_id);
         }
 
         let req_id = msg.req_id;
@@ -168,7 +184,7 @@ impl Handler<R2RequestMsg> for Controller {
             }
             R2Request::SubscribeEvents => {
                 let ws_id = msg.ws_id.clone();
-                let subscribe = match msg.deserialize::<EntityIds>() {
+                let subscribe = match EntityIds::from_msg_data(msg.msg_data) {
                     Ok(subscribe) => subscribe,
                     Err(e) => return_fut_err!(e.into()),
                 };
@@ -176,19 +192,19 @@ impl Handler<R2RequestMsg> for Controller {
                 if let Err(e) = self.respond(&ws_id, req_id, resp_msg, ()) {
                     return_fut_err!(e);
                 }
-                self.subscribe(&ws_id, subscribe.entity_ids);
+                self.subscribe(&ws_id, subscribe.entity_ids.filter(|ids| !ids.is_empty()));
                 return_fut_ok!(None);
             }
             R2Request::UnsubscribeEvents => {
                 let ws_id = msg.ws_id.clone();
-                let unsubscribe = match msg.deserialize::<EntityIds>() {
+                let unsubscribe = match EntityIds::from_msg_data(msg.msg_data) {
                     Ok(unsubscribe) => unsubscribe,
                     Err(e) => return_fut_err!(e.into()),
                 };
                 if let Err(e) = self.respond(&ws_id, req_id, resp_msg, ()) {
                     return_fut_err!(e);
                 }
-                self.unsubscribe(&ws_id, &unsubscribe.entity_ids);
+                self.unsubscribe(&ws_id, unsubscribe.entity_ids.as_deref());
                 return_fut_ok!(None);
             }
             R2Request::EntityCommand => self.entity_command(msg, resp_msg),
@@ -207,5 +223,37 @@ impl Handler<R2RequestMsg> for Controller {
                 )))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EntityIds;
+    use serde_json::json;
+
+    #[test]
+    fn entity_ids_without_a_list_are_none() {
+        for data in [
+            None,
+            Some(json!(null)),
+            Some(json!({})),
+            Some(json!({ "entity_ids": null })),
+        ] {
+            let ids = EntityIds::from_msg_data(data.clone()).expect("ids");
+            assert_eq!(None, ids.entity_ids, "{data:?}");
+        }
+    }
+
+    #[test]
+    fn entity_ids_keep_the_list() {
+        let ids = EntityIds::from_msg_data(Some(json!({ "entity_ids": [] }))).expect("ids");
+        assert_eq!(Some(Vec::new()), ids.entity_ids);
+        let ids = EntityIds::from_msg_data(Some(json!({ "entity_ids": ["x"] }))).expect("ids");
+        assert_eq!(Some(vec!["x".to_owned()]), ids.entity_ids);
+    }
+
+    #[test]
+    fn entity_ids_that_are_not_a_list_are_an_error() {
+        assert!(EntityIds::from_msg_data(Some(json!({ "entity_ids": "x" }))).is_err());
     }
 }

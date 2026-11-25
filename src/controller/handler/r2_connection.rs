@@ -4,6 +4,7 @@
 
 //! Handlers for Remote connection messages.
 
+use crate::controller::devices::ConnectTrigger;
 use crate::controller::{Controller, NewR2Session, R2Session, R2SessionDisconnect, SendWsMessage};
 use actix::prelude::SendError;
 use actix::{Context, Handler};
@@ -45,6 +46,6 @@ impl Handler<R2SessionDisconnect> for Controller {
         self.sessions.remove(&msg.id);
         // A Remote that restarted can leave an old connection. When it ends, the receivers are not
         // needed if no other awake Remote uses them.
-        self.update_connections(false);
+        self.update_connections(ConnectTrigger::Sleep);
     }
 }

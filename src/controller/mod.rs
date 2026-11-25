@@ -81,11 +81,14 @@ struct R2Session {
     standby: bool,
     /// The Remote sent `disconnect`: it does not use the receivers until `connect`.
     paused: bool,
+    /// Entities subscribed by id. Empty while `subscribe_all` is set.
     subscribed_entities: HashSet<String>,
+    /// The Remote subscribed all entities, also the entities that come later.
+    subscribe_all: bool,
     /// The Remote read the entity states with `get_entity_states` in this session.
     read_states: bool,
-    /// The last `get_entity_states` answer had all entities, and the Remote did not subscribe
-    /// since.
+    /// The last `get_entity_states` answer had all entities because the Remote had no
+    /// subscriptions, and the Remote did not subscribe since.
     read_all: bool,
     /// Entities that changed while the Remote was in standby, or after it read all states.
     missed: HashSet<String>,
@@ -101,6 +104,7 @@ impl R2Session {
             standby: false,
             paused: false,
             subscribed_entities: HashSet::default(),
+            subscribe_all: false,
             read_states: false,
             read_all: false,
             missed: HashSet::default(),
@@ -115,9 +119,21 @@ impl R2Session {
 
     /// True if the Remote subscribed an entity of the device `key`.
     fn uses(&self, key: &str) -> bool {
-        self.subscribed_entities
-            .iter()
-            .any(|id| EntityKind::parse(id).is_some_and(|(k, _)| k == key))
+        self.subscribe_all
+            || self
+                .subscribed_entities
+                .iter()
+                .any(|id| EntityKind::parse(id).is_some_and(|(k, _)| k == key))
+    }
+
+    /// True if the Remote subscribed the entity.
+    fn subscribed(&self, entity_id: &str) -> bool {
+        self.subscribe_all || self.subscribed_entities.contains(entity_id)
+    }
+
+    /// True if the Remote subscribed at least one entity.
+    fn has_subscriptions(&self) -> bool {
+        self.subscribe_all || !self.subscribed_entities.is_empty()
     }
 
     const fn new_msg_id(&mut self) -> u32 {

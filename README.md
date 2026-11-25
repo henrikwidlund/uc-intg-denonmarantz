@@ -132,7 +132,12 @@ Commands with a number are sent as raw text with the remote entity:
 - The driver connects only to receivers that are in use: a Remote that is awake subscribed at least one of
   their entities. A receiver that no awake Remote uses is disconnected. A command to a receiver that is not in
   use connects it (the driver logs a warning), and the next change of the subscriptions or of a Remote
-  disconnects it again.
+  disconnects it again. When a Remote goes to standby, sends `disconnect` or ends, the driver also stops the
+  connect tries of such a receiver.
+- Only the Remote changes its subscriptions. A subscription without entity ids, or with an empty list, means all
+  entities, also entities that come later. An unsubscribe of some entities ends this: entities that come later
+  are not subscribed. An unsubscribe without entity ids means all entities; one with an empty list changes
+  nothing.
 - The driver connects with the address and the values (`info`) of the last full connect. This sends no request:
   the start checks them. If the values changed, the driver saves them; if the type, the port or the read method
   changed, it connects again. If the start fails, or another receiver answers, the driver looks the receiver up:

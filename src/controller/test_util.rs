@@ -77,7 +77,7 @@ impl Handler<DeviceKey> for Controller {
     }
 }
 
-/// The number of entities that a Remote subscribed.
+/// The number of entity ids in the subscription list of a Remote. `subscribe_all` is not counted.
 #[derive(Message)]
 #[rtype(result = "usize")]
 pub(crate) struct Subscribed(pub &'static str);
@@ -88,6 +88,18 @@ impl Handler<Subscribed> for Controller {
         self.sessions
             .get(msg.0)
             .map_or(0, |s| s.subscribed_entities.len())
+    }
+}
+
+/// True if the Remote subscribed all entities, also the entities that come later.
+#[derive(Message)]
+#[rtype(result = "bool")]
+pub(crate) struct SubscribesAll(pub &'static str);
+
+impl Handler<SubscribesAll> for Controller {
+    type Result = bool;
+    fn handle(&mut self, msg: SubscribesAll, _: &mut Context<Self>) -> bool {
+        self.sessions.get(msg.0).is_some_and(|s| s.subscribe_all)
     }
 }
 

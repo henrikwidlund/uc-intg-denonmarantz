@@ -4,10 +4,10 @@
 //! Tests of the Remote sessions in the controller.
 
 use crate::controller::test_util::{
-    DeviceAddr, DeviceKey, LOOPBACK_CONFIG, LOOPBACK_KEY, Subscribed, TestRemote, connect,
-    controller, entity_states, request, settle, use_closed_port,
+    DeviceAddr, DeviceKey, LOOPBACK_CONFIG, LOOPBACK_KEY, Subscribed, SubscribesAll, TestRemote,
+    connect, controller, entity_states, request, settle, use_closed_port,
 };
-use crate::controller::{Controller, R2EventMsg, R2RequestMsg};
+use crate::controller::{Controller, R2EventMsg, R2RequestMsg, R2SessionDisconnect};
 use crate::device::{DenonActor, DeviceEvent, DeviceStatus, Wants};
 use crate::entities::EntityKind;
 use actix::Addr;
@@ -261,5 +261,138 @@ async fn an_unsubscribe_answer_reaches_the_remote() {
         remote
             .position(|m| m["kind"] == "resp" && m["req_id"] == 10 && m["code"] == 200)
             .is_some()
+    );
+}
+
+/// Wait until the actor plans a reconnect.
+async fn until_reconnect(actor: &Addr<DenonActor>) {
+    let end = std::time::Instant::now() + Duration::from_secs(5);
+    while !actor.send(Wants).await.expect("send").reconnect {
+        assert!(std::time::Instant::now() < end, "no reconnect");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[actix::test]
+async fn standby_ends_the_retries_of_a_receiver_that_only_a_command_connected() {
+    retries_of_an_unused_receiver_end("command-unused", false).await;
+}
+
+#[actix::test]
+async fn the_end_of_a_session_ends_the_retries_of_a_receiver_that_only_a_command_connected() {
+    retries_of_an_unused_receiver_end("command-unused-end", true).await;
+}
+
+/// A command connects a receiver that the Remote does not use. Standby, or the end of the
+/// session, stops the connect tries.
+async fn retries_of_an_unused_receiver_end(name: &str, end_session: bool) {
+    use_closed_port();
+    let controller = controller(name, Some(LOOPBACK_CONFIG));
+    let remote = connect(&controller, "a").await;
+    let command = json!({
+        "entity_type": "media_player",
+        "entity_id": format!("media_player.{LOOPBACK_KEY}"),
+        "cmd_id": "on",
+    });
+    // The connect fails, so the command fails too.
+    let _ = request(&controller, "a", R2Request::EntityCommand, Some(command)).await;
+    let actor = actor(&controller).await;
+    until_reconnect(&actor).await;
+    let state = actor.send(Wants).await.expect("send");
+    assert!(state.want);
+    assert_eq!(DeviceStatus::Disconnected, state.status);
+
+    if end_session {
+        controller
+            .send(R2SessionDisconnect { id: "a".into() })
+            .await
+            .expect("send");
+    } else {
+        event(&controller, R2Event::EnterStandby).await;
+    }
+    settle(&controller, &[&remote]).await;
+    let state = actor.send(Wants).await.expect("send");
+    assert!(!state.want);
+    assert!(!state.reconnect);
+}
+
+#[actix::test]
+async fn standby_does_not_change_a_receiver_that_was_not_asked_to_connect() {
+    use_closed_port();
+    let controller = controller("standby-unused", Some(LOOPBACK_CONFIG));
+    let remote = connect(&controller, "a").await;
+    event(&controller, R2Event::EnterStandby).await;
+    settle(&controller, &[&remote]).await;
+    let state = actor(&controller).await.send(Wants).await.expect("send");
+    assert!(!state.want);
+    assert!(!state.keep_state);
+}
+
+#[actix::test]
+async fn a_request_that_ends_standby_sends_the_missed_states_before_its_answer() {
+    use_closed_port();
+    let controller = controller("request-wake", Some(LOOPBACK_CONFIG));
+    let remote = connect(&controller, "a").await;
+    let id = format!("media_player.{LOOPBACK_KEY}");
+    request(
+        &controller,
+        "a",
+        R2Request::SubscribeEvents,
+        Some(json!({ "entity_ids": [&id] })),
+    )
+    .await
+    .expect("subscribe");
+    event(&controller, R2Event::EnterStandby).await;
+    controller.do_send(title_change(device_key(&controller).await, "probe"));
+    settle(&controller, &[&remote]).await;
+    remote.clear();
+
+    let answer = controller
+        .send(request_msg(11, R2Request::GetDeviceState))
+        .await
+        .expect("send")
+        .expect("ok");
+    assert!(answer.is_none(), "the controller sends the answer");
+    settle(&controller, &[&remote]).await;
+    let change = remote
+        .position(|m| {
+            m["msg"] == "entity_change" && m["msg_data"]["attributes"]["media_title"] == "probe"
+        })
+        .expect("change");
+    let answer = remote
+        .position(|m| m["msg"] == "device_state")
+        .expect("answer");
+    assert!(change < answer, "change {change}, answer {answer}");
+}
+
+#[actix::test]
+async fn subscribe_and_unsubscribe_without_msg_data_mean_all_entities() {
+    use_closed_port();
+    let controller = controller("subscribe-no-data", Some(LOOPBACK_CONFIG));
+    let remote = connect(&controller, "a").await;
+    request(&controller, "a", R2Request::SubscribeEvents, None)
+        .await
+        .expect("subscribe");
+    assert!(controller.send(SubscribesAll("a")).await.expect("send"));
+    assert!(
+        actor(&controller)
+            .await
+            .send(Wants)
+            .await
+            .expect("send")
+            .want
+    );
+    request(&controller, "a", R2Request::UnsubscribeEvents, None)
+        .await
+        .expect("unsubscribe");
+    settle(&controller, &[&remote]).await;
+    assert!(!controller.send(SubscribesAll("a")).await.expect("send"));
+    assert!(
+        !actor(&controller)
+            .await
+            .send(Wants)
+            .await
+            .expect("send")
+            .want
     );
 }

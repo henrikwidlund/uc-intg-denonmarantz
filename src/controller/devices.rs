@@ -79,6 +79,19 @@ fn entity_change_text<T: Serialize>(data: T) -> Option<ByteString> {
     }
 }
 
+/// What makes [`Controller::update_connections`] run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ConnectTrigger {
+    /// A Remote woke up or sent `connect`, or a setup ended. A used device is asked to connect
+    /// even if it was used before: a connect that waits for its next try starts at once.
+    Wake,
+    /// A Remote went to standby, sent `disconnect` or ended. Each device that no awake Remote uses
+    /// is disconnected, also one that a command connected or that waits for its next try.
+    Sleep,
+    /// Subscriptions or devices changed.
+    Change,
+}
+
 /// One configured receiver.
 pub(super) struct Device {
     pub cfg: DeviceConfig,
@@ -138,7 +151,7 @@ impl Controller {
             .is_some_and(|(k, _)| Arc::ptr_eq(k, key))
     }
 
-    /// Stop the actor of a device and forget its entities.
+    /// Stop the actor of a device and forget the cached states of its entities.
     pub(super) fn remove_device(&mut self, key: &str) -> Option<DeviceConfig> {
         let device = self.devices.remove(key)?;
         device.addr.do_send(Stop);
@@ -195,16 +208,16 @@ impl Controller {
     pub(super) fn entity_states(&mut self, ws_id: &str) -> Vec<EntityChangeRef<'_>> {
         if let Some(session) = self.sessions.get_mut(ws_id) {
             session.read_states = true;
-            session.read_all = session.subscribed_entities.is_empty();
+            session.read_all = !session.has_subscriptions();
             if session.read_all {
                 session.missed.clear();
             }
         }
-        let subscribed = self.sessions.get(ws_id).map(|s| &s.subscribed_entities);
+        let session = self.sessions.get(ws_id);
         let mut states: Vec<EntityChangeRef<'_>> = self
             .entities
             .iter()
-            .filter(|(id, _)| subscribed.is_none_or(|s| s.is_empty() || s.contains(*id)))
+            .filter(|(id, _)| session.is_none_or(|s| !s.has_subscriptions() || s.subscribed(id)))
             .filter_map(|(id, attrs)| entity_change(id, attrs))
             .collect();
         states.sort_by_key(|s| send_order(s.entity_id));
@@ -215,33 +228,50 @@ impl Controller {
     /// per entity can fill the event queue of the Remote, and the Remote then closes the
     /// connection.
     ///
-    /// No ids means all entities.
-    pub(super) fn subscribe(&mut self, ws_id: &str, entity_ids: Vec<String>) {
-        let entity_ids = if entity_ids.is_empty() {
-            self.all_entity_ids()
-        } else {
-            entity_ids
-        };
+    /// `None` means all entities, also the entities that come later. An empty list means none.
+    pub(super) fn subscribe(&mut self, ws_id: &str, entity_ids: Option<Vec<String>>) {
+        if entity_ids.as_ref().is_some_and(Vec::is_empty) {
+            return;
+        }
+        let all = entity_ids.is_none();
+        match self.sessions.get(ws_id) {
+            None => return,
+            Some(session) if all && session.subscribe_all => return,
+            Some(_) => {}
+        }
+        let entity_ids = entity_ids.unwrap_or_else(|| self.all_entity_ids());
         let Some(session) = self.sessions.get_mut(ws_id) else {
             return;
         };
         // At the start of a session the Remote reads the states with `get_entity_states` before
         // or after it subscribes. Before: it has all states, and gets only the changes since.
-        // After: it gets nothing now. Entities added later get their state.
+        // After: it gets nothing now. Entities subscribed later get their state.
         let read_all = std::mem::take(&mut session.read_all);
-        let mut new = Vec::new();
+        let mut new = all;
         let mut send = Vec::new();
         for id in entity_ids {
-            if session.subscribed_entities.insert(id.clone()) {
-                if session.read_states && (!read_all || session.missed.remove(&id)) {
-                    send.push(id.clone());
+            if session.subscribed(&id) {
+                continue;
+            }
+            new = true;
+            let missed = session.missed.remove(&id);
+            let send_state = session.read_states && (!read_all || missed);
+            if send_state {
+                if !all {
+                    session.subscribed_entities.insert(id.clone());
                 }
-                new.push(id);
+                send.push(id);
+            } else if !all {
+                session.subscribed_entities.insert(id);
             }
         }
+        if all {
+            session.subscribe_all = true;
+            session.subscribed_entities.clear();
+        }
         if read_all {
-            let subscribed = &session.subscribed_entities;
-            session.missed.retain(|id| subscribed.contains(id));
+            let (all, subscribed) = (session.subscribe_all, &session.subscribed_entities);
+            session.missed.retain(|id| all || subscribed.contains(id));
         }
         send.sort_by_key(|id| send_order(id));
         for id in &send {
@@ -249,60 +279,80 @@ impl Controller {
                 self.send_entity_change(ws_id, &change);
             }
         }
-        if !new.is_empty() {
-            self.update_connections(false);
+        if new {
+            self.update_connections(ConnectTrigger::Change);
         }
     }
 
     /// Send the cached states of the entities that changed while a Remote was in standby. This
     /// happens mostly if another Remote stayed awake. Sending all entities at each wake-up can fill
     /// the event queue of the Remote.
+    ///
+    /// Entities that the Remote did not subscribe stay in the list: a Remote that read all states
+    /// before it subscribed gets them when it subscribes.
     pub(super) fn send_missed_states(&mut self, ws_id: &str) {
         let Some(session) = self.sessions.get_mut(ws_id) else {
             return;
         };
-        let mut missed: Vec<String> = std::mem::take(&mut session.missed).into_iter().collect();
+        if session.missed.is_empty() {
+            return;
+        }
+        let (all, subscribed) = (session.subscribe_all, &session.subscribed_entities);
+        let mut missed: Vec<String> = session
+            .missed
+            .extract_if(|id| all || subscribed.contains(id))
+            .collect();
         missed.sort_by_key(|id| send_order(id));
         for id in &missed {
-            if self
-                .sessions
-                .get(ws_id)
-                .is_some_and(|s| s.subscribed_entities.contains(id))
-                && let Some(change) = self.entities.get(id).and_then(|a| entity_change(id, a))
-            {
+            if let Some(change) = self.entities.get(id).and_then(|a| entity_change(id, a)) {
                 self.send_entity_change(ws_id, &change);
             }
         }
     }
 
-    /// No ids means all entities.
-    pub(super) fn unsubscribe(&mut self, ws_id: &str, entity_ids: &[String]) {
+    /// `None` means all entities. An empty list means none.
+    pub(super) fn unsubscribe(&mut self, ws_id: &str, entity_ids: Option<&[String]>) {
+        if entity_ids.is_some_and(<[String]>::is_empty) {
+            return;
+        }
+        // Some entities of all: the others stay subscribed, but not the entities that come later.
+        let expand =
+            entity_ids.is_some() && self.sessions.get(ws_id).is_some_and(|s| s.subscribe_all);
+        let all_ids = if expand {
+            self.all_entity_ids()
+        } else {
+            Vec::new()
+        };
         let Some(session) = self.sessions.get_mut(ws_id) else {
             return;
         };
-        if entity_ids.is_empty() {
-            session.subscribed_entities.clear();
+        session.subscribe_all = false;
+        match entity_ids {
+            None => session.subscribed_entities.clear(),
+            Some(ids) => {
+                session.subscribed_entities.extend(all_ids);
+                for id in ids {
+                    session.subscribed_entities.remove(id);
+                }
+            }
         }
-        for id in entity_ids {
-            session.subscribed_entities.remove(id);
-        }
-        self.update_connections(false);
+        self.update_connections(ConnectTrigger::Change);
     }
 
     /// Connect the devices that an awake Remote uses, and disconnect the others. A device is used
-    /// if the Remote subscribed one of its entities.
-    ///
-    /// With `force`, a used device is asked to connect even if it was used before. After
-    /// wake-up, this starts a connect that waits for its next try at once.
-    pub(super) fn update_connections(&mut self, force: bool) {
+    /// if the Remote subscribed one of its entities. See [`ConnectTrigger`].
+    pub(super) fn update_connections(&mut self, trigger: ConnectTrigger) {
         let sessions = &self.sessions;
         for (key, device) in &mut self.devices {
             let wanted = sessions.values().any(|s| s.awake() && s.uses(key));
             if wanted {
-                if force || !device.wanted {
+                if trigger == ConnectTrigger::Wake || !device.wanted {
                     device.addr.do_send(Connect);
                 }
-            } else if device.wanted || device.status != DeviceStatus::Disconnected {
+            } else if trigger == ConnectTrigger::Sleep
+                || device.wanted
+                || device.status != DeviceStatus::Disconnected
+            {
                 // A command can connect a device that is not used, see `entity_command`.
                 debug!("[{}] not in use, disconnecting", device.cfg.name);
                 device.addr.do_send(Disconnect);
@@ -311,8 +361,8 @@ impl Controller {
         }
     }
 
-    /// Forget the cached states and the subscriptions of entities that a receiver does not have
-    /// any more, for example after the connection mode changed.
+    /// Forget the cached states of entities that a receiver does not have any more, for example
+    /// after the connection mode changed. The subscriptions stay: only the Remote changes them.
     pub(super) fn purge_entities(&mut self) {
         let devices = &self.devices;
         let keep = |id: &str| {
@@ -323,10 +373,7 @@ impl Controller {
             })
         };
         self.entities.retain(|id, _| keep(id));
-        for session in self.sessions.values_mut() {
-            session.subscribed_entities.retain(|id| keep(id));
-        }
-        self.update_connections(false);
+        self.update_connections(ConnectTrigger::Change);
     }
 
     pub(super) fn entity_command(
@@ -407,7 +454,7 @@ impl Controller {
             let wanted = self
                 .sessions
                 .values()
-                .any(|s| s.read_all || s.subscribed_entities.contains(&entity_id));
+                .any(|s| s.read_all || s.subscribed(&entity_id));
             let changed = if let Some(cache) = self.entities.get_mut(&entity_id) {
                 diff(cache, attrs, wanted)
             } else {
@@ -433,7 +480,7 @@ impl Controller {
         // A Remote in standby gets the state when it wakes up. A Remote that read all states and
         // did not subscribe yet gets it when it subscribes.
         for session in self.sessions.values_mut() {
-            let subscribed = session.subscribed_entities.contains(entity_id);
+            let subscribed = session.subscribed(entity_id);
             if ((session.standby && subscribed) || (session.read_all && !subscribed))
                 && !session.missed.contains(entity_id)
             {
@@ -443,7 +490,7 @@ impl Controller {
         let mut targets = self
             .sessions
             .iter()
-            .filter(|(_, s)| !s.standby && s.subscribed_entities.contains(entity_id))
+            .filter(|(_, s)| !s.standby && s.subscribed(entity_id))
             .map(|(ws_id, _)| &**ws_id)
             .peekable();
         let Some(cache) = self.entities.get(entity_id) else {
@@ -664,13 +711,13 @@ mod tests {
             .entities
             .insert(ids[0].into(), map(json!({ "state": "OFF" })));
         controller.send_changes(kind, ids[0], &["state".into()]);
-        controller.subscribe("a", vec![ids[0].into(), ids[1].into()]);
+        controller.subscribe("a", Some(vec![ids[0].into(), ids[1].into()]));
         settle().await;
         let sent_now = sent(&texts);
         assert_eq!(1, sent_now.len());
         assert!(sent_now[0].contains(ids[0]), "{}", sent_now[0]);
         // An entity that is added later gets its state.
-        controller.subscribe("a", vec![ids[2].into()]);
+        controller.subscribe("a", Some(vec![ids[2].into()]));
         settle().await;
         assert_eq!(2, sent(&texts).len());
     }
@@ -701,8 +748,8 @@ mod tests {
             .collect();
         assert_eq!(vec!["media_player.KEY", "remote.KEY"], first);
         // Entities that are added later get their state.
-        controller.subscribe("a", vec!["number.bass.KEY".into()]);
-        controller.subscribe("a", ids.map(str::to_owned).to_vec());
+        controller.subscribe("a", Some(vec!["number.bass.KEY".into()]));
+        controller.subscribe("a", Some(ids.map(str::to_owned).to_vec()));
         settle().await;
         let sent_now = sent(&texts);
         assert_eq!(5, sent_now.len());
@@ -795,17 +842,19 @@ mod tests {
         add_idle_device(&mut controller, "B");
         add_session(&mut controller, "a");
         // `connect` before `subscribe_events`, for example after a driver start.
-        controller.update_connections(true);
+        controller.update_connections(ConnectTrigger::Wake);
         assert_eq!(Vec::<&str>::new(), wanted(&controller));
-        controller.subscribe("a", vec!["media_player.A".into(), "remote.A".into()]);
+        controller.subscribe("a", Some(vec!["media_player.A".into(), "remote.A".into()]));
         assert_eq!(vec!["A"], wanted(&controller));
-        controller.unsubscribe("a", &["media_player.A".into()]);
+        controller.unsubscribe("a", Some(&["media_player.A".into()]));
         assert_eq!(vec!["A"], wanted(&controller));
-        controller.unsubscribe("a", &["remote.A".into()]);
+        controller.unsubscribe("a", Some(&["remote.A".into()]));
         assert_eq!(Vec::<&str>::new(), wanted(&controller));
-        // No ids means all entities.
-        controller.subscribe("a", vec!["media_player.B".into()]);
-        controller.unsubscribe("a", &[]);
+        // An empty list unsubscribes nothing. No list means all entities.
+        controller.subscribe("a", Some(vec!["media_player.B".into()]));
+        controller.unsubscribe("a", Some(&[]));
+        assert_eq!(vec!["B"], wanted(&controller));
+        controller.unsubscribe("a", None);
         assert_eq!(Vec::<&str>::new(), wanted(&controller));
     }
 
@@ -816,24 +865,109 @@ mod tests {
         add_idle_device(&mut controller, "B");
         for ws_id in ["a", "b"] {
             add_session(&mut controller, ws_id);
-            controller.subscribe(ws_id, vec!["media_player.A".into()]);
+            controller.subscribe(ws_id, Some(vec!["media_player.A".into()]));
         }
-        controller.subscribe("b", vec!["media_player.B".into()]);
+        controller.subscribe("b", Some(vec!["media_player.B".into()]));
         assert_eq!(vec!["A", "B"], wanted(&controller));
         session(&mut controller, "b").standby = true;
-        controller.update_connections(false);
+        controller.update_connections(ConnectTrigger::Sleep);
         assert_eq!(vec!["A"], wanted(&controller));
         // `disconnect` of the last awake Remote.
         session(&mut controller, "a").paused = true;
-        controller.update_connections(false);
+        controller.update_connections(ConnectTrigger::Sleep);
         assert_eq!(Vec::<&str>::new(), wanted(&controller));
         session(&mut controller, "b").standby = false;
-        controller.update_connections(true);
+        controller.update_connections(ConnectTrigger::Wake);
         assert_eq!(vec!["A", "B"], wanted(&controller));
         // A Remote that ends takes its subscriptions with it.
         controller.sessions.remove("b");
-        controller.update_connections(false);
+        controller.update_connections(ConnectTrigger::Sleep);
         assert_eq!(Vec::<&str>::new(), wanted(&controller));
+    }
+
+    #[actix::test]
+    async fn a_subscription_of_all_entities_covers_the_entities_that_come_later() {
+        let mut controller = new_controller();
+        add_idle_device(&mut controller, "A");
+        let texts = Arc::default();
+        let remote = R2Session::new(Remote(Arc::clone(&texts)).start().recipient());
+        controller.sessions.insert("a".into(), remote);
+        controller.subscribe("a", None);
+        assert_eq!(vec!["A"], wanted(&controller));
+        // A receiver that a setup adds.
+        add_idle_device(&mut controller, "B");
+        controller.update_connections(ConnectTrigger::Change);
+        assert_eq!(vec!["A", "B"], wanted(&controller));
+        controller.apply_changes(
+            "B",
+            vec![(EntityKind::MediaPlayer, map(json!({ "state": "ON" })))],
+        );
+        settle().await;
+        let sent_now = sent(&texts);
+        assert_eq!(1, sent_now.len());
+        assert!(sent_now[0].contains("media_player.B"), "{}", sent_now[0]);
+        // Some entities of all: the other entities stay subscribed.
+        let all = controller.all_entity_ids().len();
+        controller.unsubscribe("a", Some(&["media_player.B".into()]));
+        let s = session(&mut controller, "a");
+        assert!(!s.subscribe_all);
+        assert_eq!(all - 1, s.subscribed_entities.len());
+        assert!(!s.subscribed("media_player.B"));
+        assert!(s.subscribed("remote.B"));
+        controller.unsubscribe("a", None);
+        assert!(!session(&mut controller, "a").has_subscriptions());
+        assert_eq!(Vec::<&str>::new(), wanted(&controller));
+    }
+
+    #[actix::test]
+    async fn the_driver_keeps_the_subscriptions_of_entities_that_go_away() {
+        let mut controller = new_controller();
+        add_idle_device(&mut controller, "A");
+        add_session(&mut controller, "a");
+        let ids = vec!["media_player.A".to_owned(), "sensor.mute.X".to_owned()];
+        controller.subscribe("a", Some(ids.clone()));
+        controller
+            .entities
+            .insert("sensor.mute.X".into(), map(json!({ "state": "ON" })));
+        controller.purge_entities();
+        assert!(!controller.entities.contains_key("sensor.mute.X"));
+        let mut subscribed: Vec<String> = session(&mut controller, "a")
+            .subscribed_entities
+            .iter()
+            .cloned()
+            .collect();
+        subscribed.sort_unstable();
+        assert_eq!(ids, subscribed);
+        controller.remove_device("A");
+        assert_eq!(2, session(&mut controller, "a").subscribed_entities.len());
+    }
+
+    #[actix::test]
+    async fn a_remote_that_slept_before_it_subscribed_gets_the_change_when_it_subscribes() {
+        let mut controller = new_controller();
+        let id = "media_player.KEY";
+        let (_, kind) = EntityKind::parse(id).expect("id");
+        controller
+            .entities
+            .insert(id.into(), map(json!({ "state": "ON" })));
+        let texts = Arc::default();
+        let remote = R2Session::new(Remote(Arc::clone(&texts)).start().recipient());
+        controller.sessions.insert("a".into(), remote);
+        assert_eq!(1, controller.entity_states("a").len());
+        session(&mut controller, "a").standby = true;
+        controller
+            .entities
+            .insert(id.into(), map(json!({ "state": "OFF" })));
+        controller.send_changes(kind, id, &["state".into()]);
+        session(&mut controller, "a").standby = false;
+        controller.send_missed_states("a");
+        settle().await;
+        assert_eq!(0, sent(&texts).len());
+        controller.subscribe("a", Some(vec![id.into()]));
+        settle().await;
+        let texts = sent(&texts);
+        assert_eq!(1, texts.len());
+        assert!(texts[0].contains(r#""state":"OFF""#), "{}", texts[0]);
     }
 
     #[actix::test]

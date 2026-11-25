@@ -157,6 +157,8 @@ pub struct WantState {
     pub reconnect: bool,
     /// The status of the actor.
     pub status: DeviceStatus,
+    /// The entities keep their state while not connected.
+    pub keep_state: bool,
 }
 
 /// Result of a connect: the receiver, its changes and its address.
@@ -1936,6 +1938,11 @@ impl Handler<Disconnect> for DenonActor {
     type Result = ();
 
     fn handle(&mut self, _: Disconnect, ctx: &mut Self::Context) {
+        // Not connected and not asked to connect: nothing to end. The entities keep their shown
+        // state.
+        if !self.want && self.avr.is_none() && self.status == DeviceStatus::Disconnected {
+            return;
+        }
         self.want = false;
         // The other timers stop in `close`: a connect that is asked for during the wait below
         // keeps the connection and needs them.
@@ -2001,6 +2008,7 @@ impl Handler<Wants> for DenonActor {
             want: self.want,
             reconnect: self.timers.reconnect.is_some(),
             status: self.status,
+            keep_state: self.keep_state,
         })
     }
 }
