@@ -17,6 +17,7 @@ use denon_marantz::{Avr, Command, RemoteKey, State, Zone};
 use serde_json::{Map, Value};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
 use tokio::time::sleep;
 
 /// A mute value from a command is used for the next toggle until the receiver reports it.
@@ -52,7 +53,9 @@ impl Expected {
 
 /// Run the steps of a remote command one after the other. The lock is taken for each step only,
 /// so that other commands, for example the volume buttons, do not wait for a long run. The run
-/// ends before the next step when `stopped` is true.
+/// ends before the next step when `stop` gets a new value or its sender is dropped, also while it
+/// waits for the delay or the lock. `Ok(Some(n))`: the run stopped after `n` steps. `Ok(None)`: all
+/// steps were sent.
 pub async fn run_steps(
     avr: &Avr,
     heos: Option<&heos::Link>,
@@ -60,22 +63,26 @@ pub async fn run_steps(
     expected: &Expected,
     run: &remote::RemoteRun,
     lock: &tokio::sync::Mutex<()>,
-    stopped: impl Fn() -> bool,
-) -> Result<(), ServiceError> {
-    let mut first = true;
+    mut stop: watch::Receiver<()>,
+) -> Result<Option<u64>, ServiceError> {
+    let mut sent: u64 = 0;
     // The last toggle line of each command sent in this run. The receiver can answer after the
     // next step: the next toggle reads them, so that it does not send the same value again.
     let mut toggled: Vec<(&str, String)> = Vec::new();
     for action in &run.actions {
         for _ in 0..run.repeat {
-            if !first && !run.delay.is_zero() {
-                sleep(run.delay).await;
+            if sent > 0 && !run.delay.is_zero() {
+                tokio::select! {
+                    biased;
+                    _ = stop.changed() => return Ok(Some(sent)),
+                    () = sleep(run.delay) => {}
+                }
             }
-            if stopped() {
-                return Ok(());
-            }
-            first = false;
-            let _guard = lock.lock().await;
+            let _guard = tokio::select! {
+                biased;
+                _ = stop.changed() => return Ok(Some(sent)),
+                guard = lock.lock() => guard,
+            };
             match action {
                 Action::Simple(entry) if entry.toggles() => {
                     let mut state = avr.snapshot();
@@ -93,9 +100,10 @@ pub async fn run_steps(
                 }
                 _ => action_run(avr, heos, cfg, expected, action.clone(), None).await?,
             }
+            sent += 1;
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// The command does not read the state, so it can run before the start has read it. Next,

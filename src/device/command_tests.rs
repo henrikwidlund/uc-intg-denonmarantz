@@ -4,12 +4,14 @@
 //! Entity commands against a fake receiver: the commands that the library sends.
 
 use super::Command;
-use super::commands::{Expected, run};
+use super::commands::{Expected, run, run_steps};
 use crate::config_store::DeviceConfig;
-use crate::entities::{EntityKind, NumberKind, SelectKind, SwitchKind};
+use crate::entities::{EntityKind, NumberKind, SelectKind, SwitchKind, remote};
 use crate::errors::ServiceError;
 use crate::test_support::Fake;
 use serde_json::{Map, Value, json};
+use std::time::Duration;
+use tokio::sync::watch;
 
 fn cfg() -> DeviceConfig {
     DeviceConfig {
@@ -211,4 +213,109 @@ async fn a_sensor_has_no_commands() {
     )
     .await;
     assert!(matches!(result, Err(ServiceError::NotSupported(_))));
+}
+
+/// A run in these tests ends well before this time. A run that does not end fails the test.
+const RUN_LIMIT: Duration = Duration::from_secs(10);
+
+/// A run of 3 `cursor_up` steps with `delay_ms` between them.
+fn cursor_up_run(delay_ms: u64) -> remote::RemoteRun {
+    let p = json!({ "sequence": ["cursor_up"], "repeat": 3, "delay": delay_ms });
+    remote::command("send_cmd_sequence", Some(&params(&p))).expect("run")
+}
+
+/// Run three steps while the lock is held by another command. `end` runs while the run waits for
+/// the lock, then the lock is free. The sender that `end` returns lives until the run ends.
+/// Returns the result of the run and the commands that the receiver got.
+async fn steps_after_wait(
+    end: impl FnOnce(watch::Sender<()>) -> Option<watch::Sender<()>>,
+) -> (Option<u64>, Vec<String>) {
+    let fake = Fake::start(true).await;
+    let avr = fake.avr().await;
+    let run = cursor_up_run(0);
+    let lock = tokio::sync::Mutex::new(());
+    let (stop_tx, stop) = watch::channel(());
+    let (cfg, expected) = (cfg(), Expected::default());
+    let held = lock.lock().await;
+    let steps = run_steps(&avr, None, &cfg, &expected, &run, &lock, stop);
+    let release = async {
+        tokio::task::yield_now().await;
+        let kept = end(stop_tx);
+        drop(held);
+        kept
+    };
+    let (result, _kept) = tokio::time::timeout(RUN_LIMIT, async { tokio::join!(steps, release) })
+        .await
+        .expect("the run ends");
+    (result.expect("the run works"), fake.commands())
+}
+
+#[tokio::test]
+async fn a_run_sends_all_steps_after_the_lock_is_free() {
+    let (stopped, commands) = steps_after_wait(Some).await;
+    assert_eq!(None, stopped);
+    assert_eq!(3, commands.len(), "{commands:?}");
+}
+
+#[tokio::test]
+async fn a_stop_while_the_run_waits_for_the_lock_sends_nothing() {
+    let result = steps_after_wait(|stop| {
+        stop.send_replace(());
+        Some(stop)
+    })
+    .await;
+    assert_eq!((Some(0), Vec::new()), result);
+}
+
+#[tokio::test]
+async fn a_run_ends_when_the_stop_sender_is_dropped() {
+    assert_eq!((Some(0), Vec::new()), steps_after_wait(|_| None).await);
+}
+
+#[tokio::test]
+async fn a_stop_before_the_subscribe_does_not_stop_the_run() {
+    let (stop_tx, _) = watch::channel(());
+    stop_tx.send_replace(());
+    let stop = stop_tx.subscribe();
+    let fake = Fake::start(true).await;
+    let avr = fake.avr().await;
+    let run = cursor_up_run(0);
+    let lock = tokio::sync::Mutex::new(());
+    let (cfg, expected) = (cfg(), Expected::default());
+    let steps = run_steps(&avr, None, &cfg, &expected, &run, &lock, stop);
+    let stopped = tokio::time::timeout(RUN_LIMIT, steps)
+        .await
+        .expect("the run ends")
+        .expect("the run works");
+    assert_eq!(None, stopped);
+    assert_eq!(3, fake.commands().len());
+}
+
+#[tokio::test]
+async fn a_stop_during_the_delay_ends_the_run_at_once() {
+    let fake = Fake::start(true).await;
+    let avr = fake.avr().await;
+    let run = cursor_up_run(5000);
+    let lock = tokio::sync::Mutex::new(());
+    let (stop_tx, stop) = watch::channel(());
+    let (cfg, expected) = (cfg(), Expected::default());
+    let start = std::time::Instant::now();
+    let steps = run_steps(&avr, None, &cfg, &expected, &run, &lock, stop);
+    let stopper = async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fake.commands().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the first step");
+        // The first step was received. A stop during the step or the delay ends the run before the
+        // next step.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stop_tx.send_replace(());
+    };
+    let (result, ()) = tokio::join!(steps, stopper);
+    assert_eq!(Some(1), result.expect("the run works"));
+    assert_eq!(1, fake.commands().len());
+    assert!(start.elapsed() < Duration::from_secs(4));
 }

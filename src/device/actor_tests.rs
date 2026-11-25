@@ -757,6 +757,23 @@ async fn a_late_sequence_does_not_start_and_stop_send_stops_a_running_one() {
 }
 
 #[actix::test]
+async fn a_stop_before_a_sequence_does_not_stop_it() {
+    let rig = rig(answers_all, QUICK).await;
+    until("the first read", 5, || rig.telnet.count("SLP?") >= 1).await;
+    rig.telnet.send("PWON");
+    let stop = Command::new(EntityKind::Remote, "stop_send".into(), None);
+    rig.actor.send(stop).await.expect("send").expect("stop");
+    let params = serde_json::json!({ "sequence": ["cursor_up"], "repeat": 3 });
+    let run = Command::new(
+        EntityKind::Remote,
+        "send_cmd_sequence".into(),
+        params.as_object().cloned(),
+    );
+    rig.actor.send(run).await.expect("send").expect("run");
+    until("all steps", 5, || rig.telnet.count("MNCUP") == 3).await;
+}
+
+#[actix::test]
 async fn a_repeated_toggle_switches_each_time() {
     // The receiver does not answer the change: only the run knows what it sent.
     let rig = rig(answers_all, QUICK).await;
@@ -2098,6 +2115,44 @@ async fn a_command_that_waits_for_the_start_is_answered_before_its_deadline() {
         rig.telnet.count(line) + rig.http.commands().iter().filter(|c| *c == line).count()
     };
     assert_eq!(0, sent("MUON") + sent("MUOFF"));
+}
+
+/// Send a sequence of 3 steps while the start reads slowly, and with `stop` a stop after it.
+/// Returns how many steps the receiver got, counted 500 ms after the start ended.
+async fn sequence_during_the_start(stop: bool) -> usize {
+    let (rig, connected) = slow_start_rig().await;
+    let params = serde_json::json!({ "sequence": ["cursor_up"], "repeat": 3 });
+    let run = Command::new(
+        EntityKind::Remote,
+        "send_cmd_sequence".into(),
+        params.as_object().cloned(),
+    );
+    rig.actor.send(run).await.expect("send").expect("run");
+    if stop {
+        let stop = Command::new(EntityKind::Remote, "stop_send".into(), None);
+        rig.actor.send(stop).await.expect("send").expect("stop");
+    }
+    // The run waits for the start.
+    assert_eq!(
+        connected,
+        status_count(&rig.events, DeviceStatus::Connected)
+    );
+    until("connected", 10, || {
+        status_count(&rig.events, DeviceStatus::Connected) > connected
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    rig.telnet.count("MNCUP") + rig.http.commands().iter().filter(|c| *c == "MNCUP").count()
+}
+
+#[actix::test]
+async fn a_sequence_that_waits_for_the_start_is_sent_after_it() {
+    assert_eq!(3, sequence_during_the_start(false).await);
+}
+
+#[actix::test]
+async fn a_stop_while_a_sequence_waits_for_the_start_sends_nothing() {
+    assert_eq!(0, sequence_during_the_start(true).await);
 }
 
 #[actix::test]

@@ -23,7 +23,6 @@ use futures::StreamExt;
 use log::{debug, info, warn};
 use serde_json::Map;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, watch};
 use tokio::time::{sleep_until, timeout, timeout_at};
@@ -289,8 +288,9 @@ pub struct DenonActor {
     signal_interval: Option<Duration>,
     /// Commands run one after the other.
     cmd_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Incremented by `stop_send`. A remote run stops when it changed since the run started.
-    run_stop: Arc<AtomicU64>,
+    /// Gets a new value on `stop_send`. A remote run stops when it gets one after its command was
+    /// received.
+    run_stop: watch::Sender<()>,
     expected: Arc<Expected>,
     timers: Timers,
     /// Stops the start task of the library. Dropping `Started` does not stop it, and it holds
@@ -366,7 +366,7 @@ impl DenonActor {
             poll_interval: HTTP_POLL_INTERVAL,
             signal_interval: None,
             cmd_lock: Arc::default(),
-            run_stop: Arc::default(),
+            run_stop: watch::Sender::new(()),
             expected: Arc::default(),
             timers: Timers::default(),
             start_stopper: None,
@@ -811,12 +811,13 @@ impl DenonActor {
         changed
     }
 
-    /// The answer to a command that needs no receiver. A stop only ends the running remote
-    /// commands. A command that waited in the mailbox until its time is over does nothing, also no
-    /// connect. A remote command with more steps can run longer once it has started.
+    /// The answer to a command that needs no receiver. A stop ends the remote runs that were
+    /// received before it. A command that waited in the mailbox until its time is over does
+    /// nothing, also no connect. A remote command with more steps can run longer once it has
+    /// started.
     fn answer_at_once(&self, msg: &Command) -> Option<Result<(), ServiceError>> {
         if msg.kind == EntityKind::Remote && remote::is_stop(&msg.cmd_id) {
-            self.run_stop.fetch_add(1, Ordering::Relaxed);
+            self.run_stop.send_replace(());
             return Some(Ok(()));
         }
         if tokio::time::Instant::now() >= msg.deadline {
@@ -1335,8 +1336,7 @@ impl DenonActor {
         let cfg = self.cfg.clone();
         let expected = self.expected.clone();
         let received = Instant::now();
-        let stop = self.run_stop.clone();
-        let started = stop.load(Ordering::Relaxed);
+        let stop = self.run_stop.subscribe();
         ctx.spawn(
             async move {
                 connect_ended(connecting).await;
@@ -1347,6 +1347,10 @@ impl DenonActor {
                 let heos = act.heos.clone();
                 let name = act.cfg.name.clone();
                 async move {
+                    if stop.has_changed().unwrap_or(true) {
+                        debug!("[{name}] {} stopped, steps sent: 0", command_name(&msg));
+                        return;
+                    }
                     let Some(avr) = avr else {
                         warn!(
                             "[{name}] {}: the receiver is not connected",
@@ -1355,7 +1359,6 @@ impl DenonActor {
                         return;
                     };
                     log_sending(&name, &msg, received, false);
-                    let stopped = || stop.load(Ordering::Relaxed) != started;
                     let result = commands::run_steps(
                         &avr,
                         heos.as_ref(),
@@ -1363,10 +1366,16 @@ impl DenonActor {
                         &expected,
                         &run,
                         &lock,
-                        stopped,
+                        stop,
                     )
                     .await;
-                    let _ = sent(result, &name, command_name(&msg), false);
+                    if let Ok(Some(steps)) = result {
+                        debug!(
+                            "[{name}] {} stopped, steps sent: {steps}",
+                            command_name(&msg)
+                        );
+                    }
+                    let _ = sent(result.map(drop), &name, command_name(&msg), false);
                 }
                 .into_actor(act)
             }),
@@ -2325,6 +2334,7 @@ fn signal_every(cfg: &DeviceConfig, poll: Duration) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     /// A deadline that leaves `wait` for the wait before the send.
     fn deadline_after(wait: Duration) -> tokio::time::Instant {
