@@ -6,11 +6,21 @@
 
 use crate::Fail;
 use denon_marantz::proto::source::telnet_to_display_source;
+use denon_marantz::proto::telnet::EventZone;
 use denon_marantz::proto::{DiracFilter, DiracSlot, Sleep};
 use denon_marantz::{
-    Ask, Avr, Feature, Query, QueryGroup, SettingStatus, StartOptions, State, Zone,
+    Ask, Avr, Feature, Query, QueryGroup, SettingStatus, StartOptions, State, TelnetEvent, Zone,
 };
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::broadcast::error::RecvError;
+
+/// The longest wait for the answer to the volume query. The receiver answers late while other
+/// queries of the connection wait before them.
+const VOLUME_ANSWER: Duration = Duration::from_secs(10);
+
+/// How long more volume lines are collected after the first one.
+const VOLUME_LAST_LINES: Duration = Duration::from_millis(300);
 
 pub struct Oracle {
     avr: Arc<Avr>,
@@ -74,6 +84,37 @@ impl Oracle {
         self.avr.setting_status(feature)
     }
 
+    /// Ask the receiver for the volume of the main zone and wait for the answer. The volume is on
+    /// the scale of the Remote (dB plus 80). A query clears the filter of repeated events in the
+    /// library, so the answer always comes as an event.
+    pub async fn fresh_volume(&self) -> Result<f64, Fail> {
+        let mut events = self.avr.telnet_events();
+        self.avr.telnet_ask(&[Ask::Query(Query::Volume)]).await?;
+        let mut end = tokio::time::Instant::now() + VOLUME_ANSWER;
+        let mut answered = false;
+        loop {
+            match tokio::time::timeout_at(end, events.recv()).await {
+                Ok(Ok(event)) if answers_volume(&event) && !answered => {
+                    answered = true;
+                    end = tokio::time::Instant::now() + VOLUME_LAST_LINES;
+                }
+                Ok(Ok(_) | Err(RecvError::Lagged(_))) => {}
+                Ok(Err(RecvError::Closed)) | Err(_) => break,
+            }
+        }
+        if !answered {
+            return Err(Fail::new("the receiver did not answer the volume query"));
+        }
+        remote_volume(&self.state())
+            .ok_or_else(|| Fail::new("the receiver has no volume of the main zone"))
+    }
+
+    /// The volume of the main zone that the connection has, on the scale of the Remote. It is not
+    /// asked again: see [`Oracle::fresh_volume`].
+    pub fn volume(&self) -> Option<f64> {
+        remote_volume(&self.state())
+    }
+
     pub fn avr(&self) -> &Avr {
         &self.avr
     }
@@ -85,6 +126,19 @@ impl Oracle {
     pub async fn close(&self) {
         self.avr.telnet_disconnect().await;
     }
+}
+
+/// A volume line of the main zone. `MVMAX` is not an event.
+fn answers_volume(event: &TelnetEvent) -> bool {
+    event.zone == EventZone::Main && event.event.code() == "MV"
+}
+
+/// The volume of the main zone on the scale of the Remote: dB plus 80.
+fn remote_volume(state: &State) -> Option<f64> {
+    state
+        .zone(Zone::Main)
+        .volume
+        .map(|v| f64::from(v.db()) + 80.0)
 }
 
 fn on_off(value: Option<bool>) -> Option<String> {
@@ -281,6 +335,39 @@ mod tests {
             .into_iter()
             .find(|(name, _)| *name == "select.dirac_filter")
             .and_then(|(_, value)| value)
+    }
+
+    fn event(line: &str) -> TelnetEvent {
+        let message = Message::parse(line).unwrap_or_else(|| panic!("not a message: {line}"));
+        TelnetEvent {
+            zone: message.zone,
+            event: message.event,
+            parameter: message.parameter.into(),
+        }
+    }
+
+    #[test]
+    fn only_a_main_zone_volume_line_answers_the_volume_query() {
+        assert!(answers_volume(&event("MV45")));
+        assert!(answers_volume(&event("MV455")));
+        assert!(!answers_volume(&event("Z245")), "zone 2");
+        assert!(!answers_volume(&event("MUON")));
+        assert!(!answers_volume(&event("PWON")));
+        // The maximum volume line is no event, or not a volume answer.
+        assert!(Message::parse("MVMAX 98").is_none_or(|m| {
+            !answers_volume(&TelnetEvent {
+                zone: m.zone,
+                event: m.event,
+                parameter: m.parameter.into(),
+            })
+        }));
+    }
+
+    #[test]
+    fn the_volume_is_on_the_scale_of_the_remote() {
+        assert_eq!(None, remote_volume(&state(&["PWON"])));
+        assert_eq!(Some(45.0), remote_volume(&state(&["PWON", "MV45"])));
+        assert_eq!(Some(35.5), remote_volume(&state(&["PWON", "MV355"])));
     }
 
     #[test]

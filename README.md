@@ -269,13 +269,19 @@ receiver. It opens a second connection to the receiver and checks that every sel
 receiver has, after each change. It also sends the simple commands of the remote entity, but not the triggers,
 the remote lock and the LFE level of the 7.1 input. It starts the driver without mDNS, so it needs no root
 rights. The checks switch the receiver on and off and change source, sound mode and some settings, and restore
-them. While the simple commands are sent, the sound can stop for some seconds, for example when HDMI audio
-goes to the TV. The settings that they change are saved in `remote-sim-restore.txt` in the repository folder
-first. If a run stops before they are set back, the next run sets them back at its start. While the file is
-still there, the checks that change these settings are skipped. A source change stops HEOS and AirPlay, and
-they do not start again. The volume never goes above -40 dB. The `heos` check compares
-the media player with a second HEOS connection, pauses and plays once. Start HEOS Music on the main zone
-before the run, else the check is skipped.
+them, also when a check fails. The `mute` check runs only if the mute state is known, the receiver is not
+muted, its volume is at or below -40 dB and the driver shows the same volume as the receiver. An unmute comes
+only after the volume is at or below the volume before the change and at or below -40 dB (the volume of the
+receiver, or of the driver without the second connection). At the end, `restore_power` sets the power and the
+mute state back to the start and, with the second connection, lowers the volume to the start volume (not above
+-40 dB) if it is higher. While the simple commands are sent, the sound can stop for some seconds, for example
+when HDMI audio goes to the TV. The settings that they change are saved in `remote-sim-restore.txt` in the
+repository folder first. If a run stops before they are set back, the next run sets them back at its start.
+While the file is still there, the checks that change these settings are skipped. A source change stops HEOS
+and AirPlay, and they do not start again. The checks never set the volume above -40 dB. A power on can start
+with a higher volume of the receiver: if it is above -40 dB, it is lowered to -40 dB at once. The `heos` check
+compares the media player with a second HEOS connection, pauses and plays once. Start HEOS Music on the main
+zone before the run, else the check is skipped.
 
 ```shell
 cargo build --release
@@ -291,12 +297,17 @@ Options:
 - `--kinds a,b` limits the select sweep to these selects, for example `dirac_filter`.
 - `--avoid-sources a,b`: the checks never select a source whose name contains one of these, without case.
   Without this option the checks select no source: the `source` check is skipped and `http_mode` does not
-  change the source. The simple command check never sends source commands.
+  change the source. If the source at the start is one of these, no source is changed either, because the
+  checks select the start source again after the change. The simple command check never sends source commands.
 - `--kinds` and `--avoid-sources` can be given more than once; the lists are joined. A missing value, a value
   without names and a value that starts with `-` are refused. Spaces around names are removed.
 - Only one receiver address is allowed.
 - `--no-power` skips the power check. The other checks still switch the receiver on if it is off.
 - `--no-oracle` does not open the second connection. The values are then not compared with the receiver.
+  Without the second connection the volume cannot be read from the receiver, so the checks do not switch the
+  receiver on: a check that needs a power on is skipped. The `power`, `volume`, `select_sweep`,
+  `settings_restore` and `simple_commands` checks are also skipped. The `mute` check then uses the volume of
+  the driver.
 - `--driver <path>`, `--port <port>` and `--commands <path>` change the driver binary, the port and the
   command table. The default driver binary is `target/release/uc-intg-denonmarantz` and the default command
   table is `resources/commands.tsv`, both in the repository folder, so the tool works from any folder.

@@ -54,7 +54,9 @@ const STEPS: [&str; 29] = [
 ];
 /// Steps that set up the driver and connect it. The other checks need them.
 const BASE_STEPS: [&str; 3] = ["setup", "entities", "states"];
-/// Steps at the end that switch the receiver back off and check the driver log. They always run.
+/// Steps at the end that set the power and the mute state back to the start, lower the volume to
+/// the start volume (not above -40 dB, only with the second connection) if it is higher, and check
+/// the driver log. They always run.
 const END_STEPS: [&str; 2] = ["restore_power", "log"];
 /// Steps that run only if `--only` names them.
 const OPT_IN_STEPS: [&str; 0] = [];
@@ -152,6 +154,12 @@ impl Options {
     }
 }
 
+/// Mute and volume of the receiver at the start of the run.
+pub struct Start {
+    pub muted: Option<bool>,
+    pub volume: Option<f64>,
+}
+
 pub struct Ctx {
     pub opt: Options,
     pub client: Client,
@@ -162,6 +170,9 @@ pub struct Ctx {
     pub key: String,
     /// The receiver was on at the start.
     pub was_on: bool,
+    /// Mute and volume at the start of the run, as read by the `states` step. `None` before that
+    /// step.
+    pub start: Option<Start>,
     /// The driver shows the tuner entities: the setup option, else what `Deviceinfo.xml` says.
     pub tuner: bool,
     report: Vec<String>,
@@ -390,6 +401,7 @@ async fn main() {
         oracle: None,
         key: String::new(),
         was_on: true,
+        start: None,
         tuner: true,
         report: Vec::new(),
         failed: 0,
@@ -458,10 +470,11 @@ async fn middle_steps(ctx: &mut Ctx) {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
-    fn options(avoid: &[&str]) -> Options {
+    /// Options for tests, with these sources to avoid.
+    pub fn options(avoid: &[&str]) -> Options {
         Options {
             address: String::new(),
             bin: PathBuf::new(),

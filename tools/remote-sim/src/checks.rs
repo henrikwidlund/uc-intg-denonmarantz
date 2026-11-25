@@ -251,39 +251,144 @@ fn current_volume(ctx: &Ctx) -> Option<f64> {
     ctx.client.attr(&ctx.mp(), "volume")?.as_f64()
 }
 
-/// Switch the receiver on. A power on can set the power-on volume of the receiver: it is lowered
-/// at once if it is above the limit.
-async fn power_on(ctx: &mut Ctx) -> Result<String, Fail> {
-    let mp = ctx.mp();
-    ctx.client
-        .command_ok("media_player", &mp, "on", json!({}))
-        .await?;
-    ctx.client
-        .wait_attr(&mp, "state", 20, |v| v.as_str().is_some_and(is_on))
-        .await?;
-    ctx.client.listen(1).await?;
-    if let Some(v) = current_volume(ctx).filter(|v| *v > MAX_VOLUME) {
-        ctx.client
-            .command_ok(
-                "media_player",
-                &mp,
-                "volume",
-                json!({ "volume": MAX_VOLUME }),
-            )
-            .await?;
-        return Err(Fail::new(format!(
-            "the volume after power on was {v} (limit {MAX_VOLUME}), it was lowered"
-        )));
+/// The higher of two volumes. A missing volume does not count.
+fn highest(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
     }
-    Ok(String::new())
+}
+
+/// The lower of two volumes. A missing volume does not count.
+fn lowest(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// The volume that the driver shows, after the waiting events are read. It can be old: the
+/// library keeps the volume of before a standby.
+async fn driver_volume(ctx: &mut Ctx) -> Result<Option<f64>, Fail> {
+    ctx.client.listen_ms(300).await?;
+    Ok(current_volume(ctx))
+}
+
+/// The volume that the receiver has, asked on the second connection. `None` without that
+/// connection.
+async fn receiver_volume(ctx: &Ctx) -> Result<Option<f64>, Fail> {
+    match &ctx.oracle {
+        Some(oracle) => Ok(Some(oracle.fresh_volume().await?)),
+        None => Ok(None),
+    }
+}
+
+/// The volume before a change, as the limit for a set back: the lower of the receiver and the
+/// driver volume.
+async fn baseline_volume(ctx: &mut Ctx) -> Result<Option<f64>, Fail> {
+    let receiver = receiver_volume(ctx).await?;
+    Ok(lowest(receiver, driver_volume(ctx).await?))
+}
+
+/// The highest known volume: the higher of the receiver and the driver volume. Fails without a
+/// known volume.
+async fn highest_volume(ctx: &mut Ctx) -> Result<f64, Fail> {
+    let receiver = receiver_volume(ctx).await?;
+    highest(receiver, driver_volume(ctx).await?).ok_or_else(|| Fail::new("no volume"))
+}
+
+/// Switch the receiver on. A power on can set the power-on volume of the receiver: it is lowered
+/// at once if it is above the limit. The library keeps the volume of before the standby, so the
+/// driver can show that old volume at once. The receiver is asked on the second connection, and
+/// without that connection the receiver is not switched on.
+async fn power_on(ctx: &mut Ctx) -> Result<String, Fail> {
+    if ctx.oracle.is_none() {
+        return Err(Fail::skip(
+            "no second connection: no power on, the volume after it cannot be read from the receiver",
+        ));
+    }
+    let mp = ctx.mp();
+    let on = async {
+        ctx.client
+            .command_ok("media_player", &mp, "on", json!({}))
+            .await?;
+        ctx.client
+            .wait_attr(&mp, "state", 20, |v| v.as_str().is_some_and(is_on))
+            .await?;
+        ctx.client.listen(1).await
+    }
+    .await;
+    // The volume check runs also after an error: the receiver can be on.
+    let check = power_on_volume(ctx).await;
+    match on {
+        Ok(()) => check,
+        Err(e) => join_errors(Err(Fail::new(format!("power on: {e}"))), check.map(|_| ()))
+            .map(|()| String::new()),
+    }
+}
+
+/// The volume check after a power on: read the volume of the receiver, with one more try. If it
+/// is not known, mute. If it is above the limit, lower it and fail.
+async fn power_on_volume(ctx: &mut Ctx) -> Result<String, Fail> {
+    let mp = ctx.mp();
+    let ask = async |ctx: &mut Ctx| {
+        receiver_volume(ctx)
+            .await
+            .and_then(|v| v.ok_or_else(|| Fail::new("no second connection")))
+    };
+    // One more try, then mute: the volume can be loud.
+    let v = match ask(ctx).await {
+        Ok(v) => v,
+        Err(_) => match ask(ctx).await {
+            Ok(v) => v,
+            Err(e) => {
+                let mute = async {
+                    ctx.client
+                        .command_ok("media_player", &mp, "mute", json!({}))
+                        .await?;
+                    ctx.client
+                        .wait_attr(&mp, "muted", 6, |v| *v == json!(true))
+                        .await
+                };
+                let muted = match mute.await {
+                    Ok(_) => "the receiver was muted".to_owned(),
+                    Err(m) => format!("mute failed: {m}"),
+                };
+                return Err(Fail::new(format!(
+                    "the volume after power on is not known after 2 tries: {e}; {muted}"
+                )));
+            }
+        },
+    };
+    if v <= MAX_VOLUME {
+        return Ok(String::new());
+    }
+    lower_volume(ctx, None).await.map_err(|e| {
+        Fail::new(format!(
+            "the volume after power on was {v} (limit {MAX_VOLUME}), not lowered: {e}"
+        ))
+    })?;
+    Err(Fail::new(format!(
+        "the volume after power on was {v} (limit {MAX_VOLUME}), it was lowered"
+    )))
 }
 
 async fn ensure_on(ctx: &mut Ctx) -> Result<(), Fail> {
     let state = ctx.client.text(&ctx.mp(), "state");
     if !is_on(&state) {
-        power_on(ctx).await?;
+        switch_on(ctx).await?;
     }
     Ok(())
+}
+
+/// Switch the receiver on. If it was on at the start, the volume is lowered to the start volume
+/// with [`on_again`] (to [`MAX_VOLUME`] if the start volume is not known); else [`power_on`]
+/// lowers it to [`MAX_VOLUME`].
+async fn switch_on(ctx: &mut Ctx) -> Result<(), Fail> {
+    match ctx.start.as_ref().filter(|_| ctx.was_on).map(|s| s.volume) {
+        Some(volume) => on_again(ctx, volume).await,
+        None => power_on(ctx).await.map(|_| ()),
+    }
 }
 
 /// Select an option of a select entity and wait for the sensor of the same value.
@@ -327,6 +432,207 @@ async fn set_option(ctx: &mut Ctx, kind: &str, option: &str, secs: u64) -> Resul
     ctx.client
         .wait_text(&select, "current_option", secs, option)
         .await
+}
+
+/// Join the result of a check with the result of the step that sets the receiver back. The error
+/// of the check comes first. A failed set back is always a failure, also after a skip.
+fn first_error<T>(body: Result<T, Fail>, undo: Result<(), Fail>) -> Result<T, Fail> {
+    match (body, undo) {
+        (body, Ok(())) => body,
+        (Ok(_), Err(undo)) => Err(Fail::new(format!("not set back: {undo}"))),
+        (Err(body), Err(undo)) => Err(Fail::new(format!("{body}; not set back: {undo}"))),
+    }
+}
+
+/// The highest volume that a set back or an unmute may leave: not above the volume before the
+/// change and not above [`MAX_VOLUME`].
+fn unmute_limit(before: Option<f64>) -> f64 {
+    before.map_or(MAX_VOLUME, |b| b.min(MAX_VOLUME))
+}
+
+/// The telnet command that sets the volume of the main zone to `target`, on the scale of the
+/// Remote: `MV35` for 35, `MV355` for 35.5. `None` for a value that is not a whole or a half
+/// number, or that is outside 0 to [`MAX_VOLUME`].
+fn mv_command(target: f64) -> Option<String> {
+    if !(0.0..=MAX_VOLUME).contains(&target) || (target * 2.0).fract() != 0.0 {
+        return None;
+    }
+    let whole = target.trunc();
+    Some(if target == whole {
+        format!("MV{whole:02}")
+    } else {
+        format!("MV{whole:02}5")
+    })
+}
+
+/// How a volume is sent.
+#[derive(Debug, PartialEq)]
+enum VolumePlan {
+    /// A volume command of the media player.
+    Volume(f64),
+    /// A telnet command through the remote entity. If the driver refuses it, `fallback`, the next
+    /// lower whole number, goes as a volume command of the media player.
+    Raw { command: String, fallback: f64 },
+}
+
+/// How to send the volume `target`. A whole number goes as a volume command. A half number goes
+/// as a telnet command. Another number goes as the next lower whole number. Fails for a volume
+/// that is above [`MAX_VOLUME`], below 0 or not a number.
+fn volume_plan(target: f64) -> Result<VolumePlan, Fail> {
+    ensure!(
+        (0.0..=MAX_VOLUME).contains(&target),
+        "volume {target} is not in 0 to {MAX_VOLUME}, not sent"
+    );
+    if target.fract() == 0.0 {
+        return Ok(VolumePlan::Volume(target));
+    }
+    Ok(match mv_command(target) {
+        Some(command) => VolumePlan::Raw {
+            command,
+            fallback: target.floor(),
+        },
+        None => VolumePlan::Volume(target.floor()),
+    })
+}
+
+/// Set the volume by the plan of [`volume_plan`]. Returns the volume that was sent.
+async fn set_volume(ctx: &mut Ctx, target: f64) -> Result<f64, Fail> {
+    let mp = ctx.mp();
+    let sent = match volume_plan(target)? {
+        VolumePlan::Volume(v) => v,
+        VolumePlan::Raw { command, fallback } => {
+            let remote = ctx.remote();
+            let answer = ctx
+                .client
+                .command("remote", &remote, "send_cmd", json!({ "command": command }))
+                .await;
+            if answer.is_ok_and(|(response, _)| response["code"] == 200) {
+                return Ok(target);
+            }
+            fallback
+        }
+    };
+    ctx.client
+        .command_ok("media_player", &mp, "volume", json!({ "volume": sent }))
+        .await?;
+    Ok(sent)
+}
+
+/// The volume to send when the receiver has `fresh` and the limit is `limit`: the limit if the
+/// volume is above it, else nothing.
+fn volume_to_send(fresh: f64, limit: f64) -> Option<f64> {
+    (fresh > limit).then_some(limit)
+}
+
+/// The volume `v` is above `baseline`, the volume at the start, or above [`MAX_VOLUME`].
+fn above_baseline(v: f64, baseline: Option<f64>) -> bool {
+    v > baseline.map_or(MAX_VOLUME, |b| b.min(MAX_VOLUME))
+}
+
+/// Join two results of set back steps. All errors are kept.
+fn join_errors(a: Result<(), Fail>, b: Result<(), Fail>) -> Result<(), Fail> {
+    match (a, b) {
+        (Ok(()), b) => b,
+        (a, Ok(())) => a,
+        (Err(a), Err(b)) => Err(Fail::new(format!("{a}; {b}"))),
+    }
+}
+
+/// Lower the volume to [`unmute_limit`] if the receiver has a higher one. Only the volume of the
+/// receiver (second connection) decides if a volume is sent: the driver can show an old, higher
+/// volume, and the limit can be above the real volume. Without that connection nothing is sent,
+/// and a driver volume above the limit is an error.
+async fn lower_volume(ctx: &mut Ctx, before: Option<f64>) -> Result<(), Fail> {
+    let mp = ctx.mp();
+    let limit = unmute_limit(before);
+    let Some(now) = receiver_volume(ctx).await? else {
+        let shown = driver_volume(ctx)
+            .await?
+            .ok_or_else(|| Fail::new("no volume"))?;
+        ensure!(
+            shown <= limit,
+            "volume {shown} above {limit}, not lowered: no second connection"
+        );
+        return Ok(());
+    };
+    let Some(limit) = volume_to_send(now, limit) else {
+        return Ok(());
+    };
+    set_volume(ctx, limit).await?;
+    ctx.client
+        .wait_attr(&mp, "volume", 6, |v| v.as_f64().is_some_and(|x| x <= limit))
+        .await
+        .map_err(|e| Fail::new(format!("volume not lowered to {limit}: {e}")))?;
+    let after = receiver_volume(ctx).await?.unwrap_or(limit);
+    ensure!(after <= limit, "volume {after} after lowering to {limit}");
+    Ok(())
+}
+
+/// Unmute, but first lower the volume with [`lower_volume`]. Unmutes only if the higher of the
+/// receiver and the driver volume is at or below the limit.
+async fn unmute_safely(ctx: &mut Ctx, before: Option<f64>) -> Result<(), Fail> {
+    let mp = ctx.mp();
+    let limit = unmute_limit(before);
+    lower_volume(ctx, before)
+        .await
+        .map_err(|e| Fail::new(format!("{e}, not unmuted")))?;
+    let now = highest_volume(ctx)
+        .await
+        .map_err(|e| Fail::new(format!("{e}, not unmuted")))?;
+    ensure!(now <= limit, "volume {now} above {limit}, not unmuted");
+    ctx.client
+        .command_ok("media_player", &mp, "unmute", json!({}))
+        .await?;
+    ctx.client
+        .wait_attr(&mp, "muted", 6, |v| *v == json!(false))
+        .await?;
+    Ok(())
+}
+
+/// Set the mute state to `muted`. Without `force`, nothing is sent if the driver shows that
+/// state. An unmute goes through [`unmute_safely`].
+async fn set_muted(
+    ctx: &mut Ctx,
+    muted: bool,
+    before: Option<f64>,
+    force: bool,
+) -> Result<(), Fail> {
+    let mp = ctx.mp();
+    ctx.client.listen_ms(300).await?;
+    if !force && ctx.client.attr(&mp, "muted") == Some(&json!(muted)) {
+        return Ok(());
+    }
+    if !muted {
+        return unmute_safely(ctx, before).await;
+    }
+    ctx.client
+        .command_ok("media_player", &mp, "mute", json!({}))
+        .await?;
+    ctx.client
+        .wait_attr(&mp, "muted", 6, |v| *v == json!(true))
+        .await?;
+    Ok(())
+}
+
+/// Set a select back to `old`. Without `force`, nothing is sent if the select shows `old`.
+/// Does nothing without a real old option.
+async fn select_back(
+    ctx: &mut Ctx,
+    kind: &str,
+    old: &str,
+    secs: u64,
+    force: bool,
+) -> Result<(), Fail> {
+    if old.is_empty() || old == "--" {
+        return Ok(());
+    }
+    ctx.client.listen_ms(300).await?;
+    if !force && ctx.client.text(&ctx.select(kind), "current_option") == old {
+        return Ok(());
+    }
+    set_option(ctx, kind, old, secs)
+        .await
+        .map_err(|e| Fail::new(format!("{kind} back to {old}: {e}")))
 }
 
 // ---------------------------------------------------------------- setup
@@ -437,8 +743,13 @@ pub async fn states(ctx: &mut Ctx) -> Check {
     let state = wait_available(ctx, 20).await?;
     ctx.was_on = is_on(&state);
     ctx.client.listen(2).await?;
-    read_tuner(ctx).await?;
     let mp = ctx.mp();
+    // The driver values first: `restore_power` needs them if a later part of this step fails.
+    ctx.start = Some(crate::Start {
+        muted: ctx.client.attr(&mp, "muted").and_then(Value::as_bool),
+        volume: current_volume(ctx),
+    });
+    read_tuner(ctx).await?;
     let address = ctx.opt.address.clone();
     let connect = async {
         if ctx.opt.no_oracle {
@@ -452,6 +763,23 @@ pub async fn states(ctx: &mut Ctx) -> Check {
             ctx.oracle = Some(oracle);
             // The second telnet connection must not push the driver out.
             ctx.client.listen(3).await?;
+            // Read the start volume again, with the volume of the receiver.
+            if ctx.was_on
+                && let Ok(volume) = baseline_volume(ctx).await
+                && let Some(start) = &mut ctx.start
+            {
+                start.volume = volume;
+            }
+            // A mute state that the receiver and the driver do not agree on is not known.
+            let receiver_muted = ctx
+                .oracle
+                .as_ref()
+                .and_then(|oracle| oracle.state().zone(Zone::Main).muted);
+            if let Some(start) = &mut ctx.start
+                && start.muted != receiver_muted
+            {
+                start.muted = None;
+            }
             let after = ctx.client.text(&mp, "state");
             ensure!(
                 after != "UNAVAILABLE",
@@ -663,20 +991,32 @@ pub async fn remote_wake(ctx: &mut Ctx) -> Check {
 
 pub async fn selects(ctx: &mut Ctx) -> Check {
     ensure_on(ctx).await?;
-    let mut note = Vec::new();
-    for kind in ["dimmer", "eco_mode"] {
-        let start = Instant::now();
-        let (old, new) = change_select(ctx, kind, 6).await?;
-        let sensor = ctx.sensor(kind);
-        ctx.client.wait_text(&sensor, "value", 6, &new).await?;
-        note.push(format!(
-            "{kind} {old} -> {new} in {} ms",
-            start.elapsed().as_millis()
-        ));
-        set_option(ctx, kind, &old, 6).await?;
-        verify_all(ctx, 6).await?;
+    // The options before the change, for the set back.
+    let mut changed: Vec<(&str, String)> = Vec::new();
+    let result = async {
+        let mut note = Vec::new();
+        for kind in ["dimmer", "eco_mode"] {
+            changed.push((kind, ctx.client.text(&ctx.select(kind), "current_option")));
+            let start = Instant::now();
+            let (old, new) = change_select(ctx, kind, 6).await?;
+            let sensor = ctx.sensor(kind);
+            ctx.client.wait_text(&sensor, "value", 6, &new).await?;
+            note.push(format!(
+                "{kind} {old} -> {new} in {} ms",
+                start.elapsed().as_millis()
+            ));
+            set_option(ctx, kind, &old, 6).await?;
+            verify_all(ctx, 6).await?;
+        }
+        Ok(note.join(", "))
     }
-    Ok(note.join(", "))
+    .await;
+    let mut undo = Ok(());
+    for (kind, old) in &changed {
+        let back = select_back(ctx, kind, old, 6, result.is_err()).await;
+        undo = undo.and(back);
+    }
+    first_error(result, undo)
 }
 
 pub async fn remote_commands(ctx: &mut Ctx) -> Check {
@@ -685,62 +1025,102 @@ pub async fn remote_commands(ctx: &mut Ctx) -> Check {
     let dimmer = ctx.select("dimmer");
     let sensor = ctx.sensor("dimmer");
     let old = ctx.client.text(&dimmer, "current_option");
-    ctx.client
-        .command_ok(
-            "remote",
-            &remote,
-            "send_cmd",
-            json!({ "command": "DIMMER_TOGGLE" }),
-        )
-        .await?;
-    ctx.client
-        .wait_attr(&sensor, "value", 6, |v| {
-            v.as_str().is_some_and(|s| s != old)
-        })
-        .await?;
-    set_option(ctx, "dimmer", &old, 6).await?;
-    // A sequence of two commands, repeated.
-    ctx.client
-        .command_ok(
-            "remote",
-            &remote,
-            "send_cmd_sequence",
-            json!({ "sequence": ["DIMMER_TOGGLE", "DIMMER_TOGGLE"], "delay": 300 }),
-        )
-        .await?;
-    ctx.client.listen(2).await?;
-    set_option(ctx, "dimmer", &old, 6).await?;
-    // The remote entity refuses an empty command.
-    let (response, _) = ctx
-        .client
-        .command("remote", &remote, "send_cmd", json!({ "command": "" }))
-        .await?;
-    ensure!(
-        response["code"] == 400,
-        "empty command: code {}",
-        response["code"]
-    );
-    verify_all(ctx, 6).await?;
-    Ok(String::new())
+    let result = async {
+        ctx.client
+            .command_ok(
+                "remote",
+                &remote,
+                "send_cmd",
+                json!({ "command": "DIMMER_TOGGLE" }),
+            )
+            .await?;
+        ctx.client
+            .wait_attr(&sensor, "value", 6, |v| {
+                v.as_str().is_some_and(|s| s != old)
+            })
+            .await?;
+        set_option(ctx, "dimmer", &old, 6).await?;
+        // A sequence of two commands, repeated.
+        ctx.client
+            .command_ok(
+                "remote",
+                &remote,
+                "send_cmd_sequence",
+                json!({ "sequence": ["DIMMER_TOGGLE", "DIMMER_TOGGLE"], "delay": 300 }),
+            )
+            .await?;
+        ctx.client.listen(2).await?;
+        set_option(ctx, "dimmer", &old, 6).await?;
+        // The remote entity refuses an empty command.
+        let (response, _) = ctx
+            .client
+            .command("remote", &remote, "send_cmd", json!({ "command": "" }))
+            .await?;
+        ensure!(
+            response["code"] == 400,
+            "empty command: code {}",
+            response["code"]
+        );
+        verify_all(ctx, 6).await?;
+        Ok(String::new())
+    }
+    .await;
+    let undo = select_back(ctx, "dimmer", &old, 6, result.is_err()).await;
+    first_error(result, undo)
 }
 
+/// Mute and unmute. Runs only if the receiver is not muted and its volume is at or below the
+/// limit: the unmute at the end must not make it loud.
 pub async fn mute(ctx: &mut Ctx) -> Check {
     ensure_on(ctx).await?;
     let mp = ctx.mp();
-    let muted = ctx.client.attr(&mp, "muted") == Some(&json!(true));
-    for target in [!muted, muted] {
-        ctx.client
-            .command_ok("media_player", &mp, "mute_toggle", json!({}))
-            .await?;
-        ctx.client
-            .wait_attr(&mp, "muted", 6, |v| *v == json!(target))
-            .await?;
-        let sensor = ctx.sensor("mute");
-        let expected = if target { "on" } else { "off" };
-        ctx.client.wait_text(&sensor, "value", 6, expected).await?;
-        verify_all(ctx, 6).await?;
+    ctx.client.listen_ms(300).await?;
+    match ctx.client.attr(&mp, "muted").and_then(Value::as_bool) {
+        None => return Err(Fail::skip("the mute state is not known")),
+        Some(true) => return Err(Fail::skip("the receiver is muted at the start")),
+        Some(false) => {}
     }
-    Ok(String::new())
+    // One read of each value: the limit and the check use the same pair.
+    let receiver = receiver_volume(ctx).await?;
+    let driver = driver_volume(ctx).await?;
+    if receiver.is_some() && receiver != driver {
+        return Err(Fail::skip(format!(
+            "the driver shows the volume {driver:?}, the receiver {receiver:?}: the driver value is old"
+        )));
+    }
+    let before = lowest(receiver, driver);
+    let high = highest(receiver, driver).ok_or_else(|| Fail::new("no volume"))?;
+    if high > MAX_VOLUME {
+        return Err(Fail::skip(format!(
+            "the volume {high} is above the limit {MAX_VOLUME}"
+        )));
+    }
+    let result = async {
+        for target in [true, false] {
+            if !target {
+                let now = highest_volume(ctx).await?;
+                let limit = unmute_limit(before);
+                ensure!(
+                    now <= limit,
+                    "volume {now} above {limit} while muted, not unmuted by the check"
+                );
+            }
+            ctx.client
+                .command_ok("media_player", &mp, "mute_toggle", json!({}))
+                .await?;
+            ctx.client
+                .wait_attr(&mp, "muted", 6, |v| *v == json!(target))
+                .await?;
+            let sensor = ctx.sensor("mute");
+            let expected = if target { "on" } else { "off" };
+            ctx.client.wait_text(&sensor, "value", 6, expected).await?;
+            verify_all(ctx, 6).await?;
+        }
+        Ok(String::new())
+    }
+    .await;
+    let undo = set_muted(ctx, false, before, result.is_err()).await;
+    first_error(result, undo)
 }
 
 pub async fn source(ctx: &mut Ctx) -> Check {
@@ -751,32 +1131,31 @@ pub async fn source(ctx: &mut Ctx) -> Check {
     let mp = ctx.mp();
     let old = ctx.client.text(&mp, "source");
     let list = strings(ctx.client.attr(&mp, "source_list").unwrap_or(&Value::Null));
-    // The receiver lists a `Source` entry that cannot be selected: it is not used here.
-    let Some(new) = list
-        .iter()
-        .find(|s| **s != old && *s != "Source" && ctx.opt.may_select(s))
-        .cloned()
-    else {
-        return Err(Fail::skip("only one source"));
-    };
-    let start = Instant::now();
-    ctx.client
-        .command_ok(
-            "media_player",
-            &mp,
-            "select_source",
-            json!({ "source": new }),
-        )
-        .await?;
-    ctx.client
-        .wait_text(&mp, "source", 8, &new)
-        .await
-        .map_err(|e| Fail::new(format!("{e}. Wanted: {new}, source list: {list:?}")))?;
-    let took = start.elapsed().as_millis();
-    ctx.client
-        .wait_text(&ctx.select("input_source"), "current_option", 4, &new)
-        .await?;
-    let tries = restore_source(ctx, &old).await?;
+    let new = other_source(&ctx.opt, &old, &list).map_err(Fail::skip)?;
+    let result = async {
+        let start = Instant::now();
+        ctx.client
+            .command_ok(
+                "media_player",
+                &mp,
+                "select_source",
+                json!({ "source": new }),
+            )
+            .await?;
+        ctx.client
+            .wait_text(&mp, "source", 8, &new)
+            .await
+            .map_err(|e| Fail::new(format!("{e}. Wanted: {new}, source list: {list:?}")))?;
+        let took = start.elapsed().as_millis();
+        ctx.client
+            .wait_text(&ctx.select("input_source"), "current_option", 4, &new)
+            .await?;
+        Ok(took)
+    }
+    .await;
+    let back = restore_source(ctx, &old, 4).await;
+    let tries = back.as_ref().copied().unwrap_or_default();
+    let took = first_error(result, back.map(|_| ()))?;
     verify_all(ctx, 6).await?;
     let odd = if list.iter().any(|s| s == "Source") {
         ", the list has a `Source` entry"
@@ -788,9 +1167,39 @@ pub async fn source(ctx: &mut Ctx) -> Check {
     ))
 }
 
-/// Select the old source again. The receiver can ignore a source command that comes soon after
-/// another one, so the command is sent again after 4 s.
-async fn restore_source(ctx: &mut Ctx, old: &str) -> Result<u32, Fail> {
+/// A source to select for a check, or why there is none. The start source `old` must be one that
+/// a check may select, because the set back selects it again. The receiver lists a `Source`
+/// entry that cannot be selected: it is not used.
+fn other_source(opt: &crate::Options, old: &str, list: &[String]) -> Result<String, String> {
+    if opt.avoid_sources.is_empty() {
+        return Err("no --avoid-sources: no source is selected".to_owned());
+    }
+    if old.is_empty() || old == "Source" || !list.iter().any(|s| s == old) {
+        return Err(format!(
+            "the source {old:?} is not in the list, it could not be set back"
+        ));
+    }
+    if !opt.may_select(old) {
+        return Err(format!(
+            "the source {old} is in --avoid-sources, the set back would select it"
+        ));
+    }
+    list.iter()
+        .find(|s| **s != old && *s != "Source" && opt.may_select(s))
+        .cloned()
+        .ok_or_else(|| "only one source".to_owned())
+}
+
+/// Select the old source again. It is always sent: after an error the driver can show a source
+/// that is old. The receiver can ignore a source command that comes soon after another one, so
+/// the command is sent again after `secs` seconds.
+async fn restore_source(ctx: &mut Ctx, old: &str, secs: u64) -> Result<u32, Fail> {
+    // A source command switches the receiver on: switch it on with the volume check first.
+    // Without the second connection, `power_on` skips, so no source is sent.
+    ctx.client.listen_ms(300).await?;
+    if receiver_off(ctx) || !is_on(&ctx.client.text(&ctx.mp(), "state")) {
+        switch_on(ctx).await?;
+    }
     let mp = ctx.mp();
     for tries in 1..=3 {
         ctx.client
@@ -801,7 +1210,7 @@ async fn restore_source(ctx: &mut Ctx, old: &str) -> Result<u32, Fail> {
                 json!({ "source": old }),
             )
             .await?;
-        if ctx.client.wait_text(&mp, "source", 4, old).await.is_ok() {
+        if ctx.client.wait_text(&mp, "source", secs, old).await.is_ok() {
             return Ok(tries);
         }
     }
@@ -846,53 +1255,78 @@ pub async fn sound_mode(ctx: &mut Ctx) -> Check {
             .unwrap_or(&Value::Null),
     );
     ensure!(!list.is_empty(), "the sound mode list is empty");
+    if old.is_empty() {
+        return Err(Fail::skip(
+            "no sound mode is shown, it could not be set back",
+        ));
+    }
+    if !list.iter().any(|m| m.eq_ignore_ascii_case(&old)) {
+        return Err(Fail::skip(format!(
+            "the sound mode {old} is not in the list, it could not be set back"
+        )));
+    }
     let new = pick_sound_mode(&list, &old).ok_or_else(|| Fail::skip("no other sound mode"))?;
-    select_sound(ctx, &new).await?;
-    // The receiver can report the mode in other letter case than the list.
-    ctx.client
-        .wait_attr(&mp, "sound_mode", 10, |v| {
-            v.as_str().is_some_and(|m| m.eq_ignore_ascii_case(&new))
-        })
-        .await?;
-    let shown = ctx.client.text(&mp, "sound_mode");
-    ensure!(
-        ctx.client.text(&ctx.sensor("sound_mode"), "value") != "--",
-        "the sound mode sensor is empty"
-    );
+    let result = async {
+        select_sound(ctx, &new).await?;
+        // The receiver can report the mode in other letter case than the list.
+        ctx.client
+            .wait_attr(&mp, "sound_mode", 10, |v| {
+                v.as_str().is_some_and(|m| m.eq_ignore_ascii_case(&new))
+            })
+            .await?;
+        let shown = ctx.client.text(&mp, "sound_mode");
+        ensure!(
+            ctx.client.text(&ctx.sensor("sound_mode"), "value") != "--",
+            "the sound mode sensor is empty"
+        );
+        verify_all(ctx, 6).await?;
+        Ok(shown)
+    }
+    .await;
+    let undo = restore_sound(ctx, &old, &list, result.is_err()).await;
+    let shown = first_error(result, undo)?;
     verify_all(ctx, 6).await?;
-    let restored = restore_sound(ctx, &old, &list).await;
-    verify_all(ctx, 6).await?;
-    Ok(format!("{old} -> {new} (receiver: {shown}), {restored}"))
+    Ok(format!("{old} -> {new} (receiver: {shown}), restored"))
 }
 
-/// Select the old mode again. The receiver can report a name that is not in the list.
-async fn restore_sound(ctx: &mut Ctx, old: &str, list: &[String]) -> String {
+/// Select the old mode again. Without `force`, nothing is sent if the old mode is shown. The
+/// receiver can report a name that is not in the list.
+async fn restore_sound(ctx: &mut Ctx, old: &str, list: &[String], force: bool) -> Result<(), Fail> {
     let mp = ctx.mp();
+    let is_old = |v: &Value| v.as_str().is_some_and(|m| m.eq_ignore_ascii_case(old));
     if old.is_empty() {
-        return "no sound mode was shown before, not restored".into();
+        return Err(Fail::new("no sound mode was shown before"));
+    }
+    ctx.client.listen_ms(300).await?;
+    if !force && ctx.client.attr(&mp, "sound_mode").is_some_and(is_old) {
+        return Ok(());
     }
     let Some(name) = list.iter().find(|m| m.eq_ignore_ascii_case(old)) else {
-        return format!("the old mode {old} is not in the list, not restored");
+        return Err(Fail::new(format!("the old mode {old} is not in the list")));
     };
-    if select_sound(ctx, name).await.is_err() {
-        return "restore failed".into();
-    }
-    match ctx
-        .client
-        .wait_attr(&mp, "sound_mode", 10, |v| {
-            v.as_str().is_some_and(|m| m.eq_ignore_ascii_case(old))
-        })
+    select_sound(ctx, name).await?;
+    ctx.client
+        .wait_attr(&mp, "sound_mode", 10, is_old)
         .await
-    {
-        Ok(_) => "restored".into(),
-        Err(e) => format!("not restored: {e}"),
-    }
+        .map(|_| ())
+        .map_err(|e| Fail::new(format!("sound mode {old}: {e}")))
 }
 
 pub async fn volume(ctx: &mut Ctx) -> Check {
     ensure_on(ctx).await?;
     let mp = ctx.mp();
-    let start = current_volume(ctx).ok_or_else(|| Fail::new("no volume"))?;
+    // The start volume comes from the receiver: the driver can show an old, higher volume.
+    let Some(start) = receiver_volume(ctx).await? else {
+        return Err(Fail::skip(
+            "no second connection: the start volume cannot be read from the receiver",
+        ));
+    };
+    let shown = driver_volume(ctx).await?;
+    if shown != Some(start) {
+        return Err(Fail::skip(format!(
+            "the driver shows the volume {shown:?}, the receiver {start}: the driver value is old"
+        )));
+    }
     if start > MAX_VOLUME {
         return Err(Fail::skip(format!(
             "the volume {start} is above the limit {MAX_VOLUME}"
@@ -903,104 +1337,165 @@ pub async fn volume(ctx: &mut Ctx) -> Check {
             "the volume {start} is too low or not a whole number"
         )));
     }
-    let step = ctx
-        .client
-        .attr(&mp, "volume")
-        .and_then(Value::as_f64)
-        .unwrap_or(start);
-    ensure!(step == start, "unstable volume");
-    // Down first: the volume never goes above the start value.
+    let result = async {
+        // Down first: the volume never goes above the start value.
+        set_volume(ctx, start - VOLUME_STEP_DOWN).await?;
+        ctx.client
+            .wait_attr(&mp, "volume", 6, |v| {
+                v.as_f64() == Some(start - VOLUME_STEP_DOWN)
+            })
+            .await?;
+        let sensor = ctx.sensor("volume_db");
+        ctx.client
+            .wait_attr(&sensor, "value", 6, |v| {
+                v.as_f64() == Some(start - VOLUME_STEP_DOWN - 80.0)
+            })
+            .await?;
+        ctx.client
+            .command_ok("media_player", &mp, "volume_up", json!({}))
+            .await?;
+        let up = ctx
+            .client
+            .wait_attr(&mp, "volume", 6, |v| {
+                v.as_f64().is_some_and(|x| x > start - VOLUME_STEP_DOWN)
+            })
+            .await?;
+        let up = up.as_f64().unwrap_or(start);
+        ensure!(
+            up <= start,
+            "volume_up went to {up}, above the start value {start}"
+        );
+        Ok(format!("volume {start}, up step gave {up}, restored"))
+    }
+    .await;
+    let undo = volume_back(ctx, start).await;
+    first_error(result, undo)
+}
+
+/// The lowest volume that the volume check sets, below its start volume.
+const VOLUME_STEP_DOWN: f64 = 2.0;
+
+/// The volume that the volume check sends to set the volume back: `start` if `fresh` is not
+/// `start` and not below the lowest volume that the check sets. A lower volume was set by someone
+/// else: it stays.
+fn volume_back_target(fresh: f64, start: f64) -> Option<f64> {
+    (fresh != start && fresh >= start - VOLUME_STEP_DOWN).then_some(start)
+}
+
+/// Set the volume back to `start`, the volume of the receiver before the change, by the rule of
+/// [`volume_back_target`]. `start` is not above [`MAX_VOLUME`]: the volume check skips a higher
+/// start volume.
+async fn volume_back(ctx: &mut Ctx, start: f64) -> Result<(), Fail> {
+    let mp = ctx.mp();
+    let fresh = receiver_volume(ctx)
+        .await?
+        .ok_or_else(|| Fail::new("no second connection"))?;
+    let Some(start) = volume_back_target(fresh, start) else {
+        return Ok(());
+    };
+    let sent = set_volume(ctx, start).await?;
     ctx.client
-        .command_ok(
-            "media_player",
-            &mp,
-            "volume",
-            json!({ "volume": start - 2.0 }),
-        )
+        .wait_attr(&mp, "volume", 6, |v| v.as_f64() == Some(sent))
         .await?;
-    ctx.client
-        .wait_attr(&mp, "volume", 6, |v| v.as_f64() == Some(start - 2.0))
-        .await?;
-    let sensor = ctx.sensor("volume_db");
-    ctx.client
-        .wait_attr(&sensor, "value", 6, |v| {
-            v.as_f64() == Some(start - 2.0 - 80.0)
-        })
-        .await?;
-    ctx.client
-        .command_ok("media_player", &mp, "volume_up", json!({}))
-        .await?;
-    let up = ctx
-        .client
-        .wait_attr(&mp, "volume", 6, |v| {
-            v.as_f64().is_some_and(|x| x > start - 2.0)
-        })
-        .await?;
-    let up = up.as_f64().unwrap_or(start);
-    ensure!(
-        up <= start,
-        "volume_up went to {up}, above the start value {start}"
-    );
-    ctx.client
-        .command_ok("media_player", &mp, "volume", json!({ "volume": start }))
-        .await?;
-    ctx.client
-        .wait_attr(&mp, "volume", 6, |v| v.as_f64() == Some(start))
-        .await?;
-    Ok(format!("volume {start}, up step gave {up}, restored"))
+    Ok(())
 }
 
 pub async fn power(ctx: &mut Ctx) -> Check {
     if ctx.opt.no_power {
         return Err(Fail::skip("--no-power"));
     }
+    if ctx.oracle.is_none() {
+        return Err(Fail::skip(
+            "no second connection: the volume after a power on cannot be read from the receiver",
+        ));
+    }
     ensure_on(ctx).await?;
     let mp = ctx.mp();
-    // Mute first: a power on can start with another volume.
-    let muted = ctx.client.attr(&mp, "muted") == Some(&json!(true));
-    if !muted {
+    ctx.client.listen_ms(300).await?;
+    let Some(muted) = ctx.client.attr(&mp, "muted").and_then(Value::as_bool) else {
+        return Err(Fail::skip("the mute state is not known"));
+    };
+    let before = baseline_volume(ctx).await?;
+    let result = async {
+        // Mute first: a power on can start with another volume.
+        if !muted {
+            ctx.client
+                .command_ok("media_player", &mp, "mute", json!({}))
+                .await?;
+            ctx.client
+                .wait_attr(&mp, "muted", 6, |v| *v == json!(true))
+                .await?;
+        }
         ctx.client
-            .command_ok("media_player", &mp, "mute_toggle", json!({}))
+            .command_ok("media_player", &mp, "off", json!({}))
             .await?;
+        ctx.client.wait_text(&mp, "state", 15, "OFF").await?;
+        ctx.client.listen(1).await?;
+        let (volume_sensor, eco) = (ctx.sensor("volume_db"), ctx.select("eco_mode"));
+        ensure!(
+            ctx.client.text(&volume_sensor, "value") == "--",
+            "volume sensor while off"
+        );
+        ensure!(
+            ctx.client.text(&eco, "current_option") == "--",
+            "eco select while off"
+        );
+        ensure!(
+            ctx.client.text(&mp, "source").is_empty(),
+            "source while off"
+        );
+        let start = Instant::now();
+        let on = power_on(ctx).await;
+        let took = start.elapsed().as_millis();
+        on?;
         ctx.client
-            .wait_attr(&mp, "muted", 6, |v| *v == json!(true))
+            .wait_attr(&volume_sensor, "value", 10, |v| v.as_f64().is_some())
             .await?;
+        Ok(took)
     }
-    ctx.client
-        .command_ok("media_player", &mp, "off", json!({}))
-        .await?;
-    ctx.client.wait_text(&mp, "state", 15, "OFF").await?;
-    ctx.client.listen(1).await?;
-    let (volume_sensor, eco) = (ctx.sensor("volume_db"), ctx.select("eco_mode"));
-    ensure!(
-        ctx.client.text(&volume_sensor, "value") == "--",
-        "volume sensor while off"
-    );
-    ensure!(
-        ctx.client.text(&eco, "current_option") == "--",
-        "eco select while off"
-    );
-    ensure!(
-        ctx.client.text(&mp, "source").is_empty(),
-        "source while off"
-    );
-    let start = Instant::now();
-    let on = power_on(ctx).await;
-    let took = start.elapsed().as_millis();
-    on?;
-    ctx.client
-        .wait_attr(&volume_sensor, "value", 10, |v| v.as_f64().is_some())
-        .await?;
-    if !muted {
-        ctx.client
-            .command_ok("media_player", &mp, "mute_toggle", json!({}))
-            .await?;
-        ctx.client
-            .wait_attr(&mp, "muted", 6, |v| *v == json!(false))
-            .await?;
-    }
+    .await;
+    let undo = power_back(ctx, muted, before, result.is_err()).await;
+    let took = first_error(result, undo)?;
     verify_fresh(ctx).await?;
     Ok(format!("off, then on after {took} ms, values are back"))
+}
+
+/// Switch the receiver on with [`on_again`] if the driver or the second connection says that it
+/// is off, else lower the volume with [`lower_volume`]. Then set the mute state back to `muted`.
+/// `before` is the volume before the check. `force` is passed to [`set_muted`].
+async fn power_back(
+    ctx: &mut Ctx,
+    muted: bool,
+    before: Option<f64>,
+    force: bool,
+) -> Result<(), Fail> {
+    ctx.client.listen_ms(300).await?;
+    let volume = if !is_on(&ctx.client.text(&ctx.mp(), "state")) || receiver_off(ctx) {
+        on_again(ctx, before).await
+    } else {
+        lower_volume(ctx, before).await
+    };
+    // The mute step runs also after an error: an unmute goes through `unmute_safely`.
+    let mute = set_muted(ctx, muted, before, force).await;
+    join_errors(volume, mute)
+}
+
+/// The second connection says that the main zone is not on. False without that connection.
+fn receiver_off(ctx: &Ctx) -> bool {
+    ctx.oracle.as_ref().is_some_and(|oracle| {
+        oracle.state().zone(Zone::Main).power != Some(denon_marantz::proto::Power::On)
+    })
+}
+
+/// Switch the receiver on with [`power_on`], then lower the volume with [`lower_volume`]. The
+/// volume is lowered also after an error of [`power_on`], except after a skip.
+async fn on_again(ctx: &mut Ctx, before: Option<f64>) -> Result<(), Fail> {
+    let on = power_on(ctx).await.map(|_| ());
+    if on.as_ref().is_err_and(|e| e.skip) {
+        return on;
+    }
+    let lowered = lower_volume(ctx, before).await;
+    join_errors(on, lowered)
 }
 
 // ---------------------------------------------------------------- setup changes
@@ -1054,52 +1549,78 @@ pub async fn http_mode(ctx: &mut Ctx) -> Check {
         .and_then(|v| v.as_str().map(str::to_owned))
         .unwrap_or_default();
     let waited = start.elapsed().as_millis();
-    let result = http_checks(ctx).await;
-    // Always go back to telnet, also after a failure.
+    let mut start_source = None;
+    let result = http_checks(ctx, &old_sound, &mut start_source).await;
+    // Always go back to telnet and set the source and the sound mode back, also after a failure.
+    let force = result.is_err();
     let address = ctx.opt.address.clone();
-    let back = async {
-        configure(ctx, &address, Some(true)).await?;
-        refresh_remote(ctx).await?;
-        wait_available(ctx, 20).await
+    let undo = async {
+        let telnet = async {
+            configure(ctx, &address, Some(true)).await?;
+            refresh_remote(ctx).await?;
+            wait_available(ctx, 20).await
+        };
+        let telnet = telnet
+            .await
+            .map(|_| ())
+            .map_err(|e| Fail::new(format!("back to telnet: {e}")));
+        // The source is set back also if the switch to telnet failed. The shown source is not
+        // trusted then.
+        let source = match &start_source {
+            Some(source) => {
+                let source = source.clone();
+                async {
+                    ctx.client.listen_ms(300).await?;
+                    if telnet.is_err() || ctx.client.text(&mp, "source") != source {
+                        restore_source(ctx, &source, 4).await?;
+                    }
+                    Ok(())
+                }
+                .await
+            }
+            None => Ok(()),
+        };
+        let failed = telnet.is_err();
+        let errors = join_errors(telnet, source);
+        // Without telnet the list of sound modes is not known. Without a mode shown before,
+        // `http_checks` does not change the sound mode.
+        if failed || old_sound.is_empty() {
+            return errors;
+        }
+        // The list of the receiver comes over telnet after the connect. Until then the list has
+        // the groups of HTTP mode, which do not have every mode.
+        let has_old = |v: &Value| {
+            v.as_array().is_some_and(|modes| {
+                modes.iter().any(|m| {
+                    m.as_str()
+                        .is_some_and(|m| m.eq_ignore_ascii_case(&old_sound))
+                })
+            })
+        };
+        let list = ctx
+            .client
+            .wait_attr(&mp, "sound_mode_list", 10, has_old)
+            .await
+            .ok()
+            .or_else(|| ctx.client.attr(&mp, "sound_mode_list").cloned())
+            .unwrap_or(Value::Null);
+        let sound = restore_sound(ctx, &old_sound, &strings(&list), force).await;
+        join_errors(errors, sound)
     }
     .await;
-    match (result, back) {
-        (Ok(note), Ok(_)) => {
-            // The list of the receiver comes over telnet after the connect. Until then the list has
-            // the groups of HTTP mode, which do not have every mode.
-            let has_old = |v: &Value| {
-                v.as_array().is_some_and(|modes| {
-                    modes.iter().any(|m| {
-                        m.as_str()
-                            .is_some_and(|m| m.eq_ignore_ascii_case(&old_sound))
-                    })
-                })
-            };
-            let wait = if old_sound.is_empty() { 0 } else { 10 };
-            let list = ctx
-                .client
-                .wait_attr(&mp, "sound_mode_list", wait, has_old)
-                .await
-                .ok()
-                .or_else(|| ctx.client.attr(&mp, "sound_mode_list").cloned())
-                .unwrap_or(Value::Null);
-            let list = strings(&list);
-            let restored = restore_sound(ctx, &old_sound, &list).await;
-            let shown = if old_sound.is_empty() {
-                "not shown".to_owned()
-            } else {
-                format!("shown after {waited} ms")
-            };
-            Ok(format!(
-                "{note}, {restored} (sound mode with telnet {shown})"
-            ))
-        }
-        (Err(e), _) => Err(e),
-        (Ok(_), Err(e)) => Err(Fail::new(format!("back to telnet: {e}"))),
-    }
+    let note = first_error(result, undo)?;
+    let shown = if old_sound.is_empty() {
+        "not shown".to_owned()
+    } else {
+        format!("shown after {waited} ms, restored")
+    };
+    Ok(format!("{note} (sound mode with telnet {shown})"))
 }
 
-async fn http_checks(ctx: &mut Ctx) -> Check {
+/// The checks in HTTP mode. The sound mode is changed only if `old_sound`, the mode shown with
+/// telnet, is known: [`http_mode`] sets it back. Before a source change, `start_source` is set to
+/// the source at the start, for [`http_mode`] to check it after the switch back to telnet.
+async fn http_checks(ctx: &mut Ctx, old_sound: &str, start_source: &mut Option<String>) -> Check {
     let mp = ctx.mp();
     let before = entity_ids(ctx).await?.len();
     let address = ctx.opt.address.clone();
@@ -1140,13 +1661,21 @@ async fn http_checks(ctx: &mut Ctx) -> Check {
 
     // Receivers read with the status pages have no dimmer over HTTP.
     if expected.contains("select.dimmer") {
-        let start = Instant::now();
-        let (old, new) = change_select(ctx, "dimmer", 12).await?;
-        note.push(format!("dimmer {} ms", start.elapsed().as_millis()));
-        ctx.client
-            .wait_text(&ctx.sensor("dimmer"), "value", 12, &new)
-            .await?;
-        set_option(ctx, "dimmer", &old, 12).await?;
+        let old = ctx.client.text(&ctx.select("dimmer"), "current_option");
+        let result = async {
+            let start = Instant::now();
+            let (old, new) = change_select(ctx, "dimmer", 12).await?;
+            let took = start.elapsed().as_millis();
+            ctx.client
+                .wait_text(&ctx.sensor("dimmer"), "value", 12, &new)
+                .await?;
+            set_option(ctx, "dimmer", &old, 12).await?;
+            Ok(took)
+        }
+        .await;
+        let back = select_back(ctx, "dimmer", &old, 12, result.is_err()).await;
+        let took = first_error(result, back)?;
+        note.push(format!("dimmer {took} ms"));
     } else {
         note.push("no dimmer over HTTP".to_owned());
     }
@@ -1154,35 +1683,34 @@ async fn http_checks(ctx: &mut Ctx) -> Check {
     let old = ctx.client.text(&mp, "source");
     let list = strings(ctx.client.attr(&mp, "source_list").unwrap_or(&Value::Null));
     ensure!(!list.is_empty(), "no source list over HTTP");
-    if let Some(new) = list
-        .iter()
-        .find(|s| **s != old && *s != "Source" && ctx.opt.may_select(s))
-        .cloned()
-    {
-        let start = Instant::now();
-        ctx.client
-            .command_ok(
-                "media_player",
-                &mp,
-                "select_source",
-                json!({ "source": new }),
-            )
-            .await?;
-        ctx.client.wait_text(&mp, "source", 12, &new).await?;
-        note.push(format!("source {} ms", start.elapsed().as_millis()));
-        ctx.client
-            .command_ok(
-                "media_player",
-                &mp,
-                "select_source",
-                json!({ "source": old }),
-            )
-            .await?;
-        ctx.client.wait_text(&mp, "source", 12, &old).await?;
-    } else {
-        note.push("source not changed".to_owned());
+    match other_source(&ctx.opt, &old, &list) {
+        Ok(new) => {
+            *start_source = Some(old.clone());
+            let start = Instant::now();
+            let result = async {
+                ctx.client
+                    .command_ok(
+                        "media_player",
+                        &mp,
+                        "select_source",
+                        json!({ "source": new }),
+                    )
+                    .await?;
+                ctx.client.wait_text(&mp, "source", 12, &new).await
+            }
+            .await;
+            let took = start.elapsed().as_millis();
+            let back = restore_source(ctx, &old, 12).await.map(|_| ());
+            first_error(result, back)?;
+            note.push(format!("source {took} ms"));
+        }
+        Err(why) => note.push(format!("source not changed: {why}")),
     }
 
+    if old_sound.is_empty() {
+        note.push("sound mode not changed: no mode was shown with telnet".to_owned());
+        return Ok(note.join(", "));
+    }
     let old = ctx.client.text(&mp, "sound_mode");
     let groups = strings(
         ctx.client
@@ -1206,9 +1734,7 @@ async fn http_checks(ctx: &mut Ctx) -> Check {
         })
         .await?;
     note.push(format!("sound mode {} ms", start.elapsed().as_millis()));
-    note.push(format!(
-        "sound mode was {old}, restored after the switch to telnet"
-    ));
+    note.push(format!("sound mode was {old} in HTTP mode"));
     Ok(note.join(", "))
 }
 
@@ -1575,8 +2101,8 @@ pub async fn python_config(ctx: &mut Ctx) -> Check {
         })
         .collect();
     ctx.driver.stop().await;
-    tokio::fs::write(ctx.driver.config_file(), json!([python]).to_string()).await?;
     let result = async {
+        tokio::fs::write(ctx.driver.config_file(), json!([python]).to_string()).await?;
         restart(ctx).await?;
         // Right after the start the receiver may not be read yet: the driver can offer more
         // entities.
@@ -1641,12 +2167,17 @@ pub async fn python_config(ctx: &mut Ctx) -> Check {
     }
     .await;
     ctx.key = mac_key;
+    let undo = config_back(ctx, good).await;
+    first_error(result, undo)
+}
+
+/// Stop the driver, write the saved configuration file `good` and start the driver again.
+async fn config_back(ctx: &mut Ctx, good: String) -> Result<(), Fail> {
     ctx.driver.stop().await;
     tokio::fs::write(ctx.driver.config_file(), good).await?;
     restart(ctx).await?;
     subscribe_all(ctx).await?;
-    settle(ctx).await?;
-    result
+    settle(ctx).await
 }
 
 /// Name and address of the receiver that is added but not used. 192.0.2.1 is a documentation
@@ -1671,8 +2202,8 @@ pub async fn unused_receiver(ctx: &mut Ctx) -> Check {
         .ok_or_else(|| Fail::new("config.json is not a list"))?
         .push(unused);
     ctx.driver.stop().await;
-    tokio::fs::write(ctx.driver.config_file(), config.to_string()).await?;
     let result = async {
+        tokio::fs::write(ctx.driver.config_file(), config.to_string()).await?;
         ctx.driver.start().await?;
         ctx.client = crate::ws::Client::connect(ctx.driver.port).await?;
         let ids = entity_ids(ctx).await?;
@@ -1716,19 +2247,15 @@ pub async fn unused_receiver(ctx: &mut Ctx) -> Check {
         Ok("not connected without subscriptions; connected after a subscribe, disconnected after the unsubscribe".to_owned())
     }
     .await;
-    ctx.driver.stop().await;
-    tokio::fs::write(ctx.driver.config_file(), good).await?;
-    restart(ctx).await?;
-    subscribe_all(ctx).await?;
-    settle(ctx).await?;
-    result
+    let undo = config_back(ctx, good).await;
+    first_error(result, undo)
 }
 
 pub async fn broken_config(ctx: &mut Ctx) -> Check {
     let good = tokio::fs::read_to_string(ctx.driver.config_file()).await?;
     ctx.driver.stop().await;
-    tokio::fs::write(ctx.driver.config_file(), "[{\"broken\": ").await?;
     let result = async {
+        tokio::fs::write(ctx.driver.config_file(), "[{\"broken\": ").await?;
         // Without a receiver the driver needs a setup: it does not give entities.
         ctx.driver.start().await?;
         ctx.client = crate::ws::Client::connect(ctx.driver.port).await?;
@@ -1745,31 +2272,71 @@ pub async fn broken_config(ctx: &mut Ctx) -> Check {
     for path in bad_configs(ctx).await.unwrap_or_default() {
         let _ = tokio::fs::remove_file(path).await;
     }
-    tokio::fs::write(ctx.driver.config_file(), good).await?;
-    restart(ctx).await?;
-    subscribe_all(ctx).await?;
-    settle(ctx).await?;
-    result
+    let undo = config_back(ctx, good).await;
+    first_error(result, undo)
 }
 
 // ---------------------------------------------------------------- end
 
-/// Switch the receiver off if it was off at the start. Does nothing without a device key (set by
-/// `entities`).
+/// Set the power and the mute state back to the start. A receiver that was off is switched off.
+/// A receiver that was on is switched on if it is off. With the second connection, the volume is
+/// lowered to the start volume (not above [`MAX_VOLUME`]) first, then the mute state is set back; an unmute goes through [`unmute_safely`] with the start
+/// volume. Does nothing without a device key (set by `entities`), and does not switch on without
+/// the start values (read by `states`) or without the second connection (see [`power_on`]).
 pub async fn restore_power(ctx: &mut Ctx) -> Check {
     if ctx.key.is_empty() {
         return Ok("no device key, nothing to do".into());
     }
-    if ctx.was_on {
-        return Ok(String::new());
-    }
     let mp = ctx.mp();
-    ctx.client
-        .command_ok("media_player", &mp, "off", json!({}))
-        .await?;
-    ctx.client.wait_text(&mp, "state", 15, "OFF").await?;
-    sleep(Duration::from_millis(200)).await;
-    Ok("the receiver is off again, like at the start".into())
+    if !ctx.was_on {
+        ctx.client
+            .command_ok("media_player", &mp, "off", json!({}))
+            .await?;
+        ctx.client.wait_text(&mp, "state", 15, "OFF").await?;
+        sleep(Duration::from_millis(200)).await;
+        return Ok("the receiver is off again, like at the start".into());
+    }
+    let Some((muted, volume)) = ctx.start.as_ref().map(|s| (s.muted, s.volume)) else {
+        return Ok(String::new());
+    };
+    let mut notes = Vec::new();
+    ctx.client.listen_ms(300).await?;
+    let mut errors = Ok(());
+    if !is_on(&ctx.client.text(&mp, "state")) || receiver_off(ctx) {
+        let on = on_again(ctx, volume).await;
+        if on.as_ref().is_err_and(|e| e.skip) {
+            return on.map(|()| String::new());
+        }
+        if on.is_ok() {
+            notes.push("the receiver is on again, like at the start");
+        }
+        errors = on;
+    } else if ctx.oracle.is_some() {
+        errors = lower_volume(ctx, volume).await;
+    }
+    // The driver or the second connection can show another mute state.
+    let receiver_muted = ctx
+        .oracle
+        .as_ref()
+        .and_then(|oracle| oracle.state().zone(Zone::Main).muted);
+    if muted.is_none() {
+        notes.push("the mute state at the start is not known, it is not set back");
+    }
+    if let Some(muted) = muted
+        && (ctx.client.attr(&mp, "muted") != Some(&json!(muted))
+            || receiver_muted.is_some_and(|m| m != muted))
+    {
+        let mute = set_muted(ctx, muted, volume, true).await;
+        if mute.is_ok() {
+            notes.push(if muted {
+                "muted again"
+            } else {
+                "unmuted again"
+            });
+        }
+        errors = join_errors(errors, mute);
+    }
+    errors.map(|()| notes.join(", "))
 }
 
 pub async fn log(ctx: &mut Ctx) -> Check {
@@ -1978,6 +2545,12 @@ async fn sweep_select(
 
 /// Select every option of the selects and check the entities after each change.
 pub async fn select_sweep(ctx: &mut Ctx) -> Check {
+    // Without the second connection, Dynamic EQ cannot be set back.
+    if ctx.oracle.is_none() {
+        return Err(Fail::skip(
+            "no second connection: Dynamic EQ could not be set back",
+        ));
+    }
     ensure_on(ctx).await?;
     let mut problems = Vec::new();
     // The receiver ignores the Audyssey settings while a Dirac filter is selected.
@@ -1987,63 +2560,74 @@ pub async fn select_sweep(ctx: &mut Ctx) -> Check {
         .attr(&dirac, "current_option")
         .cloned()
         .unwrap_or(Value::Null);
-    if dirac_original != json!("Off") && dirac_original != Value::Null {
-        sweep_one(ctx, "dirac_filter", &json!("Off")).await?;
-    }
-    // The reference level needs Dynamic EQ. It is set back at the end.
-    let dynamic_eq = match &ctx.oracle {
-        Some(oracle) => restore::read(oracle.avr(), &["PSDYNEQ ?"]).await?,
-        None => Vec::new(),
-    };
-    let remote = ctx.remote();
-    ctx.client
-        .command_ok(
-            "remote",
-            &remote,
-            "send_cmd",
-            json!({ "command": "DYNAMIC_EQ_ON" }),
-        )
-        .await?;
-    ctx.client.listen(1).await?;
-    let mut summary = Vec::new();
-    let mut verified = 0;
-    // The driver leaves out the selects of features that the receiver does not list.
-    let offered = entity_ids(ctx).await?;
-    for kind in [
-        "dimmer",
-        "eco_mode",
-        "reference_level_offset",
-        "dynamic_volume",
-        "monitor_output",
-        "speaker_preset",
-        "picture_mode",
-        "digital_codec",
-        "dirac_filter",
-    ] {
-        if !ctx.opt.kinds.is_empty() && !ctx.opt.kinds.iter().any(|k| k == kind) {
-            continue;
+    // The saved Dynamic EQ answer lines. `None` until they are read.
+    let mut dynamic_eq: Option<Vec<String>> = None;
+    let result = async {
+        if dirac_original != json!("Off") && dirac_original != Value::Null {
+            sweep_one(ctx, "dirac_filter", &json!("Off")).await?;
         }
-        if !offered.contains(&ctx.select(kind)) {
-            summary.push(format!("{kind}: not offered"));
-            continue;
+        // The reference level needs Dynamic EQ. It is set back at the end.
+        if let Some(oracle) = &ctx.oracle {
+            dynamic_eq = Some(restore::read(oracle.avr(), &["PSDYNEQ ?"]).await?);
         }
-        if let Some(tally) = sweep_select(ctx, kind, &mut problems).await? {
-            verified += tally.verified;
-            summary.push(format!("{kind}: {}", tally.describe()));
+        let mut summary = Vec::new();
+        // Dynamic EQ is switched on only if its value was saved: else it cannot be set back.
+        if dynamic_eq
+            .as_ref()
+            .is_some_and(|lines| lines.iter().any(|l| l.starts_with("PSDYNEQ")))
+        {
+            let remote = ctx.remote();
+            ctx.client
+                .command_ok(
+                    "remote",
+                    &remote,
+                    "send_cmd",
+                    json!({ "command": "DYNAMIC_EQ_ON" }),
+                )
+                .await?;
+            ctx.client.listen(1).await?;
+        } else {
+            summary.push(
+                "Dynamic EQ not switched on: the receiver did not answer its query".to_owned(),
+            );
         }
-    }
-    if dirac_original != Value::Null
-        && dirac_original != json!("--")
-        && let Err(e) = sweep_one(ctx, "dirac_filter", &dirac_original).await
-    {
-        problems.push(format!("dirac_filter back to {dirac_original}: {e}"));
-    }
-    if let Some(oracle) = &ctx.oracle {
-        let missed = restore::write(oracle.avr(), &["PSDYNEQ ?"], &dynamic_eq).await?;
-        if !missed.is_empty() {
-            problems.push(format!("Dynamic EQ not set back: {missed:?}"));
+        let mut verified = 0;
+        // The driver leaves out the selects of features that the receiver does not list.
+        let offered = entity_ids(ctx).await?;
+        for kind in [
+            "dimmer",
+            "eco_mode",
+            "reference_level_offset",
+            "dynamic_volume",
+            "monitor_output",
+            "speaker_preset",
+            "picture_mode",
+            "digital_codec",
+            "dirac_filter",
+        ] {
+            if !ctx.opt.kinds.is_empty() && !ctx.opt.kinds.iter().any(|k| k == kind) {
+                continue;
+            }
+            if !offered.contains(&ctx.select(kind)) {
+                summary.push(format!("{kind}: not offered"));
+                continue;
+            }
+            if let Some(tally) = sweep_select(ctx, kind, &mut problems).await? {
+                verified += tally.verified;
+                summary.push(format!("{kind}: {}", tally.describe()));
+            }
         }
+        Ok((summary, verified))
     }
+    .await;
+    let undo = sweep_back(ctx, &dirac_original, dynamic_eq.as_deref()).await;
+    let (summary, verified) = first_error(result, undo).map_err(|e| {
+        if problems.is_empty() {
+            e
+        } else {
+            Fail::new(format!("{e}. Other problems: {}", problems.join(" | ")))
+        }
+    })?;
     verify_fresh(ctx)
         .await
         .map_err(|e| Fail::new(format!("at the end: {e}")))?;
@@ -2060,6 +2644,41 @@ pub async fn select_sweep(ctx: &mut Ctx) -> Check {
         summary.join(" | ")
     );
     Ok(format!("{verified} verified. {}", summary.join(" | ")))
+}
+
+/// Set the Dirac filter back to `dirac`, then Dynamic EQ to the saved answer lines.
+async fn sweep_back(
+    ctx: &mut Ctx,
+    dirac: &Value,
+    dynamic_eq: Option<&[String]>,
+) -> Result<(), Fail> {
+    let mut problems = Vec::new();
+    if *dirac != Value::Null && *dirac != json!("--") {
+        match sweep_one(ctx, "dirac_filter", dirac).await {
+            Ok(Outcome::Refused(reason)) => {
+                problems.push(format!("dirac_filter back to {dirac}: refused: {reason}"));
+            }
+            Ok(Outcome::Ignored) => {
+                problems.push(format!(
+                    "dirac_filter back to {dirac}: ignored by the receiver"
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => problems.push(format!("dirac_filter back to {dirac}: {e}")),
+        }
+    }
+    if let (Some(oracle), Some(saved)) = (&ctx.oracle, dynamic_eq) {
+        match restore::write(oracle.avr(), &["PSDYNEQ ?"], saved).await {
+            Ok(missed) if missed.is_empty() => {}
+            Ok(missed) => problems.push(format!("Dynamic EQ not set back: {missed:?}")),
+            Err(e) => problems.push(format!("Dynamic EQ not set back: {e}")),
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(Fail::new(problems.join(" | ")))
+    }
 }
 
 /// Set one option, wait for the select and its sensor, then compare with the receiver.
@@ -2303,7 +2922,22 @@ async fn send_simple_commands(ctx: &mut Ctx) -> Check {
     ensure!(names.len() > 250, "only {} commands to send", names.len());
     let mut problems = Vec::new();
     let mut refused: Vec<String> = Vec::new();
-    let mp = ctx.mp();
+    // No command may leave the volume above the volume of the receiver at the start, or above
+    // the limit. A start volume above the limit is lowered once.
+    let start = receiver_volume(ctx)
+        .await?
+        .ok_or_else(|| Fail::new("no second connection"))?;
+    let mut start_note = String::new();
+    if start > MAX_VOLUME {
+        lower_volume(ctx, None).await.map_err(|e| {
+            Fail::new(format!(
+                "the start volume {start} is above the limit {MAX_VOLUME}, not lowered: {e}"
+            ))
+        })?;
+        start_note = format!(". The start volume {start} was lowered to {MAX_VOLUME}");
+    }
+    let baseline = Some(start.min(MAX_VOLUME));
+    let limit = unmute_limit(baseline);
     // A speaker preset command was sent since the last compare.
     let mut preset_sent = false;
     for (i, name) in names.iter().enumerate() {
@@ -2326,16 +2960,26 @@ async fn send_simple_commands(ctx: &mut Ctx) -> Check {
         if response["code"] == 200 && !wait_for_filter(ctx, name).await? {
             problems.push(format!("{name}: the receiver did not select the filter"));
         }
-        if let Some(v) = current_volume(ctx).filter(|v| *v > MAX_VOLUME) {
-            ctx.client
-                .command_ok(
-                    "media_player",
-                    &mp,
-                    "volume",
-                    json!({ "volume": MAX_VOLUME }),
-                )
-                .await?;
-            problems.push(format!("{name}: the volume went to {v}, it was lowered"));
+        // The cached values decide if the receiver is asked: the second connection follows the
+        // changes of the receiver. The receiver is asked before anything is sent.
+        let seen = highest(
+            current_volume(ctx),
+            ctx.oracle.as_ref().and_then(Oracle::volume),
+        );
+        if seen.is_some_and(|v| above_baseline(v, baseline)) {
+            let real = receiver_volume(ctx).await?;
+            if real.is_none_or(|v| above_baseline(v, baseline)) {
+                let real = real.map_or_else(|| "an unknown volume".to_owned(), |v| v.to_string());
+                lower_volume(ctx, baseline).await.map_err(|e| {
+                    Fail::new(format!(
+                        "{name}: the volume went to {real}, above {limit}, not lowered: {e}. Earlier problems: {}",
+                        problems.join(" | ")
+                    ))
+                })?;
+                problems.push(format!(
+                    "{name}: the volume went to {real}, above {limit}, it was lowered"
+                ));
+            }
         }
         if i % 10 == 9 {
             compare_group(ctx, name, preset_sent, &mut problems).await?;
@@ -2349,14 +2993,14 @@ async fn send_simple_commands(ctx: &mut Ctx) -> Check {
         // The effect of one command is not checked: only that the entities showed the values of
         // the receiver after each group of 10 commands.
         Ok(format!(
-            "{} commands accepted ({} refused with a reason: {refused:?}), the effect of each is not verified, entities matched the receiver after every 10 commands",
+            "{} commands accepted ({} refused with a reason: {refused:?}), the effect of each is not verified, entities matched the receiver after every 10 commands{start_note}",
             names.len() - refused.len(),
             refused.len()
         ))
     } else {
         problems.truncate(12);
         Err(Fail::new(format!(
-            "{} commands sent. Problems: {}",
+            "{} commands sent. Problems: {}{start_note}",
             names.len(),
             problems.join(" | ")
         )))
@@ -2423,86 +3067,142 @@ pub async fn extra_entities(ctx: &mut Ctx) -> Check {
         before == "ON" || before == "OFF",
         "tone control switch shows {before}"
     );
-    let (response, _) = ctx
-        .client
-        .command("switch", &tone, "toggle", json!({}))
-        .await?;
-    if [409, 503].contains(&response["code"].as_u64().unwrap_or(0)) {
-        // A Dirac filter blocks the tone control.
-        notes.push(format!(
-            "tone control refused: {}",
-            response["msg_data"]["message"]
-                .as_str()
-                .unwrap_or("no reason")
-        ));
-    } else {
-        ensure!(response["code"] == 200, "toggle: code {}", response["code"]);
-        let after = if before == "ON" { "OFF" } else { "ON" };
-        if ctx
-            .client
-            .wait_text(&tone, "state", 6, after)
-            .await
-            .is_err()
-        {
-            // The receiver can ignore it, for example in a direct sound mode. The driver is
-            // right if it shows what the receiver has.
-            verify_all(ctx, 3).await?;
-            notes.push("tone control: the receiver did not change it".to_owned());
-        } else {
-            verify_all(ctx, 6).await?;
-            ctx.client
-                .command_ok("switch", &tone, "toggle", json!({}))
-                .await?;
-            ctx.client.wait_text(&tone, "state", 6, &before).await?;
-            verify_all(ctx, 6).await?;
-            notes.push("tone control toggled and restored".to_owned());
-        }
-    }
-
     let bass = format!("number.bass.{}", ctx.key);
-    let start = ctx.client.attr(&bass, "value").and_then(Value::as_i64);
-    match start {
-        None => notes.push("bass has no value".to_owned()),
-        Some(start) => {
-            let (up, back) = if start < 6 {
-                ("increment", "decrement")
-            } else {
-                ("decrement", "increment")
-            };
-            let moved = if start < 6 { start + 1 } else { start - 1 };
-            let (response, _) = ctx.client.command("number", &bass, up, json!({})).await?;
-            if response["code"] == 409 {
-                // A Dirac filter blocks the tone control.
-                notes.push(format!(
-                    "bass refused: {}",
-                    response["msg_data"]["message"]
-                        .as_str()
-                        .unwrap_or("no reason")
-                ));
-                return Ok(notes.join(", "));
-            }
-            ensure!(response["code"] == 200, "{up}: code {}", response["code"]);
-            let moved_to = ctx
+    // What the body can have changed: only these are set back.
+    let mut tone_changed = false;
+    // The bass level before its change. `None` while the bass is not changed.
+    let mut bass_start = None;
+    let result = async {
+        tone_changed = true;
+        let (response, _) = ctx
+            .client
+            .command("switch", &tone, "toggle", json!({}))
+            .await?;
+        if [409, 503].contains(&response["code"].as_u64().unwrap_or(0)) {
+            tone_changed = false;
+            // A Dirac filter blocks the tone control.
+            notes.push(format!(
+                "tone control refused: {}",
+                response["msg_data"]["message"]
+                    .as_str()
+                    .unwrap_or("no reason")
+            ));
+        } else {
+            ensure!(response["code"] == 200, "toggle: code {}", response["code"]);
+            let after = if before == "ON" { "OFF" } else { "ON" };
+            if ctx
                 .client
-                .wait_attr(&bass, "value", 6, |v| v.as_i64() == Some(moved))
-                .await;
-            if moved_to.is_err() {
+                .wait_text(&tone, "state", 6, after)
+                .await
+                .is_err()
+            {
+                // The receiver can ignore it, for example in a direct sound mode. The driver is
+                // right if it shows what the receiver has.
                 verify_all(ctx, 3).await?;
-                notes.push("bass: the receiver did not change it".to_owned());
+                notes.push("tone control: the receiver did not change it".to_owned());
             } else {
                 verify_all(ctx, 6).await?;
                 ctx.client
-                    .command_ok("number", &bass, back, json!({}))
+                    .command_ok("switch", &tone, "toggle", json!({}))
                     .await?;
-                ctx.client
-                    .wait_attr(&bass, "value", 6, |v| v.as_i64() == Some(start))
-                    .await?;
+                ctx.client.wait_text(&tone, "state", 6, &before).await?;
                 verify_all(ctx, 6).await?;
-                notes.push(format!("bass {start} -> {moved} -> {start} dB"));
+                notes.push("tone control toggled and restored".to_owned());
             }
         }
+
+        let start = ctx.client.attr(&bass, "value").and_then(Value::as_i64);
+        bass_start = start;
+        match start {
+            None => notes.push("bass has no value".to_owned()),
+            Some(start) => {
+                let (up, back) = if start < 6 {
+                    ("increment", "decrement")
+                } else {
+                    ("decrement", "increment")
+                };
+                let moved = if start < 6 { start + 1 } else { start - 1 };
+                let (response, _) = ctx.client.command("number", &bass, up, json!({})).await?;
+                if response["code"] == 409 {
+                    bass_start = None;
+                    // A Dirac filter blocks the tone control.
+                    notes.push(format!(
+                        "bass refused: {}",
+                        response["msg_data"]["message"]
+                            .as_str()
+                            .unwrap_or("no reason")
+                    ));
+                    return Ok(notes.join(", "));
+                }
+                ensure!(response["code"] == 200, "{up}: code {}", response["code"]);
+                let moved_to = ctx
+                    .client
+                    .wait_attr(&bass, "value", 6, |v| v.as_i64() == Some(moved))
+                    .await;
+                if moved_to.is_err() {
+                    verify_all(ctx, 3).await?;
+                    notes.push("bass: the receiver did not change it".to_owned());
+                } else {
+                    verify_all(ctx, 6).await?;
+                    ctx.client
+                        .command_ok("number", &bass, back, json!({}))
+                        .await?;
+                    ctx.client
+                        .wait_attr(&bass, "value", 6, |v| v.as_i64() == Some(start))
+                        .await?;
+                    verify_all(ctx, 6).await?;
+                    notes.push(format!("bass {start} -> {moved} -> {start} dB"));
+                }
+            }
+        }
+        Ok(notes.join(", "))
     }
-    Ok(notes.join(", "))
+    .await;
+    let tone_before = tone_changed.then_some(before.as_str());
+    let undo = tone_back(ctx, &tone, tone_before, &bass, bass_start, result.is_err()).await;
+    first_error(result, undo)
+}
+
+/// Set the tone control switch back to `tone_before`, then the bass level back to `bass_start`.
+/// `None` means that the check did not change the value: nothing is sent for it. Without `force`,
+/// a value that the driver shows as the old one is not sent.
+async fn tone_back(
+    ctx: &mut Ctx,
+    tone: &str,
+    tone_before: Option<&str>,
+    bass: &str,
+    bass_start: Option<i64>,
+    force: bool,
+) -> Result<(), Fail> {
+    ctx.client.listen_ms(300).await?;
+    let tone_result = async {
+        if let Some(tone_before) = tone_before
+            && (force || ctx.client.text(tone, "state") != tone_before)
+        {
+            let cmd = if tone_before == "ON" { "on" } else { "off" };
+            ctx.client
+                .command_ok("switch", tone, cmd, json!({}))
+                .await?;
+            ctx.client.wait_text(tone, "state", 6, tone_before).await?;
+        }
+        Ok(())
+    }
+    .await;
+    let bass_result = async {
+        if let Some(start) = bass_start
+            && (force || ctx.client.attr(bass, "value").and_then(Value::as_i64) != Some(start))
+        {
+            ctx.client
+                .command_ok("number", bass, "set_value", json!({ "value": start }))
+                .await?;
+            ctx.client
+                .wait_attr(bass, "value", 6, |v| v.as_i64() == Some(start))
+                .await?;
+        }
+        Ok(())
+    }
+    .await;
+    join_errors(tone_result, bass_result)
 }
 
 /// Time that the HEOS check watches the events of the media player while HEOS plays.
@@ -2705,4 +3405,226 @@ fn heos_position(ctx: &Ctx, mp: &str) -> Result<i64, Fail> {
         .map_err(|e| Fail::new(format!("media_position_updated_at {at:?}: {e}")))?;
     let since = jiff::Timestamp::now().duration_since(at).as_secs();
     Ok(sent + since)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(result: Result<u8, Fail>) -> (Option<u8>, String, bool) {
+        match result {
+            Ok(v) => (Some(v), String::new(), false),
+            Err(f) => (None, f.msg, f.skip),
+        }
+    }
+
+    #[test]
+    fn first_error_keeps_a_clean_result() {
+        assert_eq!(
+            check(first_error(Ok(1), Ok(()))),
+            (Some(1), String::new(), false)
+        );
+        assert_eq!(
+            check(first_error(Err(Fail::new("body")), Ok(()))),
+            (None, "body".to_owned(), false)
+        );
+        assert_eq!(
+            check(first_error(Err(Fail::skip("why")), Ok(()))),
+            (None, "why".to_owned(), true),
+            "a skip stays a skip"
+        );
+    }
+
+    #[test]
+    fn first_error_reports_a_failed_undo() {
+        assert_eq!(
+            check(first_error(Ok(1), Err(Fail::new("undo")))),
+            (None, "not set back: undo".to_owned(), false)
+        );
+        assert_eq!(
+            check(first_error(Err(Fail::new("body")), Err(Fail::new("undo")))),
+            (None, "body; not set back: undo".to_owned(), false),
+            "the error of the check comes first"
+        );
+        assert_eq!(
+            check(first_error(Err(Fail::skip("why")), Err(Fail::new("undo")))),
+            (None, "why; not set back: undo".to_owned(), false),
+            "a skip with a failed undo is a failure"
+        );
+        assert_eq!(
+            check(first_error(Ok(1), Err(Fail::skip("undo")))),
+            (None, "not set back: undo".to_owned(), false),
+            "a failed undo is never a skip"
+        );
+    }
+
+    #[test]
+    fn lowest_takes_the_lower_known_volume() {
+        assert_eq!(lowest(None, None), None);
+        assert_eq!(lowest(Some(30.0), None), Some(30.0));
+        assert_eq!(lowest(None, Some(30.0)), Some(30.0));
+        assert_eq!(lowest(Some(30.0), Some(35.5)), Some(30.0));
+        assert_eq!(lowest(Some(35.5), Some(30.0)), Some(30.0));
+    }
+
+    #[test]
+    fn highest_takes_the_higher_known_volume() {
+        assert_eq!(highest(None, None), None);
+        assert_eq!(highest(Some(30.0), None), Some(30.0));
+        assert_eq!(highest(None, Some(30.0)), Some(30.0));
+        assert_eq!(highest(Some(30.0), Some(35.5)), Some(35.5));
+        assert_eq!(highest(Some(35.5), Some(30.0)), Some(35.5));
+    }
+
+    use crate::tests::options;
+
+    fn list(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    #[test]
+    fn other_source_is_one_that_may_be_selected() {
+        let opt = options(&["oppo"]);
+        let sources = list(&["Source", "OPPO", "TV Audio", "Apple TV"]);
+        assert_eq!(
+            other_source(&opt, "TV Audio", &sources),
+            Ok("Apple TV".to_owned())
+        );
+        assert_eq!(
+            other_source(&opt, "Apple TV", &sources),
+            Ok("TV Audio".to_owned())
+        );
+        let two = list(&["Source", "OPPO", "Apple TV"]);
+        assert!(
+            other_source(&opt, "Apple TV", &two).is_err(),
+            "only one source"
+        );
+    }
+
+    #[test]
+    fn other_source_needs_a_start_source_that_can_be_set_back() {
+        let sources = list(&["Source", "OPPO", "TV Audio", "Apple TV"]);
+        let opt = options(&["oppo"]);
+        assert!(other_source(&options(&[]), "TV Audio", &sources).is_err());
+        assert!(other_source(&opt, "", &sources).is_err(), "no start source");
+        assert!(other_source(&opt, "Source", &sources).is_err());
+        assert!(
+            other_source(&opt, "CD", &sources).is_err(),
+            "not in the list"
+        );
+        assert!(
+            other_source(&opt, "OPPO", &sources).is_err(),
+            "the set back would select an avoided source"
+        );
+    }
+
+    #[test]
+    fn a_volume_is_sent_only_when_the_receiver_is_above_the_limit() {
+        assert_eq!(volume_to_send(45.0, 40.0), Some(40.0));
+        assert_eq!(volume_to_send(40.5, 40.0), Some(40.0));
+        assert_eq!(volume_to_send(40.0, 40.0), None);
+        assert_eq!(volume_to_send(20.0, 40.0), None, "never up to the limit");
+    }
+
+    #[test]
+    fn the_volume_check_sets_back_only_its_own_changes() {
+        assert_eq!(volume_back_target(30.0, 30.0), None, "already at the start");
+        assert_eq!(
+            volume_back_target(28.0, 30.0),
+            Some(30.0),
+            "the lowest step"
+        );
+        assert_eq!(volume_back_target(29.0, 30.0), Some(30.0));
+        assert_eq!(
+            volume_back_target(31.0, 30.0),
+            Some(30.0),
+            "above the start"
+        );
+        assert_eq!(
+            volume_back_target(27.5, 30.0),
+            None,
+            "set lower by someone else"
+        );
+    }
+
+    #[test]
+    fn above_baseline_uses_the_start_and_the_limit() {
+        assert!(above_baseline(30.5, Some(30.0)));
+        assert!(!above_baseline(30.0, Some(30.0)));
+        assert!(!above_baseline(29.0, Some(30.0)));
+        assert!(above_baseline(40.5, Some(55.0)), "the limit counts");
+        assert!(above_baseline(40.5, None));
+        assert!(!above_baseline(40.0, None));
+    }
+
+    #[test]
+    fn join_errors_keeps_all_errors() {
+        let msg = |r: Result<(), Fail>| r.err().map(|f| (f.msg, f.skip));
+        assert_eq!(msg(join_errors(Ok(()), Ok(()))), None);
+        assert_eq!(
+            msg(join_errors(Err(Fail::new("a")), Ok(()))),
+            Some(("a".to_owned(), false))
+        );
+        assert_eq!(
+            msg(join_errors(Ok(()), Err(Fail::new("b")))),
+            Some(("b".to_owned(), false))
+        );
+        assert_eq!(
+            msg(join_errors(Err(Fail::new("a")), Err(Fail::skip("b")))),
+            Some(("a; b".to_owned(), false))
+        );
+    }
+
+    #[test]
+    fn unmute_limit_is_never_above_the_start_or_the_limit() {
+        assert_eq!(unmute_limit(None), MAX_VOLUME);
+        assert_eq!(unmute_limit(Some(30.0)), 30.0);
+        assert_eq!(unmute_limit(Some(MAX_VOLUME)), MAX_VOLUME);
+        assert_eq!(unmute_limit(Some(55.5)), MAX_VOLUME);
+        assert_eq!(unmute_limit(Some(35.5)), 35.5, "a half step stays");
+        assert_eq!(unmute_limit(Some(0.5)), 0.5);
+    }
+
+    #[test]
+    fn volume_plan_never_sends_above_the_limit() {
+        assert_eq!(
+            volume_plan(35.5).ok(),
+            Some(VolumePlan::Raw {
+                command: "MV355".to_owned(),
+                fallback: 35.0
+            })
+        );
+        assert_eq!(volume_plan(35.0).ok(), Some(VolumePlan::Volume(35.0)));
+        assert_eq!(
+            volume_plan(0.5).ok(),
+            Some(VolumePlan::Raw {
+                command: "MV005".to_owned(),
+                fallback: 0.0
+            })
+        );
+        assert_eq!(volume_plan(0.0).ok(), Some(VolumePlan::Volume(0.0)));
+        assert_eq!(
+            volume_plan(35.25).ok(),
+            Some(VolumePlan::Volume(35.0)),
+            "the next lower whole number"
+        );
+        assert_eq!(volume_plan(MAX_VOLUME).ok(), Some(VolumePlan::Volume(40.0)));
+        assert!(volume_plan(40.5).is_err(), "above the limit");
+        assert!(volume_plan(-1.0).is_err());
+        assert!(volume_plan(f64::NAN).is_err());
+    }
+
+    #[test]
+    fn mv_command_sets_whole_and_half_steps_up_to_the_limit() {
+        assert_eq!(mv_command(35.5).as_deref(), Some("MV355"));
+        assert_eq!(mv_command(5.5).as_deref(), Some("MV055"));
+        assert_eq!(mv_command(35.0).as_deref(), Some("MV35"));
+        assert_eq!(mv_command(0.0).as_deref(), Some("MV00"));
+        assert_eq!(mv_command(0.5).as_deref(), Some("MV005"));
+        assert_eq!(mv_command(MAX_VOLUME).as_deref(), Some("MV40"));
+        assert_eq!(mv_command(40.5), None, "above the limit");
+        assert_eq!(mv_command(-0.5), None);
+        assert_eq!(mv_command(35.25), None, "not a half step");
+        assert_eq!(mv_command(f64::NAN), None);
+    }
 }
