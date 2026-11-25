@@ -3,7 +3,7 @@
 
 //! Receivers of the controller: entity states, subscriptions and commands.
 
-use crate::config_store::{DeviceConfig, SaveWait};
+use crate::config_store::DeviceConfig;
 use crate::controller::{Controller, R2RequestMsg, SendWsMessage};
 use crate::device::{
     Command, Connect, DenonActor, DeviceEvent, DeviceStatus, Disconnect, Stop, UpdateConfig,
@@ -169,15 +169,13 @@ impl Controller {
         devices
     }
 
-    /// Save the configuration of all devices. The write runs on its own thread. The result says
-    /// when it is done.
-    pub(super) fn save_devices(&self) -> Result<SaveWait, ServiceError> {
-        Ok(self.store.save_devices(&self.sorted_configs())?)
-    }
-
-    /// Save the configuration of all devices without waiting for the disk.
-    pub(super) fn queue_devices(&self) -> Result<(), ServiceError> {
-        self.store.queue_devices(&self.sorted_configs())?;
+    /// Save the configuration of all devices without waiting for the disk. Counts the write in
+    /// [`Controller::config_writes`].
+    pub(super) fn queue_devices(&mut self) -> Result<(), ServiceError> {
+        let mut devices: Vec<&DeviceConfig> = self.devices.values().map(|d| &d.cfg).collect();
+        devices.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        self.store.queue_devices(&devices)?;
+        self.config_writes = self.config_writes.wrapping_add(1);
         Ok(())
     }
 

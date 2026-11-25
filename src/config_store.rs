@@ -749,7 +749,7 @@ impl ConfigStore {
 
     /// Queue the save of the configured devices. The write runs on the writer thread: the caller
     /// does not wait for the disk, and gets the result from the returned [`SaveWait`].
-    pub fn save_devices(&self, devices: &[DeviceConfig]) -> io::Result<SaveWait> {
+    pub fn save_devices(&self, devices: &[&DeviceConfig]) -> io::Result<SaveWait> {
         let data = serde_json::to_vec_pretty(&devices).map_err(io::Error::other)?;
         let (tx, rx) = oneshot::channel();
         self.writer.send(Job::Write {
@@ -764,7 +764,7 @@ impl ConfigStore {
 
     /// Queue the save of the configured devices and return at once. A write error is only
     /// logged. Use it where no caller waits for the result.
-    pub fn queue_devices(&self, devices: &[DeviceConfig]) -> io::Result<()> {
+    pub fn queue_devices(&self, devices: &[&DeviceConfig]) -> io::Result<()> {
         self.write_json(self.dir.join(CONFIG_FILE), devices, true)
     }
 
@@ -1458,7 +1458,7 @@ mod tests {
         fs::write(dir.join("config.json.tmp"), b"x").expect("tmp");
         let devices = vec![device()];
         store
-            .save_devices(&devices)
+            .save_devices(&[&devices[0]])
             .expect("save")
             .wait_blocking()
             .expect("written");
@@ -1467,7 +1467,7 @@ mod tests {
         store.queue_devices(&[]).expect("queue");
         store.writer.flush();
         assert_eq!(Vec::<DeviceConfig>::new(), store.load_devices());
-        store.queue_devices(&devices).expect("queue");
+        store.queue_devices(&[&devices[0]]).expect("queue");
         store.writer.flush();
         assert_eq!(devices, store.load_devices());
 

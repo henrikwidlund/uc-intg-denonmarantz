@@ -168,6 +168,9 @@ pub struct Controller {
     devices: HashMap<Arc<str>, Device>,
     /// Last sent attributes by entity id.
     entities: HashMap<String, serde_json::Map<String, serde_json::Value>>,
+    /// Number of queued writes of `config.json`. A setup save compares it to find writes that
+    /// were queued while it waited for its own.
+    config_writes: u64,
 }
 
 impl Controller {
@@ -191,6 +194,7 @@ impl Controller {
             driver_settings,
             devices: HashMap::default(),
             entities: HashMap::default(),
+            config_writes: 0,
         }
     }
 

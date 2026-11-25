@@ -296,6 +296,72 @@ enum InputError {
     Failed(IntegrationSetupError),
 }
 
+/// Checked action of the configuration mode page.
+enum ConfigAction {
+    Settings,
+    Add,
+    /// Remove the device with this key.
+    Remove(String),
+    /// Show the options of this device.
+    Configure(Box<DeviceConfig>),
+    /// Show this backup text.
+    Backup(String),
+    Restore,
+    Reset,
+}
+
+/// A change of the configured devices. The setup writes it to `config.json` first, then
+/// changes the memory.
+enum DeviceChange {
+    /// Replace all devices.
+    Restore(Vec<DeviceConfig>),
+    /// Remove the device with this key.
+    Remove(String),
+    /// Set the options of the device with this key. `None` keeps the address.
+    Configure {
+        key: String,
+        address: Option<String>,
+        options: Options,
+    },
+    /// Add a receiver. `update`: the receiver was configured when the setup read it.
+    /// `replace`: remove all other devices.
+    Add {
+        cfg: Box<DeviceConfig>,
+        update: bool,
+        replace: bool,
+    },
+}
+
+/// Set the options of a setup page. `None` keeps the address.
+fn set_options(cfg: &mut DeviceConfig, address: Option<&str>, options: Options) {
+    cfg.show_all_inputs = options.show_all_inputs;
+    cfg.is_denon = options.is_denon;
+    cfg.use_telnet = options.use_telnet;
+    cfg.is_dirac_supported = Some(options.is_dirac_supported);
+    cfg.tuner = Some(options.has_tuner);
+    cfg.signal_poll_secs = Some(options.signal_poll_secs);
+    if let Some(address) = address {
+        address.clone_into(&mut cfg.address);
+    }
+}
+
+/// Copy from the configured device `old` the fields that the setup does not read from the
+/// receiver: the id, the fields that the driver does not use, and the names and the form of the
+/// tuner presets that the receiver reported.
+fn keep_unused(cfg: &mut DeviceConfig, old: &DeviceConfig) {
+    cfg.id.clone_from(&old.id);
+    cfg.id_kind = old.id_kind;
+    cfg.update_audyssey = old.update_audyssey;
+    cfg.zone2 = old.zone2;
+    cfg.zone3 = old.zone3;
+    cfg.timeout = old.timeout;
+    cfg.volume_step = old.volume_step;
+    cfg.tuner_presets_lettered = old.tuner_presets_lettered;
+    cfg.tuner_preset_names.clone_from(&old.tuner_preset_names);
+    cfg.network_favorite_names
+        .clone_from(&old.network_favorite_names);
+}
+
 impl Handler<SetupDriverMsg> for Controller {
     type Result = Result<(), ServiceError>;
 
@@ -374,11 +440,7 @@ impl Handler<SetDriverUserDataMsg> for Controller {
         let flow = self.setup_flow;
         let Some(step) = self.setup.take() else {
             warn!("[{ws_id}] no active setup step");
-            ctx.run_later(ACK_DELAY, move |act, ctx| {
-                if act.is_setup_flow(flow, &ws_id) {
-                    act.finish_setup(&ws_id, Some(IntegrationSetupError::Other), ctx);
-                }
-            });
+            self.finish_setup_later(ws_id, Some(IntegrationSetupError::Other), ctx);
             return Ok(());
         };
         match self.setup_input(&ws_id, step, &values, ctx) {
@@ -393,13 +455,7 @@ impl Handler<SetDriverUserDataMsg> for Controller {
                     }
                 });
             }
-            Err(InputError::Failed(error)) => {
-                ctx.run_later(ACK_DELAY, move |act, ctx| {
-                    if act.is_setup_flow(flow, &ws_id) {
-                        act.finish_setup(&ws_id, Some(error), ctx);
-                    }
-                });
-            }
+            Err(InputError::Failed(error)) => self.finish_setup_later(ws_id, Some(error), ctx),
         }
         Ok(())
     }
@@ -493,13 +549,7 @@ impl Controller {
                 });
             }
             SetupState::RestoreChoice => self.restore_choice(ws_id, values, ctx),
-            SetupState::Backup => {
-                ctx.run_later(ACK_DELAY, move |act, ctx| {
-                    if act.is_setup_flow(flow, &ws_id) {
-                        act.finish_setup(&ws_id, None, ctx);
-                    }
-                });
-            }
+            SetupState::Backup => self.finish_setup_later(ws_id, None, ctx),
             SetupState::Restore => self.restore(ws_id, values, ctx)?,
             SetupState::ConfigMode => self.config_mode(ws_id, values, ctx)?,
             SetupState::ChooseDevice { mut found } => {
@@ -551,8 +601,12 @@ impl Controller {
                     }
                     None => return Err(InputError::Failed(IntegrationSetupError::NotFound)),
                 };
-                let save = self.configure(&key, address, options);
-                self.finish_after_save(ws_id, save, ctx);
+                let change = DeviceChange::Configure {
+                    key,
+                    address,
+                    options,
+                };
+                self.apply_after_save(ws_id, change, ctx);
             }
         }
         Ok(())
@@ -599,11 +653,7 @@ impl Controller {
                 InputError::Invalid(Box::new(SetupState::Restore), RESTORE_FAILED.into())
             })?;
         info!("[{ws_id}] restoring {} device(s)", devices.len());
-        let save = self.restore_devices(devices, ctx).map_err(|e| {
-            warn!("[{ws_id}] saving the configuration failed: {e}");
-            IntegrationSetupError::Other
-        });
-        self.finish_after_save(ws_id, save, ctx);
+        self.apply_after_save(ws_id, DeviceChange::Restore(devices), ctx);
         Ok(())
     }
 
@@ -676,16 +726,15 @@ impl Controller {
                     };
                     // A receiver that is configured already is updated: it keeps its id, which
                     // can be the serial number of the Python integration.
-                    // The fields that the driver does not use keep their values.
                     let old =
                         act.find_device(identified.serial.as_deref(), identified.mac.as_deref());
-                    let cfg = DeviceConfig {
-                        update_audyssey: old.is_some_and(|c| c.update_audyssey),
-                        zone2: old.is_some_and(|c| c.zone2),
-                        zone3: old.is_some_and(|c| c.zone3),
-                        timeout: old.map_or(2000, |c| c.timeout),
-                        id: old.map_or(identified.id, |c| c.id.clone()),
-                        id_kind: old.map_or(identified.id_kind, |c| c.id_kind),
+                    let mut cfg = DeviceConfig {
+                        update_audyssey: false,
+                        zone2: false,
+                        zone3: false,
+                        timeout: 2000,
+                        id: identified.id,
+                        id_kind: identified.id_kind,
                         serial: identified.serial,
                         mac: identified.mac,
                         name: identified.name,
@@ -693,7 +742,7 @@ impl Controller {
                         support_sound_mode: identified.support_sound_mode,
                         show_all_inputs: options.show_all_inputs,
                         use_telnet: options.use_telnet,
-                        volume_step: old.map_or(0.5, |c| c.volume_step),
+                        volume_step: 0.5,
                         is_denon: options.is_denon,
                         is_dirac_supported: Some(identified.is_dirac_supported),
                         signal_poll_secs: Some(options.signal_poll_secs),
@@ -702,89 +751,92 @@ impl Controller {
                         comm_api_version: identified.kind.comm_api_version,
                         has_tuner: identified.kind.has_tuner,
                         tuner: Some(options.has_tuner),
-                        tuner_presets_lettered: old.and_then(|c| c.tuner_presets_lettered),
-                        tuner_preset_names: old
-                            .map_or_else(Vec::new, |c| c.tuner_preset_names.clone()),
-                        network_favorite_names: old
-                            .map_or_else(Vec::new, |c| c.network_favorite_names.clone()),
+                        tuner_presets_lettered: None,
+                        tuner_preset_names: Vec::new(),
+                        network_favorite_names: Vec::new(),
                         info: Some(identified.info),
                         // A new setup asks all sources again.
                         missing: denon_marantz::MissingSources::default(),
                     };
-                    if act.setup_replace {
-                        act.remove_other_devices(cfg.key());
+                    let update = old.is_some();
+                    if let Some(old) = old {
+                        keep_unused(&mut cfg, old);
                     }
-                    if let Some(device) = act.devices.get_mut(cfg.key()) {
-                        device.cfg = cfg;
-                        device.send_config();
-                        act.purge_entities();
-                    } else {
-                        act.add_device(cfg, ctx);
-                    }
-                    let save = act.save_devices().map_err(|e| {
-                        warn!("[{ws_id}] saving the configuration failed: {e}");
-                        IntegrationSetupError::Other
-                    });
-                    act.finish_after_save(ws_id, save, ctx);
+                    let change = DeviceChange::Add {
+                        cfg: Box::new(cfg),
+                        update,
+                        replace: act.setup_replace,
+                    };
+                    act.apply_after_save(ws_id, change, ctx);
                 }),
         );
     }
 
+    /// Check the action of the configuration mode page and the chosen device.
+    fn check_config_action(&self, action: &str, key: &str) -> Result<ConfigAction, InputError> {
+        let invalid =
+            |message: String| InputError::Invalid(Box::new(SetupState::ConfigMode), message);
+        let unknown_device = || invalid("Unknown device".into());
+        Ok(match action {
+            "settings" => ConfigAction::Settings,
+            "add" => ConfigAction::Add,
+            "remove" if self.devices.contains_key(key) => ConfigAction::Remove(key.to_owned()),
+            "configure" => ConfigAction::Configure(Box::new(
+                self.devices
+                    .get(key)
+                    .ok_or_else(unknown_device)?
+                    .cfg
+                    .clone(),
+            )),
+            "remove" => return Err(unknown_device()),
+            "backup" => ConfigAction::Backup(
+                backup_json(&self.sorted_configs())
+                    .filter(|_| !self.devices.is_empty())
+                    .ok_or_else(|| invalid("Nothing to back up".into()))?,
+            ),
+            "restore" => ConfigAction::Restore,
+            "reset" => ConfigAction::Reset,
+            _ => return Err(invalid(format!("Unknown action: {action}"))),
+        })
+    }
+
+    /// Handle the configuration mode page. The debug log setting is saved only for valid input.
     fn config_mode(
         &mut self,
         ws_id: String,
         values: &HashMap<String, String>,
         ctx: &mut Context<Self>,
     ) -> Result<(), InputError> {
-        let unknown_device =
-            || InputError::Invalid(Box::new(SetupState::ConfigMode), "Unknown device".into());
         let flow = self.setup_flow;
-        let action = values.get("action").map_or_default(String::as_str);
-        let key = values.get("choice").map_or_default(String::as_str);
+        let action = self.check_config_action(
+            values.get("action").map_or_default(String::as_str),
+            values.get("choice").map_or_default(String::as_str),
+        )?;
         self.set_debug_log(
             &ws_id,
             parse_bool(values, "debug_log", self.driver_settings.debug_log),
         );
         match action {
-            "settings" => self.finish_setup_later(ws_id, ctx),
-            "add" => {
+            ConfigAction::Settings => self.finish_setup_later(ws_id, None, ctx),
+            ConfigAction::Add => {
                 ctx.run_later(ACK_DELAY, move |act, ctx| {
                     if act.is_setup_flow(flow, &ws_id) {
                         act.request_discover(&ws_id, ctx);
                     }
                 });
             }
-            "remove" => {
-                let cfg = self.remove_device(key).ok_or_else(unknown_device)?;
-                info!("[{ws_id}] removed {}", cfg.name);
-                let save = self.save_devices().map_err(|e| {
-                    warn!("[{ws_id}] saving the configuration failed: {e}");
-                    IntegrationSetupError::Other
-                });
-                self.finish_after_save(ws_id, save, ctx);
+            ConfigAction::Remove(key) => {
+                info!("[{ws_id}] removing {key}");
+                self.apply_after_save(ws_id, DeviceChange::Remove(key), ctx);
             }
-            "configure" => {
-                let cfg = self
-                    .devices
-                    .get(key)
-                    .ok_or_else(unknown_device)?
-                    .cfg
-                    .clone();
+            ConfigAction::Configure(cfg) => {
                 ctx.run_later(ACK_DELAY, move |act, ctx| {
                     if act.is_setup_flow(flow, &ws_id) {
-                        act.request_configure(ws_id, cfg, ctx);
+                        act.request_configure(ws_id, *cfg, ctx);
                     }
                 });
             }
-            "backup" => {
-                let text = backup_json(&self.sorted_configs())
-                    .filter(|_| !self.devices.is_empty())
-                    .ok_or_else(|| {
-                        InputError::Invalid(
-                            Box::new(SetupState::ConfigMode),
-                            "Nothing to back up".into(),
-                        )
-                    })?;
+            ConfigAction::Backup(text) => {
                 ctx.run_later(ACK_DELAY, move |act, ctx| {
                     if act.is_setup_flow(flow, &ws_id) {
                         act.setup = Some(SetupState::Backup);
@@ -792,7 +844,7 @@ impl Controller {
                     }
                 });
             }
-            "restore" => {
+            ConfigAction::Restore => {
                 ctx.run_later(ACK_DELAY, move |act, ctx| {
                     if act.is_setup_flow(flow, &ws_id) {
                         act.setup = Some(SetupState::Restore);
@@ -800,7 +852,7 @@ impl Controller {
                     }
                 });
             }
-            "reset" => {
+            ConfigAction::Reset => {
                 // The receivers are replaced when the setup ends with a receiver.
                 self.setup_replace = true;
                 info!("[{ws_id}] configuration reset after the setup");
@@ -809,12 +861,6 @@ impl Controller {
                         act.request_discover(&ws_id, ctx);
                     }
                 });
-            }
-            _ => {
-                return Err(InputError::Invalid(
-                    Box::new(SetupState::ConfigMode),
-                    format!("Unknown action: {action}"),
-                ));
             }
         }
         Ok(())
@@ -850,43 +896,183 @@ impl Controller {
         );
     }
 
-    /// End the setup when the configuration is written, without blocking the thread. A write
-    /// error ends the setup with an error.
-    fn finish_after_save(
-        &self,
-        ws_id: String,
-        save: Result<SaveWait, IntegrationSetupError>,
-        ctx: &mut Context<Self>,
-    ) {
+    /// Write `config.json` with the change, then change the devices in memory and end the setup.
+    /// The write runs off the actix thread. A failed write ends the setup with an error and
+    /// changes nothing. A device that was removed during the write is not added again, and the
+    /// file is written again from memory. If the setup flow ended during the write, the memory
+    /// still follows the file, but no setup event is sent.
+    fn apply_after_save(&mut self, ws_id: String, change: DeviceChange, ctx: &mut Context<Self>) {
         let flow = self.setup_flow;
-        ctx.spawn(
-            async move {
-                match save {
-                    Ok(wait) => wait.wait().await.map_err(|e| {
-                        warn!("Saving the configuration failed: {e}");
-                        IntegrationSetupError::Other
-                    }),
-                    Err(e) => Err(e),
+        let (save, writes) = match self.save_change(&change) {
+            Ok(save) => save,
+            Err(e) => {
+                self.finish_setup_later(ws_id, Some(e), ctx);
+                return;
+            }
+        };
+        ctx.spawn(save.wait().into_actor(self).map(move |result, act, ctx| {
+            let result = match result {
+                Ok(()) => act.apply_change(&ws_id, change, writes, ctx),
+                Err(e) => {
+                    warn!("[{ws_id}] saving the configuration failed: {e}");
+                    Err(IntegrationSetupError::Other)
+                }
+            };
+            if act.setup_flow != flow {
+                debug!("[{ws_id}] setup flow ended during the write");
+                // The end of the old flow did not see the changed devices.
+                if !act.devices.is_empty() {
+                    let _ =
+                        act.sm_consume(&ws_id, &operation_mode::Input::ConfigurationAvailable, ctx);
+                }
+                return;
+            }
+            // The request got its answer first.
+            act.finish_setup_later(ws_id, result.err(), ctx);
+        }));
+    }
+
+    /// Queue the write of `config.json` with the change. The devices in memory are not changed.
+    /// Gives the result of the write and [`Controller::config_writes`] after the write was
+    /// queued.
+    fn save_change(
+        &mut self,
+        change: &DeviceChange,
+    ) -> Result<(SaveWait, u64), IntegrationSetupError> {
+        let configured;
+        let mut devices: Vec<&DeviceConfig> = match change {
+            DeviceChange::Restore(devices) => devices.iter().collect(),
+            DeviceChange::Remove(key) => self
+                .devices
+                .iter()
+                .filter(|(k, _)| ***k != **key)
+                .map(|(_, d)| &d.cfg)
+                .collect(),
+            DeviceChange::Configure {
+                key,
+                address,
+                options,
+            } => {
+                let device = self
+                    .devices
+                    .get(key.as_str())
+                    .ok_or(IntegrationSetupError::NotFound)?;
+                let mut cfg = device.cfg.clone();
+                set_options(&mut cfg, address.as_deref(), *options);
+                configured = cfg;
+                self.devices
+                    .iter()
+                    .map(|(k, d)| if **k == **key { &configured } else { &d.cfg })
+                    .collect()
+            }
+            DeviceChange::Add { cfg, replace, .. } => {
+                let mut devices: Vec<&DeviceConfig> = if *replace {
+                    Vec::with_capacity(1)
+                } else {
+                    self.devices
+                        .iter()
+                        .filter(|(k, _)| ***k != *cfg.key())
+                        .map(|(_, d)| &d.cfg)
+                        .collect()
+                };
+                devices.push(cfg);
+                devices
+            }
+        };
+        devices.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        let save = self.store.save_devices(&devices).map_err(|e| {
+            warn!("Saving the configuration failed: {e}");
+            IntegrationSetupError::Other
+        })?;
+        self.config_writes = self.config_writes.wrapping_add(1);
+        Ok((save, self.config_writes))
+    }
+
+    /// Change the devices in memory after `config.json` was written with the change. The change
+    /// is applied to the configuration as it is now: device actors can change it during the
+    /// write. `writes` is [`Controller::config_writes`] after the write of the change was
+    /// queued. If other writes were queued after it, or if the change failed, the file is written
+    /// again from memory.
+    fn apply_change(
+        &mut self,
+        ws_id: &str,
+        change: DeviceChange,
+        writes: u64,
+        ctx: &Context<Self>,
+    ) -> Result<(), IntegrationSetupError> {
+        let result = match change {
+            DeviceChange::Restore(devices) => {
+                self.restore_devices(devices, ctx);
+                Ok(())
+            }
+            DeviceChange::Remove(key) => {
+                if let Some(cfg) = self.remove_device(&key) {
+                    info!("[{ws_id}] removed {}", cfg.name);
+                }
+                Ok(())
+            }
+            DeviceChange::Configure {
+                key,
+                address,
+                options,
+            } => {
+                // A device that was removed during the write is not added again.
+                if let Some(device) = self.devices.get_mut(key.as_str()) {
+                    set_options(&mut device.cfg, address.as_deref(), options);
+                    device.send_config();
+                    Ok(())
+                } else {
+                    Err(IntegrationSetupError::NotFound)
                 }
             }
-            .into_actor(self)
-            .map(move |result, _, ctx| {
-                // The request got its answer first.
-                ctx.run_later(ACK_DELAY, move |act, ctx| {
-                    if act.is_setup_flow(flow, &ws_id) {
-                        act.finish_setup(&ws_id, result.err(), ctx);
+            DeviceChange::Add {
+                mut cfg,
+                update,
+                replace,
+            } => {
+                // A device that was removed during the write is not added again.
+                if update && !self.devices.contains_key(cfg.key()) {
+                    Err(IntegrationSetupError::NotFound)
+                } else {
+                    if replace {
+                        self.remove_other_devices(cfg.key());
                     }
-                });
-            }),
-        );
+                    if let Some(device) = self.devices.get_mut(cfg.key()) {
+                        if update {
+                            keep_unused(&mut cfg, &device.cfg);
+                        }
+                        device.cfg = *cfg;
+                        device.send_config();
+                    } else {
+                        self.add_device(*cfg, ctx);
+                    }
+                    Ok(())
+                }
+            }
+        };
+        // Entities can come or go, for example when the connection mode changes. New devices
+        // connect if a Remote uses them.
+        self.purge_entities();
+        if result.is_err() || self.config_writes != writes {
+            info!("[{ws_id}] writing the configuration again from memory");
+            if let Err(e) = self.queue_devices() {
+                warn!("[{ws_id}] saving the configuration failed: {e}");
+            }
+        }
+        result
     }
 
     /// End the setup after the request was acknowledged.
-    fn finish_setup_later(&self, ws_id: String, ctx: &mut Context<Self>) {
+    fn finish_setup_later(
+        &self,
+        ws_id: String,
+        error: Option<IntegrationSetupError>,
+        ctx: &mut Context<Self>,
+    ) {
         let flow = self.setup_flow;
         ctx.run_later(ACK_DELAY, move |act, ctx| {
             if act.is_setup_flow(flow, &ws_id) {
-                act.finish_setup(&ws_id, None, ctx);
+                act.finish_setup(&ws_id, error, ctx);
             }
         });
     }
@@ -911,8 +1097,8 @@ impl Controller {
         }
     }
 
-    /// Remove all devices but the one with `key`, and the cached states of their entities. The
-    /// caller saves.
+    /// Remove all devices but the one with `key`, and the cached states of their entities. Memory
+    /// only: the caller writes the file.
     fn remove_other_devices(&mut self, key: &str) {
         let keys: Vec<String> = self
             .devices
@@ -925,12 +1111,8 @@ impl Controller {
         }
     }
 
-    /// Replace all devices with the devices of a backup.
-    fn restore_devices(
-        &mut self,
-        devices: Vec<DeviceConfig>,
-        ctx: &Context<Self>,
-    ) -> Result<SaveWait, ServiceError> {
+    /// Replace all devices with the devices of a backup. Memory only: the caller writes the file.
+    fn restore_devices(&mut self, devices: Vec<DeviceConfig>, ctx: &Context<Self>) {
         let keys: Vec<String> = self.devices.keys().map(ToString::to_string).collect();
         for key in &keys {
             self.remove_device(key);
@@ -938,39 +1120,6 @@ impl Controller {
         for cfg in devices {
             self.add_device(cfg, ctx);
         }
-        // Forget the cached states of entities that are gone.
-        self.purge_entities();
-        self.save_devices()
-    }
-
-    /// Apply the options page of a configured device.
-    fn configure(
-        &mut self,
-        key: &str,
-        address: Option<String>,
-        options: Options,
-    ) -> Result<SaveWait, IntegrationSetupError> {
-        let device = self
-            .devices
-            .get_mut(key)
-            .ok_or(IntegrationSetupError::NotFound)?;
-        let cfg = &mut device.cfg;
-        cfg.show_all_inputs = options.show_all_inputs;
-        cfg.is_denon = options.is_denon;
-        cfg.use_telnet = options.use_telnet;
-        cfg.is_dirac_supported = Some(options.is_dirac_supported);
-        cfg.tuner = Some(options.has_tuner);
-        cfg.signal_poll_secs = Some(options.signal_poll_secs);
-        if let Some(address) = address {
-            cfg.address = address;
-        }
-        device.send_config();
-        // Entities can come or go, for example when the connection mode changes.
-        self.purge_entities();
-        self.save_devices().map_err(|e| {
-            warn!("Saving the configuration failed: {e}");
-            IntegrationSetupError::Other
-        })
     }
 
     /// Show a setup page.
@@ -1544,11 +1693,14 @@ mod tests {
     }
 
     mod flow {
+        use crate::config_store::DeviceConfig;
         use crate::config_store::backup_json;
-        use crate::controller::handler::setup::{SetDriverUserDataMsg, SetupDriverMsg};
+        use crate::controller::handler::setup::{
+            DeviceChange, Options, SetDriverUserDataMsg, SetupDriverMsg,
+        };
         use crate::controller::test_util::{
-            DeviceAddr, Subscribed, SubscribesAll, TestRemote, config_file, connect, controller,
-            settle, use_closed_port, wait_stopped,
+            DeviceAddr, FlushStore, Subscribed, SubscribesAll, TestRemote, config_file, connect,
+            controller, settle, test_dir, use_closed_port, wait_stopped,
         };
         use crate::controller::{Controller, R2RequestMsg, R2SessionDisconnect};
         use actix::Addr;
@@ -1852,8 +2004,7 @@ mod tests {
             use_closed_port();
             let controller = controller("restore-valid", None);
             let events = connect(&controller, "a").await;
-            let devices: Vec<crate::config_store::DeviceConfig> =
-                serde_json::from_str(PYTHON_CONFIG).expect("devices");
+            let devices: Vec<DeviceConfig> = serde_json::from_str(PYTHON_CONFIG).expect("devices");
             let backup = backup_json(&devices).expect("backup");
             controller
                 .send(start_setup("a", false))
@@ -2102,6 +2253,488 @@ mod tests {
             assert_eq!(1, controller.send(Subscribed("a")).await.expect("send"));
             wait_stopped(&controller, &actor).await;
             assert_eq!(json!([]), config_file("remove"));
+        }
+
+        /// Make each write of `config.json` of the test `name` fail: the temporary file cannot be
+        /// made.
+        fn block_config_writes(name: &str) {
+            let tmp = test_dir(name).join("config.json.tmp");
+            std::fs::create_dir_all(&tmp).expect("dir");
+            std::fs::write(tmp.join("x"), b"x").expect("file");
+        }
+
+        #[actix::test]
+        async fn a_failed_write_of_a_removal_keeps_the_receiver() {
+            use_closed_port();
+            let controller = controller("remove-write-fails", Some(PYTHON_CONFIG));
+            let events = connect(&controller, "a").await;
+            block_config_writes("remove-write-fails");
+            controller
+                .send(start_setup("a", true))
+                .await
+                .expect("send")
+                .expect("setup started");
+            pause().await;
+            controller
+                .send(values(
+                    "a",
+                    &[("choice", "SERIAL0000001"), ("action", "remove")],
+                ))
+                .await
+                .expect("send")
+                .expect("ok");
+            wait_state(&events, "ERROR").await;
+            assert_eq!(json!("OTHER"), last(&events)["error"]);
+            assert_eq!(71, entity_ids(&controller).await.len());
+            let actor = controller
+                .send(DeviceAddr("SERIAL0000001"))
+                .await
+                .expect("send")
+                .expect("actor");
+            assert!(actor.connected());
+            controller.send(FlushStore).await.expect("send");
+            assert_eq!(
+                json!("SERIAL0000001"),
+                config_file("remove-write-fails")[0]["id"]
+            );
+        }
+
+        #[actix::test]
+        async fn a_failed_write_of_the_options_keeps_the_configuration() {
+            use_closed_port();
+            let controller = controller("configure-write-fails", Some(PYTHON_CONFIG));
+            let events = connect(&controller, "a").await;
+            block_config_writes("configure-write-fails");
+            controller
+                .send(start_setup("a", true))
+                .await
+                .expect("send")
+                .expect("setup started");
+            pause().await;
+            controller
+                .send(values(
+                    "a",
+                    &[("choice", "SERIAL0000001"), ("action", "configure")],
+                ))
+                .await
+                .expect("send")
+                .expect("ok");
+            wait_page(&events, "connection_mode").await;
+            controller
+                .send(values(
+                    "a",
+                    &[("address", "192.0.2.7"), ("connection_mode", "use_http")],
+                ))
+                .await
+                .expect("send")
+                .expect("ok");
+            wait_state(&events, "ERROR").await;
+            assert_eq!(json!("OTHER"), last(&events)["error"]);
+            // HTTP mode would have 15 entities.
+            assert_eq!(71, entity_ids(&controller).await.len());
+            let cfg = controller
+                .send(DeviceCfg("SERIAL0000001"))
+                .await
+                .expect("send")
+                .expect("device");
+            assert!(cfg.use_telnet);
+            assert_eq!("192.0.2.6", cfg.address);
+        }
+
+        #[actix::test]
+        async fn invalid_config_mode_input_does_not_change_the_debug_log() {
+            use_closed_port();
+            let name = "config-mode-debug-log";
+            let controller = controller(name, None);
+            let events = connect(&controller, "a").await;
+            controller
+                .send(start_setup("a", true))
+                .await
+                .expect("send")
+                .expect("setup started");
+            wait_state(&events, "WAIT_USER_ACTION").await;
+            let settings = test_dir(name).join("settings.json");
+            for action in ["unknown", "remove", "configure", "backup"] {
+                events.clear();
+                controller
+                    .send(values(
+                        "a",
+                        &[
+                            ("choice", "NOT_CONFIGURED"),
+                            ("action", action),
+                            ("debug_log", "true"),
+                        ],
+                    ))
+                    .await
+                    .expect("send")
+                    .expect("ok");
+                wait_state(&events, "WAIT_USER_ACTION").await;
+                let event = last(&events);
+                assert_eq!(json!("INVALID_INPUT"), event["error"], "{action}");
+                let field = event["require_user_action"]["input"]["settings"]
+                    .as_array()
+                    .expect("fields")
+                    .iter()
+                    .find(|f| f["id"] == "debug_log")
+                    .cloned()
+                    .expect("debug_log field");
+                assert_eq!(
+                    json!(false),
+                    field["field"]["checkbox"]["value"],
+                    "{action}"
+                );
+                controller.send(FlushStore).await.expect("send");
+                assert!(!settings.exists(), "{action}");
+            }
+            // Valid input saves it.
+            controller
+                .send(values(
+                    "a",
+                    &[("action", "settings"), ("debug_log", "true")],
+                ))
+                .await
+                .expect("send")
+                .expect("ok");
+            wait_state(&events, "OK").await;
+            controller.send(FlushStore).await.expect("send");
+            let saved: Value =
+                serde_json::from_str(&std::fs::read_to_string(&settings).expect("settings"))
+                    .expect("json");
+            assert_eq!(json!(true), saved["debug_log"]);
+        }
+
+        /// The configuration of a device in memory.
+        #[derive(actix::Message)]
+        #[rtype(result = "Option<DeviceConfig>")]
+        struct DeviceCfg(&'static str);
+
+        impl actix::Handler<DeviceCfg> for Controller {
+            type Result = Option<DeviceConfig>;
+            fn handle(&mut self, msg: DeviceCfg, _: &mut actix::Context<Self>) -> Self::Result {
+                self.devices.get(msg.0).map(|d| d.cfg.clone())
+            }
+        }
+
+        /// Starts the save of `change` and then runs `during` while the write runs.
+        #[derive(actix::Message)]
+        #[rtype(result = "()")]
+        struct ChangeDuringWrite {
+            change: DeviceChange,
+            during: fn(&mut Controller, &mut actix::Context<Controller>),
+        }
+
+        impl actix::Handler<ChangeDuringWrite> for Controller {
+            type Result = ();
+            fn handle(&mut self, msg: ChangeDuringWrite, ctx: &mut actix::Context<Self>) {
+                self.apply_after_save("a".into(), msg.change, ctx);
+                (msg.during)(self, ctx);
+            }
+        }
+
+        /// Set the options of the Python receiver to HTTP mode.
+        fn to_http() -> DeviceChange {
+            DeviceChange::Configure {
+                key: "SERIAL0000001".into(),
+                address: Some("192.0.2.7".into()),
+                options: Options {
+                    use_telnet: false,
+                    ..super::options()
+                },
+            }
+        }
+
+        /// Wait until the device has this configuration in memory, then until the store has
+        /// done all queued writes.
+        async fn wait_cfg(
+            controller: &Addr<Controller>,
+            key: &'static str,
+            done: impl Fn(Option<&DeviceConfig>) -> bool,
+        ) {
+            let end = std::time::Instant::now() + Duration::from_secs(5);
+            while !done(
+                controller
+                    .send(DeviceCfg(key))
+                    .await
+                    .expect("send")
+                    .as_ref(),
+            ) {
+                assert!(std::time::Instant::now() < end, "configuration not changed");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            controller.send(FlushStore).await.expect("send");
+        }
+
+        #[actix::test]
+        async fn the_options_keep_what_changed_during_the_write() {
+            use_closed_port();
+            let name = "configure-keeps-changes";
+            let controller = controller(name, Some(PYTHON_CONFIG));
+            controller
+                .send(ChangeDuringWrite {
+                    change: to_http(),
+                    // As a device actor reports names: the controller saves them.
+                    during: |act, _| {
+                        let device = act.devices.get_mut("SERIAL0000001").expect("device");
+                        device.cfg.network_favorite_names = vec!["Radio".into()];
+                        act.queue_devices().expect("queue");
+                    },
+                })
+                .await
+                .expect("send");
+            wait_cfg(&controller, "SERIAL0000001", |cfg| {
+                cfg.is_some_and(|c| !c.use_telnet)
+            })
+            .await;
+            let cfg = controller
+                .send(DeviceCfg("SERIAL0000001"))
+                .await
+                .expect("send")
+                .expect("device");
+            assert_eq!("192.0.2.7", cfg.address);
+            assert_eq!(vec!["Radio".to_owned()], cfg.network_favorite_names);
+            let file = &config_file(name)[0];
+            assert_eq!(json!(false), file["use_telnet"]);
+            assert_eq!(json!("192.0.2.7"), file["address"]);
+            assert_eq!(json!(["Radio"]), file["network_favorite_names"]);
+        }
+
+        #[actix::test]
+        async fn the_options_do_not_add_a_receiver_that_was_removed_during_the_write() {
+            use_closed_port();
+            let name = "configure-removed";
+            let controller = controller(name, Some(PYTHON_CONFIG));
+            controller
+                .send(ChangeDuringWrite {
+                    change: to_http(),
+                    during: |act, _| {
+                        act.remove_device("SERIAL0000001");
+                    },
+                })
+                .await
+                .expect("send");
+            // The file has the receiver until the change is applied and the file is written
+            // again.
+            let end = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                controller.send(FlushStore).await.expect("send");
+                if config_file(name) == json!([]) {
+                    break;
+                }
+                assert!(std::time::Instant::now() < end, "file not written again");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                controller
+                    .send(DeviceCfg("SERIAL0000001"))
+                    .await
+                    .expect("send")
+                    .is_none()
+            );
+        }
+
+        #[actix::test]
+        async fn a_change_is_applied_when_the_setup_ends_during_the_write() {
+            use_closed_port();
+            let name = "remove-after-abort";
+            let controller = controller(name, Some(PYTHON_CONFIG));
+            let events = connect(&controller, "a").await;
+            controller
+                .send(start_setup("a", true))
+                .await
+                .expect("send")
+                .expect("setup started");
+            pause().await;
+            controller
+                .send(ChangeDuringWrite {
+                    change: DeviceChange::Remove("SERIAL0000001".into()),
+                    during: |act, ctx| act.abort_setup("a", false, ctx),
+                })
+                .await
+                .expect("send");
+            wait_cfg(&controller, "SERIAL0000001", |cfg| cfg.is_none()).await;
+            assert_eq!(json!([]), config_file(name));
+            assert_eq!(0, entity_ids(&controller).await.len());
+            // The aborted flow gets no end event.
+            pause().await;
+            assert_eq!(json!("WAIT_USER_ACTION"), last(&events)["state"]);
+        }
+
+        #[actix::test]
+        async fn a_change_of_an_old_flow_does_not_end_a_new_flow() {
+            use_closed_port();
+            let name = "remove-then-new-setup";
+            let controller = controller(name, Some(PYTHON_CONFIG));
+            let events = connect(&controller, "a").await;
+            controller
+                .send(start_setup("a", true))
+                .await
+                .expect("send")
+                .expect("setup started");
+            pause().await;
+            controller
+                .send(ChangeDuringWrite {
+                    change: DeviceChange::Remove("SERIAL0000001".into()),
+                    during: |act, ctx| {
+                        act.abort_setup("a", false, ctx);
+                        actix::Handler::handle(act, start_setup("a", true), ctx)
+                            .expect("setup started");
+                    },
+                })
+                .await
+                .expect("send");
+            wait_cfg(&controller, "SERIAL0000001", |cfg| cfg.is_none()).await;
+            pause().await;
+            let states: Vec<Value> = events
+                .filter("driver_setup_change")
+                .iter()
+                .map(|e| e["state"].clone())
+                .collect();
+            assert!(!states.contains(&json!("OK")), "{states:?}");
+            assert_eq!(Some(&json!("WAIT_USER_ACTION")), states.last());
+            // The new flow still takes input.
+            controller
+                .send(values("a", &[("action", "settings")]))
+                .await
+                .expect("send")
+                .expect("ok");
+            wait_state(&events, "OK").await;
+        }
+
+        /// True if the driver state is `Running`.
+        #[derive(actix::Message)]
+        #[rtype(result = "bool")]
+        struct IsRunning;
+
+        impl actix::Handler<IsRunning> for Controller {
+            type Result = bool;
+            fn handle(&mut self, _: IsRunning, _: &mut actix::Context<Self>) -> bool {
+                is_running(self)
+            }
+        }
+
+        /// True if the driver state is `Running`.
+        fn is_running(controller: &Controller) -> bool {
+            matches!(
+                controller.machine.state(),
+                crate::controller::operation_mode::State::Running
+            )
+        }
+
+        /// The receiver of [`PYTHON_CONFIG`].
+        fn python_device() -> DeviceConfig {
+            let mut devices: Vec<DeviceConfig> =
+                serde_json::from_str(PYTHON_CONFIG).expect("devices");
+            devices.remove(0)
+        }
+
+        #[actix::test]
+        async fn a_receiver_added_when_the_first_setup_ends_during_the_write_sets_the_driver_running()
+         {
+            use_closed_port();
+            let name = "add-after-abort";
+            let controller = controller(name, None);
+            connect(&controller, "a").await;
+            controller
+                .send(start_setup("a", false))
+                .await
+                .expect("send")
+                .expect("setup started");
+            pause().await;
+            controller
+                .send(ChangeDuringWrite {
+                    change: DeviceChange::Add {
+                        cfg: Box::new(python_device()),
+                        update: false,
+                        replace: true,
+                    },
+                    during: |act, ctx| {
+                        act.abort_setup("a", false, ctx);
+                        assert!(!is_running(act));
+                    },
+                })
+                .await
+                .expect("send");
+            wait_cfg(&controller, "SERIAL0000001", |cfg| cfg.is_some()).await;
+            assert!(controller.send(IsRunning).await.expect("send"));
+            assert_eq!(json!("SERIAL0000001"), config_file(name)[0]["id"]);
+        }
+
+        #[actix::test]
+        async fn a_failed_write_of_a_restore_keeps_the_receivers() {
+            use_closed_port();
+            let name = "restore-write-fails";
+            let controller = controller(name, Some(PYTHON_CONFIG));
+            let events = connect(&controller, "a").await;
+            let mut other = python_device();
+            other.id = "OTHER0000001".into();
+            let backup = backup_json(&[other]).expect("backup");
+            block_config_writes(name);
+            controller
+                .send(start_setup("a", false))
+                .await
+                .expect("send")
+                .expect("setup started");
+            pause().await;
+            controller
+                .send(values("a", &[("restore_from_backup", "true")]))
+                .await
+                .expect("send")
+                .expect("ok");
+            pause().await;
+            controller
+                .send(values("a", &[("restore_data", &backup)]))
+                .await
+                .expect("send")
+                .expect("ok");
+            wait_state(&events, "ERROR").await;
+            assert_eq!(json!("OTHER"), last(&events)["error"]);
+            assert!(controller_cfg(&controller, "SERIAL0000001").await.is_some());
+            assert!(controller_cfg(&controller, "OTHER0000001").await.is_none());
+            controller.send(FlushStore).await.expect("send");
+            assert_eq!(json!("SERIAL0000001"), config_file(name)[0]["id"]);
+        }
+
+        /// The configuration of a device in memory.
+        async fn controller_cfg(
+            controller: &Addr<Controller>,
+            key: &'static str,
+        ) -> Option<DeviceConfig> {
+            controller.send(DeviceCfg(key)).await.expect("send")
+        }
+
+        #[actix::test]
+        async fn an_updated_receiver_keeps_the_names_reported_during_the_write() {
+            use_closed_port();
+            let name = "update-keeps-names";
+            let controller = controller(name, Some(PYTHON_CONFIG));
+            let mut cfg = python_device();
+            cfg.address = "192.0.2.7".into();
+            controller
+                .send(ChangeDuringWrite {
+                    change: DeviceChange::Add {
+                        cfg: Box::new(cfg),
+                        update: true,
+                        replace: false,
+                    },
+                    during: |act, _| {
+                        let device = act.devices.get_mut("SERIAL0000001").expect("device");
+                        device.cfg.network_favorite_names = vec!["Radio".into()];
+                        act.queue_devices().expect("queue");
+                    },
+                })
+                .await
+                .expect("send");
+            wait_cfg(&controller, "SERIAL0000001", |cfg| {
+                cfg.is_some_and(|c| c.address == "192.0.2.7")
+            })
+            .await;
+            let cfg = controller_cfg(&controller, "SERIAL0000001")
+                .await
+                .expect("device");
+            assert_eq!(vec!["Radio".to_owned()], cfg.network_favorite_names);
+            let file = &config_file(name)[0];
+            assert_eq!(json!("192.0.2.7"), file["address"]);
+            assert_eq!(json!(["Radio"]), file["network_favorite_names"]);
         }
 
         /// The address of the fake receiver in the setup.
