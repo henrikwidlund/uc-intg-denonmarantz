@@ -36,7 +36,7 @@ struct WsConn {
     msg_tracing_out: bool,
     /// The `authentication` message, sent first.
     authentication: ByteString,
-    /// Invalid messages from the Remote.
+    /// Messages from the Remote that are not a JSON object.
     invalid: connection::InvalidMessages,
 }
 

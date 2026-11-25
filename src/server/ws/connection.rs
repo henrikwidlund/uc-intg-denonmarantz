@@ -21,9 +21,10 @@ use uc_api::ws::{WsMessage, WsResultMsgData};
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 /// Messages that can wait to be sent to one Remote.
 const MAILBOX_CAPACITY: usize = 1024;
-/// Invalid messages within [`INVALID_WINDOW`] before the connection is closed. A Remote does not
-/// send invalid messages: many of them are a bug or another client.
+/// This many messages that are not a JSON object within [`INVALID_WINDOW`] close the connection.
+/// A Remote does not send them: many of them are a bug or another client.
 const INVALID_LIMIT: u8 = 5;
+/// Starts at the first message that is not a JSON object.
 const INVALID_WINDOW: Duration = Duration::from_secs(60);
 
 /// Sends messages from the controller to the WebSocket connection.
@@ -99,7 +100,7 @@ impl Handler<SendWsMessage> for WsSender {
     }
 }
 
-/// Counts invalid messages within [`INVALID_WINDOW`].
+/// Counts messages that are not a JSON object within [`INVALID_WINDOW`].
 #[derive(Debug)]
 pub(super) struct InvalidMessages {
     count: u8,
@@ -114,9 +115,10 @@ impl InvalidMessages {
         }
     }
 
-    /// Count one invalid message. True if the connection must be closed.
+    /// Count one invalid message. True if the connection must be closed. The window starts at
+    /// the first invalid message.
     fn add(&mut self, now: Instant) -> bool {
-        if now.duration_since(self.since) > INVALID_WINDOW {
+        if self.count == 0 || now.duration_since(self.since) > INVALID_WINDOW {
             self.since = now;
             self.count = 0;
         }
@@ -262,9 +264,10 @@ impl WsConn {
         }
     }
 
-    /// An invalid message gets an error response only if it is a request with a readable id.
-    /// The connection is closed after [`INVALID_LIMIT`] invalid messages within
-    /// [`INVALID_WINDOW`].
+    /// A message that cannot be parsed is skipped. A JSON object with a readable request id gets
+    /// an error response. The connection is closed after [`INVALID_LIMIT`] messages that are not
+    /// a JSON object within [`INVALID_WINDOW`]. A JSON object of an unknown form is not counted:
+    /// a newer Remote can send it.
     fn handle_text_message(
         &mut self,
         text: &str,
@@ -277,20 +280,26 @@ impl WsConn {
             }
             Err(e) => e,
         };
-        if self.invalid.add(Instant::now()) {
+        let json = text.trim_start().starts_with('{')
+            && serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok();
+        // The error text does not contain values from `msg_data`.
+        if !json && self.invalid.add(Instant::now()) {
             warn!(
-                "[{}] {INVALID_LIMIT} invalid messages, closing the connection",
+                "[{}] {INVALID_LIMIT} invalid messages, closing the connection: {e}",
                 self.id
             );
             return Err(Some(CloseReason {
                 code: CloseCode::Policy,
-                description: Some("Invalid JSON messages".into()),
+                description: Some("Invalid messages".into()),
             }));
         }
-        // The error text does not contain values from `msg_data`.
-        warn!("[{}] Invalid JSON message: {e}", self.id);
-        if let Some(req_id) = invalid_request_id(text) {
-            let error = ServiceError::BadRequest("Invalid JSON message".into());
+        if json {
+            warn!("[{}] Unknown message, skipped: {e}", self.id);
+        } else {
+            warn!("[{}] Invalid message, skipped: {e}", self.id);
+        }
+        if json && let Some(req_id) = invalid_request_id(text) {
+            let error = ServiceError::BadRequest("Unknown message".into());
             send_error_response(&self.id, req_id, error, sender);
         }
         Ok(())
@@ -530,6 +539,8 @@ mod tests {
             invalid_request_id(r#"{"kind":"r\u0065q","id":6,"cat":"x"}"#)
         );
         assert_eq!(Some(5), invalid_request_id(text));
+        // An array can match: the caller checks for a JSON object first.
+        assert_eq!(Some(9), invalid_request_id(r#"["req",9]"#));
         assert_eq!(
             None,
             invalid_request_id(r#"{"kind":"event","id":5,"cat":"x"}"#)
@@ -557,7 +568,22 @@ mod tests {
             assert!(!invalid.add(start));
         }
         let later = start + INVALID_WINDOW + Duration::from_secs(1);
-        assert!(!invalid.add(later));
+        for _ in 1..INVALID_LIMIT {
+            assert!(!invalid.add(later));
+        }
+        assert!(invalid.add(later), "new window full");
+    }
+
+    #[test]
+    fn invalid_window_starts_at_the_first_invalid_message() {
+        let mut invalid = InvalidMessages::new();
+        let first = Instant::now() + Duration::from_secs(50);
+        assert!(!invalid.add(first));
+        let later = first + Duration::from_secs(15);
+        for _ in 2..INVALID_LIMIT {
+            assert!(!invalid.add(later));
+        }
+        assert!(invalid.add(later), "within the window of the first message");
     }
 
     #[test]
@@ -629,7 +655,7 @@ mod tests {
     type Answers = (Vec<serde_json::Value>, Option<u16>);
 
     #[actix::test]
-    async fn errors_go_only_to_requests_with_an_id_and_invalid_messages_close() {
+    async fn errors_go_only_to_requests_with_an_id_and_non_objects_close() {
         use crate::configuration::HeartbeatSettings;
         use crate::controller::test_util::controller;
         use crate::server::{Authentication, ws_index};
@@ -664,14 +690,19 @@ mod tests {
                 r#"{"kind":"req","msg":"get_driver_version"}"#,
                 r#"{"kind":"foo"}"#,
                 r#"{"msg":"get_driver_version"}"#,
-                // Invalid, no id: no response.
+                // Not a JSON object: counted, no response.
                 "{not json",
+                "[1,",
+                "[]",
+                // A JSON object of an unknown form: not counted. With an id: an error response.
                 r#"{"kind":"event","cat":"x"}"#,
+                r#" {"kind":"event","cat":"x"}"#,
                 r#"{"kind":"req","cat":"x"}"#,
-                // Invalid with an id: an error response.
                 r#"{"kind":"req","id":8,"msg":"x","cat":"x"}"#,
                 // Valid with an id: a response.
                 r#"{"kind":"req","id":7,"msg":"get_driver_version"}"#,
+                // The 4th message that is not a JSON object.
+                "{",
             ] {
                 raw::send_text(&mut s, text);
             }
@@ -689,8 +720,8 @@ mod tests {
                     keep(&mut answers, &payload);
                 }
             }
-            // The 5th invalid message closes the connection.
-            raw::send_text(&mut s, "[1,");
+            // The 5th message that is not a JSON object closes the connection.
+            raw::send_text(&mut s, "]");
             loop {
                 let (opcode, payload) = raw::read(&mut s);
                 match opcode {
@@ -710,6 +741,7 @@ mod tests {
         handle.stop(false).await;
 
         assert_eq!(Some(1008), close, "policy close code");
+        assert_eq!(2, answers.len(), "{answers:?}");
         let mut ids: Vec<_> = answers.iter().map(|a| a["req_id"].clone()).collect();
         ids.sort_by_key(|id| id.as_u64());
         assert_eq!(
@@ -719,5 +751,6 @@ mod tests {
         );
         let error = answers.iter().find(|a| a["req_id"] == 8).expect("error");
         assert_eq!(400, error["code"]);
+        assert_eq!("Unknown message", error["msg_data"]["message"]);
     }
 }
