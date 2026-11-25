@@ -62,6 +62,21 @@ impl Handler<DeviceAddr> for Controller {
     }
 }
 
+/// The `Arc` key that the controller holds for this device key. Device events must use the same
+/// `Arc`, or they are dropped.
+#[derive(Message)]
+#[rtype(result = "Option<Arc<str>>")]
+pub(crate) struct DeviceKey(pub &'static str);
+
+impl Handler<DeviceKey> for Controller {
+    type Result = Option<Arc<str>>;
+    fn handle(&mut self, msg: DeviceKey, _: &mut Context<Self>) -> Self::Result {
+        self.devices
+            .get_key_value(msg.0)
+            .map(|(k, _)| Arc::clone(k))
+    }
+}
+
 /// The number of entities that a Remote subscribed.
 #[derive(Message)]
 #[rtype(result = "usize")]
@@ -102,6 +117,7 @@ pub(crate) async fn wait_stopped(controller: &Addr<Controller>, actor: &Addr<Den
 
 /// A connected test Remote. Keeps every message it gets.
 pub(crate) struct TestRemote {
+    id: Arc<str>,
     messages: Arc<Mutex<Vec<Value>>>,
     addr: Addr<Remote>,
 }
@@ -127,6 +143,11 @@ impl TestRemote {
             .rev()
             .find(|m| m["msg"] == msg)
             .map_or(Value::Null, |m| m["msg_data"].clone())
+    }
+
+    /// The index of the first message for which `f` is true.
+    pub(crate) fn position(&self, f: impl Fn(&Value) -> bool) -> Option<usize> {
+        self.messages.lock().expect("lock").iter().position(f)
     }
 
     /// Forget the messages received so far.
@@ -196,7 +217,11 @@ pub(crate) async fn connect(controller: &Addr<Controller>, id: &str) -> TestRemo
         })
         .await
         .expect("send");
-    TestRemote { messages, addr }
+    TestRemote {
+        id: id.into(),
+        messages,
+        addr,
+    }
 }
 
 /// Wait until the controller handled all queued messages, and then until the Remotes handled
@@ -208,7 +233,8 @@ pub(crate) async fn settle(controller: &Addr<Controller>, remotes: &[&TestRemote
     }
 }
 
-/// Send a request of the Remote `ws_id` and give its response.
+/// Send a request of the Remote `ws_id` and give its response. `None` if the controller sent
+/// the response to the Remote.
 pub(crate) async fn request(
     controller: &Addr<Controller>,
     ws_id: &str,
@@ -224,15 +250,19 @@ pub(crate) async fn request(
     controller.send(msg).await.expect("send")
 }
 
-/// The entity ids in the `get_entity_states` answer to the Remote `ws_id`.
-pub(crate) async fn entity_states(controller: &Addr<Controller>, ws_id: &str) -> Vec<String> {
+/// The entity ids in the `get_entity_states` answer that `remote` gets.
+pub(crate) async fn entity_states(
+    controller: &Addr<Controller>,
+    remote: &TestRemote,
+) -> Vec<String> {
+    let ws_id = remote.id.as_ref();
     let response = request(controller, ws_id, R2Request::GetEntityStates, None)
         .await
-        .expect("ok")
-        .expect("response");
-    response
-        .msg_data
-        .expect("data")
+        .expect("ok");
+    assert!(response.is_none(), "the controller sends the answer");
+    settle(controller, &[remote]).await;
+    remote
+        .last("entity_states")
         .as_array()
         .expect("list")
         .iter()

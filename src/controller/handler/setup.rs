@@ -24,7 +24,9 @@ use uc_api::intg::{DriverSetupChange, IntegrationSetup, SetupDriver};
 use uc_api::model::intg::{IntegrationSetupError, IntegrationSetupState, SetupChangeEventType};
 use uc_api::ws::{EventCategory, WsMessage};
 
-/// Delay so that the request is acknowledged before the next setup event.
+/// Time between the acknowledgment of a setup request and the next setup event, for the web
+/// configurator. The order does not depend on it: the acknowledgment goes first through the same
+/// queue.
 const ACK_DELAY: Duration = Duration::from_millis(100);
 /// Highest time between signal reads in seconds.
 const MAX_SIGNAL_POLL_SECS: u16 = 3600;
@@ -35,6 +37,9 @@ const MAX_SIGNAL_POLL_SECS: u16 = 3600;
 pub struct SetupDriverMsg {
     pub ws_id: String,
     pub data: SetupDriver,
+    /// Request id and response message. The handler sends the acknowledgment. `None`: no
+    /// acknowledgment.
+    pub ack: Option<(u32, &'static str)>,
 }
 
 /// User input of a setup page.
@@ -43,6 +48,9 @@ pub struct SetupDriverMsg {
 pub struct SetDriverUserDataMsg {
     pub ws_id: String,
     pub data: IntegrationSetup,
+    /// Request id and response message. The handler sends the acknowledgment. `None`: no
+    /// acknowledgment.
+    pub ack: Option<(u32, &'static str)>,
 }
 
 /// Receiver found in the setup flow.
@@ -301,6 +309,7 @@ impl Handler<SetupDriverMsg> for Controller {
                 "Cannot start driver setup. Please abort setup first.".into(),
             ));
         }
+        self.send_ack(&msg.ws_id, msg.ack);
         let reconfigure = msg.data.reconfigure == Some(true);
         if let Some(session) = self.sessions.get_mut(msg.ws_id.as_str()) {
             session.reconfiguring = msg.data.reconfigure;
@@ -361,11 +370,17 @@ impl Handler<SetDriverUserDataMsg> for Controller {
             ));
         }
         let ws_id = msg.ws_id;
-        let Some(step) = self.setup.take() else {
-            self.finish_setup(&ws_id, Some(IntegrationSetupError::Other), ctx);
-            return Err(ServiceError::BadRequest("No active setup step".into()));
-        };
+        self.send_ack(&ws_id, msg.ack);
         let flow = self.setup_flow;
+        let Some(step) = self.setup.take() else {
+            warn!("[{ws_id}] no active setup step");
+            ctx.run_later(ACK_DELAY, move |act, ctx| {
+                if act.is_setup_flow(flow, &ws_id) {
+                    act.finish_setup(&ws_id, Some(IntegrationSetupError::Other), ctx);
+                }
+            });
+            return Ok(());
+        };
         match self.setup_input(&ws_id, step, &values, ctx) {
             Ok(()) => {}
             Err(InputError::Invalid(step, message)) => {
@@ -399,6 +414,15 @@ impl Handler<AbortDriverSetup> for Controller {
 }
 
 impl Controller {
+    /// Acknowledge a setup request. It goes through the event queue, so it comes before the
+    /// setup events that follow.
+    fn send_ack(&self, ws_id: &str, ack: Option<(u32, &'static str)>) {
+        let Some((req_id, msg)) = ack else { return };
+        if let Err(e) = self.respond(ws_id, req_id, msg, ()) {
+            warn!("[{ws_id}] setup acknowledgment: {e}");
+        }
+    }
+
     /// Abort the setup flow, because of a timeout, an abort event or a disconnect of the Remote.
     pub(super) fn abort_setup(&mut self, ws_id: &str, timeout: bool, ctx: &mut Context<Self>) {
         debug!("[{ws_id}] abort driver setup, timeout: {timeout}");
@@ -1532,8 +1556,8 @@ mod tests {
         use crate::config_store::backup_json;
         use crate::controller::handler::setup::{SetDriverUserDataMsg, SetupDriverMsg};
         use crate::controller::test_util::{
-            DeviceAddr, Subscribed, TestRemote, config_file, connect, controller, use_closed_port,
-            wait_stopped,
+            DeviceAddr, Subscribed, TestRemote, config_file, connect, controller, settle,
+            use_closed_port, wait_stopped,
         };
         use crate::controller::{Controller, R2RequestMsg, R2SessionDisconnect};
         use actix::Addr;
@@ -1550,6 +1574,7 @@ mod tests {
             SetDriverUserDataMsg {
                 ws_id: ws_id.into(),
                 data: IntegrationSetup::InputValues(values),
+                ack: None,
             }
         }
 
@@ -1560,6 +1585,7 @@ mod tests {
             SetupDriverMsg {
                 ws_id: ws_id.into(),
                 data,
+                ack: None,
             }
         }
 
@@ -1610,7 +1636,8 @@ mod tests {
                 .collect()
         }
 
-        /// Send a request of the Remote `a` and give its response.
+        /// Send a request of the Remote `a` and give its response. `None` if the controller sent
+        /// the response to the Remote.
         async fn request(
             controller: &Addr<Controller>,
             request: R2Request,
@@ -1846,8 +1873,8 @@ mod tests {
         }
 
         /// The states that the Remote `a` gets when it asks for them.
-        async fn entity_states(controller: &Addr<Controller>) -> Vec<String> {
-            crate::controller::test_util::entity_states(controller, "a").await
+        async fn entity_states(controller: &Addr<Controller>, remote: &TestRemote) -> Vec<String> {
+            crate::controller::test_util::entity_states(controller, remote).await
         }
 
         #[actix::test]
@@ -1856,7 +1883,7 @@ mod tests {
             let controller = controller("purge", Some(PYTHON_CONFIG));
             let events = connect(&controller, "a").await;
             pause().await;
-            assert_eq!(71, entity_states(&controller).await.len());
+            assert_eq!(71, entity_states(&controller, &events).await.len());
             controller
                 .send(start_setup("a", true))
                 .await
@@ -1885,7 +1912,7 @@ mod tests {
                 .expect("send")
                 .expect("ok");
             wait_state(&events, "OK").await;
-            assert_eq!(15, entity_states(&controller).await.len());
+            assert_eq!(15, entity_states(&controller, &events).await.len());
         }
 
         /// Wait until the last setup event is a page with the field `id`.
@@ -1900,6 +1927,107 @@ mod tests {
                 assert!(std::time::Instant::now() < end, "no page with {id}");
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+        }
+
+        /// The answer `req_id` comes before the first setup event.
+        fn assert_ack_first(events: &TestRemote, req_id: u32) {
+            let ack = events
+                .position(|m| m["kind"] == "resp" && m["req_id"] == req_id)
+                .expect("ack");
+            let event = events
+                .position(|m| m["msg"] == "driver_setup_change")
+                .expect("event");
+            assert!(ack < event, "ack {ack}, event {event}");
+        }
+
+        #[actix::test]
+        async fn setup_answers_come_before_the_setup_events() {
+            use_closed_port();
+            let controller = controller("setup-ack", None);
+            let events = connect(&controller, "a").await;
+            let start = R2RequestMsg {
+                ws_id: "a".into(),
+                req_id: 5,
+                request: R2Request::SetupDriver,
+                msg_data: Some(json!({ "reconfigure": false, "setup_data": {} })),
+            };
+            let answer = controller.send(start).await.expect("send").expect("ok");
+            assert!(answer.is_none(), "the controller sends the answer");
+            wait_page(&events, "restore_from_backup").await;
+            assert_ack_first(&events, 5);
+
+            events.clear();
+            let input = R2RequestMsg {
+                ws_id: "a".into(),
+                req_id: 6,
+                request: R2Request::SetDriverUserData,
+                msg_data: Some(json!({ "input_values": { "restore_from_backup": "false" } })),
+            };
+            let answer = controller.send(input).await.expect("send").expect("ok");
+            assert!(answer.is_none(), "the controller sends the answer");
+            wait_page(&events, "address").await;
+            assert_ack_first(&events, 6);
+        }
+
+        /// Removes the active setup step.
+        #[derive(actix::Message)]
+        #[rtype(result = "()")]
+        struct ClearSetupStep;
+
+        impl actix::Handler<ClearSetupStep> for Controller {
+            type Result = ();
+            fn handle(&mut self, _: ClearSetupStep, _: &mut actix::Context<Self>) {
+                self.setup = None;
+            }
+        }
+
+        fn user_data(req_id: u32) -> R2RequestMsg {
+            R2RequestMsg {
+                ws_id: "a".into(),
+                req_id,
+                request: R2Request::SetDriverUserData,
+                msg_data: Some(json!({ "input_values": { "restore_from_backup": "false" } })),
+            }
+        }
+
+        #[actix::test]
+        async fn user_data_without_a_setup_step_is_answered_and_ends_the_setup() {
+            use_closed_port();
+            let controller = controller("setup-no-step", None);
+            let events = connect(&controller, "a").await;
+            controller
+                .send(start_setup("a", false))
+                .await
+                .expect("send")
+                .expect("setup started");
+            wait_page(&events, "restore_from_backup").await;
+            controller.send(ClearSetupStep).await.expect("send");
+            events.clear();
+
+            let answer = controller
+                .send(user_data(7))
+                .await
+                .expect("send")
+                .expect("ok");
+            assert!(answer.is_none(), "the controller sends the answer");
+            wait_state(&events, "ERROR").await;
+            assert_ack_first(&events, 7);
+            assert_eq!(
+                events.position(|m| m["kind"] == "resp" && m["req_id"] == 7),
+                events.position(|m| m["kind"] == "resp" && m["req_id"] == 7 && m["code"] == 200),
+                "the first answer has code 200"
+            );
+        }
+
+        #[actix::test]
+        async fn user_data_without_a_setup_flow_gets_no_acknowledgment() {
+            use_closed_port();
+            let controller = controller("setup-no-flow", None);
+            let events = connect(&controller, "a").await;
+            let answer = controller.send(user_data(8)).await.expect("send");
+            assert!(answer.is_err(), "{answer:?}");
+            settle(&controller, &[&events]).await;
+            assert_eq!(None, events.position(|m| m["kind"] == "resp"));
         }
 
         async fn subscribe(controller: &Addr<Controller>, ws_id: &str, ids: &[String]) {
@@ -1925,7 +2053,10 @@ mod tests {
             // The start of a session: one event per entity can fill the event queue of the Remote.
             subscribe(&controller, "a", &first).await;
             assert_eq!(0, changes.filter("entity_change").len());
-            assert_eq!(first.len(), entity_states(&controller).await.len());
+            assert_eq!(
+                first.len(),
+                entity_states(&controller, &changes).await.len()
+            );
             // An entity that is added later gets its state at once.
             subscribe(&controller, "a", &rest).await;
             assert_eq!(1, changes.filter("entity_change").len());

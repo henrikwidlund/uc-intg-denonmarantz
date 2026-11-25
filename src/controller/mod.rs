@@ -23,8 +23,10 @@ use crate::entities::EntityKind;
 use crate::errors::ServiceError;
 use actix::prelude::{Actor, Context, Recipient, SendError};
 use actix::{AsyncContext, SpawnHandle};
+use bytestring::ByteString;
 use log::{debug, error, info, warn};
 use rust_fsm::state_machine;
+use serde::Serialize;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -204,6 +206,29 @@ impl Controller {
         }
     }
 
+    /// Send the answer to a request. It uses the same queue as the events, so a later event cannot
+    /// come first. It is not dropped in standby or when the queue is full.
+    fn send_r2_response(&self, message: impl Into<SendWsMessage>, ws_id: &str) {
+        if let Some(session) = self.sessions.get(ws_id) {
+            session.recipient.do_send(message.into());
+        } else {
+            warn!("Attempting to send response but couldn't find session: {ws_id}");
+        }
+    }
+
+    /// Serialize a successful response and send it with [`Self::send_r2_response`].
+    fn respond<T: Serialize>(
+        &self,
+        ws_id: &str,
+        req_id: u32,
+        msg: &str,
+        msg_data: T,
+    ) -> Result<(), ServiceError> {
+        let text = response_text(req_id, msg, msg_data)?;
+        self.send_r2_response(SendWsMessage::Text(text), ws_id);
+        Ok(())
+    }
+
     /// Send a `device_state` event to a Remote.
     fn send_device_state(&self, ws_id: &str) {
         debug!("[{ws_id}] sending device_state: {}", self.device_state);
@@ -256,6 +281,35 @@ impl Controller {
             ))),
         }
     }
+}
+
+/// Successful response, the same as [`WsMessage::response`] gives. Borrows the data, so that it
+/// is not copied to serialize it.
+#[derive(Serialize)]
+struct ResponseRef<'a, T> {
+    kind: &'static str,
+    req_id: u32,
+    msg: &'a str,
+    code: u16,
+    msg_data: T,
+}
+
+/// Serialize a successful response.
+fn response_text<T: Serialize>(
+    req_id: u32,
+    msg: &str,
+    msg_data: T,
+) -> Result<ByteString, ServiceError> {
+    let response = ResponseRef {
+        kind: "resp",
+        req_id,
+        msg,
+        code: 200,
+        msg_data,
+    };
+    serde_json::to_string(&response)
+        .map(ByteString::from)
+        .map_err(|e| ServiceError::InternalServerError(format!("Error serializing {msg}: {e}")))
 }
 
 fn device_state_event(state: DeviceState) -> WsMessage {

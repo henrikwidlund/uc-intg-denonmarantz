@@ -5,14 +5,13 @@
 //! Handler for [`R2RequestMsg`].
 
 use crate::controller::handler::setup::{SetDriverUserDataMsg, SetupDriverMsg};
-use crate::controller::{Controller, R2RequestMsg, operation_mode};
+use crate::controller::{Controller, R2RequestMsg, SendWsMessage, operation_mode};
 use crate::errors::ServiceError;
 use crate::util::{DeserializeMsgData, return_fut_err, return_fut_ok};
 use crate::{APP_VERSION, built_info};
 use actix::{Handler, ResponseFuture};
 use log::debug;
 use serde::Deserialize;
-use serde_json::Value;
 use strum::EnumMessage;
 use uc_api::intg::ws::AvailableEntitiesFilter;
 use uc_api::intg::ws::{AvailableEntitiesMsgData, DriverVersionMsgData, R2Request};
@@ -70,9 +69,12 @@ impl Handler<R2RequestMsg> for Controller {
         }
 
         let req_id = msg.req_id;
-        // Answered with an event, so it has no response message.
+        // Answered with an event, so it has no response message. Sent from here, so that a later
+        // `device_state` event cannot come first.
         if msg.request == R2Request::GetDeviceState {
-            return_fut_ok!(Some(super::super::device_state_event(self.device_state)));
+            let event = super::super::device_state_event(self.device_state);
+            self.send_r2_response(event, &msg.ws_id);
+            return_fut_ok!(None);
         }
         let Some(resp_msg) = msg.request.get_message() else {
             return_fut_err!(ServiceError::InternalServerError(format!(
@@ -104,22 +106,24 @@ impl Handler<R2RequestMsg> for Controller {
                 let result = msg
                     .deserialize()
                     .map_err(ServiceError::from)
-                    .and_then(|data| self.handle(SetupDriverMsg { ws_id, data }, ctx));
-                return Box::pin(async move {
-                    result?;
-                    Ok(Some(WsMessage::response(req_id, resp_msg, Value::Null)))
-                });
+                    .and_then(|data| {
+                        let ack = Some((req_id, resp_msg));
+                        self.handle(SetupDriverMsg { ws_id, data, ack }, ctx)
+                    });
+                // The handler sends the acknowledgment.
+                return Box::pin(std::future::ready(result.map(|()| None)));
             }
             R2Request::SetDriverUserData => {
                 let ws_id = msg.ws_id.to_string();
                 let result = msg
                     .deserialize()
                     .map_err(ServiceError::from)
-                    .and_then(|data| self.handle(SetDriverUserDataMsg { ws_id, data }, ctx));
-                return Box::pin(async move {
-                    result?;
-                    Ok(Some(WsMessage::response(req_id, resp_msg, Value::Null)))
-                });
+                    .and_then(|data| {
+                        let ack = Some((req_id, resp_msg));
+                        self.handle(SetDriverUserDataMsg { ws_id, data, ack }, ctx)
+                    });
+                // The handler sends the acknowledgment.
+                return Box::pin(std::future::ready(result.map(|()| None)));
             }
             _ => {}
         }
@@ -151,24 +155,41 @@ impl Handler<R2RequestMsg> for Controller {
                 return_fut_ok!(Some(WsMessage::response(req_id, resp_msg, msg_data)));
             }
             R2Request::GetEntityStates => {
-                let states = self.entity_states(&msg.ws_id);
-                return_fut_ok!(Some(WsMessage::response(req_id, resp_msg, states)));
+                // Sent from here, so that a later `entity_change` event cannot come first.
+                let text = {
+                    let states = self.entity_states(&msg.ws_id);
+                    super::super::response_text(req_id, resp_msg, &states)
+                };
+                match text {
+                    Ok(text) => self.send_r2_response(SendWsMessage::Text(text), &msg.ws_id),
+                    Err(e) => return_fut_err!(e),
+                }
+                return_fut_ok!(None);
             }
             R2Request::SubscribeEvents => {
                 let ws_id = msg.ws_id.clone();
-                match msg.deserialize::<EntityIds>() {
-                    Ok(subscribe) => self.subscribe(&ws_id, subscribe.entity_ids),
+                let subscribe = match msg.deserialize::<EntityIds>() {
+                    Ok(subscribe) => subscribe,
                     Err(e) => return_fut_err!(e.into()),
+                };
+                // The answer comes before the states that the subscription sends.
+                if let Err(e) = self.respond(&ws_id, req_id, resp_msg, ()) {
+                    return_fut_err!(e);
                 }
-                return_fut_ok!(Some(WsMessage::response(req_id, resp_msg, Value::Null)));
+                self.subscribe(&ws_id, subscribe.entity_ids);
+                return_fut_ok!(None);
             }
             R2Request::UnsubscribeEvents => {
                 let ws_id = msg.ws_id.clone();
-                match msg.deserialize::<EntityIds>() {
-                    Ok(subscribe) => self.unsubscribe(&ws_id, &subscribe.entity_ids),
+                let unsubscribe = match msg.deserialize::<EntityIds>() {
+                    Ok(unsubscribe) => unsubscribe,
                     Err(e) => return_fut_err!(e.into()),
+                };
+                if let Err(e) = self.respond(&ws_id, req_id, resp_msg, ()) {
+                    return_fut_err!(e);
                 }
-                return_fut_ok!(Some(WsMessage::response(req_id, resp_msg, Value::Null)));
+                self.unsubscribe(&ws_id, &unsubscribe.entity_ids);
+                return_fut_ok!(None);
             }
             R2Request::EntityCommand => self.entity_command(msg, resp_msg),
             R2Request::BrowseMedia | R2Request::SearchMedia => {

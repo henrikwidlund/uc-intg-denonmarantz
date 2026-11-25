@@ -299,7 +299,9 @@ impl WsConn {
     /// Process a received Integration-API request, response or event message.
     ///
     /// A request runs in its own task, so a slow request does not stop reading the next
-    /// messages. The responses are sent with `sender` and can come in a different order.
+    /// messages. The responses are sent with `sender` and can come in a different order. A
+    /// response that must keep its order with the events is sent by the controller, and the
+    /// task gets `None`.
     fn process_intg_api_message(&self, mut msg: WsMessage, sender: &Addr<WsSender>) {
         match route(&msg) {
             Route::Request(req_id) => {
