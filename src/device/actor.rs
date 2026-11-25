@@ -12,6 +12,7 @@ use crate::entities::{
     self, EntityKind, SelectKind, SensorKind, View, media_player, remote, select,
 };
 use crate::errors::ServiceError;
+use actix::WeakAddr;
 use actix::prelude::*;
 use denon_marantz::HeosPlayerStatus;
 use denon_marantz::heos::{Change as HeosChange, PlayState, PlayerState};
@@ -31,8 +32,9 @@ use tokio_stream::wrappers::{BroadcastStream, WatchStream};
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// Longest wait for a running connect before a command runs: as long as the fast retries of the
 /// connect while the network is not ready ([`discovery::NETWORK_RETRY_TIMEOUT`]). The deadline
-/// of the command can end it earlier.
-const CONNECT_WAIT: Duration = Duration::from_secs(3);
+/// of the command can end it earlier. A command that is sent again can wait once more, see
+/// [`send_again`].
+pub(super) const CONNECT_WAIT: Duration = Duration::from_secs(3);
 /// A connection that stayed up this long resets the reconnect delay.
 const STABLE_CONNECTION: Duration = Duration::from_secs(60);
 /// Changes come in bursts. Entity attributes are sent once after the last one.
@@ -74,6 +76,34 @@ struct StartSynced(u64);
 #[derive(Message)]
 #[rtype(result = "()")]
 struct Early(u64, Arc<Avr>);
+
+/// Asks for what a command needs to be sent again, see [`send_again`]. The answer is `None` after a
+/// [`Disconnect`], a reconnect after a setup change, or a [`Stop`].
+#[derive(Message)]
+#[rtype(result = "Option<Again>")]
+struct SendAgain {
+    /// See [`Resend::without_state`].
+    without_state: bool,
+    /// See [`Resend::disconnects`].
+    disconnects: u64,
+}
+
+/// Where a command goes now.
+struct Target {
+    avr: Option<Arc<Avr>>,
+    heos: Option<heos::Link>,
+    /// Set when the command runs before the start ends, see [`send_command`].
+    attempt: Option<watch::Receiver<u64>>,
+}
+
+/// The answer to [`SendAgain`].
+struct Again {
+    target: Target,
+    /// The status of a running connect, if the command must wait for it.
+    connecting: Option<watch::Receiver<DeviceStatus>>,
+    /// The receiver before the start ends, for a command that does not read the state.
+    early: Option<watch::Receiver<Option<Arc<Avr>>>>,
+}
 
 /// The start found other receiver values than the stored ones. It has the generation of the
 /// connection and the configuration version of the connect.
@@ -257,8 +287,14 @@ pub struct DenonActor {
     /// The connects look the receiver up and do not use the stored values, until one succeeds.
     look_up: bool,
     /// Incremented on each connect attempt and on close. Results of older attempts are ignored, and
-    /// commands of an older attempt are not sent again.
+    /// commands sent before the start ends stop when it changes.
     attempt: watch::Sender<u64>,
+    /// The address of this actor, set when it starts. A weak address costs no allocation per
+    /// command.
+    me: Option<WeakAddr<Self>>,
+    /// Incremented on each [`Disconnect`] and on each reconnect after a setup change. A command is
+    /// not sent again after one.
+    disconnects: u64,
     /// How long the last connects took. They set the time limit of the connect tries, see
     /// [`discovery::Stall`].
     connect_times: discovery::ConnectTimes,
@@ -352,6 +388,8 @@ impl DenonActor {
             attempts: 0,
             look_up: false,
             attempt: watch::Sender::new(0),
+            me: None,
+            disconnects: 0,
             connect_times: discovery::ConnectTimes::default(),
             generation: 0,
             connected_at: None,
@@ -1397,6 +1435,24 @@ impl DenonActor {
         }
     }
 
+    /// Where a command goes now. Before the start ends, only a command that does not read the
+    /// state (`without_state`) gets the receiver.
+    fn target(&self, without_state: bool) -> Target {
+        let early = self.avr.is_none() && without_state;
+        let avr = if early {
+            self.early_tx.borrow().clone()
+        } else {
+            self.avr.clone()
+        };
+        Target {
+            avr,
+            heos: self.heos.clone(),
+            // Before the start ends, the network of the Remote can still be down after wake-up.
+            // The library tries the command again then, but not after standby or a new wake-up.
+            attempt: early.then(|| self.attempt.subscribe()),
+        }
+    }
+
     /// Start a connect if none runs.
     fn start_connect(&mut self, ctx: &mut Context<Self>) {
         self.want = true;
@@ -1620,7 +1676,8 @@ async fn connect_ended(status: Option<watch::Receiver<DeviceStatus>>) {
 impl Actor for DenonActor {
     type Context = Context<Self>;
 
-    fn started(&mut self, _: &mut Self::Context) {
+    fn started(&mut self, ctx: &mut Self::Context) {
+        self.me = Some(ctx.address().downgrade());
         self.keep_state = false;
         self.emit();
     }
@@ -1833,6 +1890,28 @@ impl Handler<Early> for DenonActor {
     }
 }
 
+impl Handler<SendAgain> for DenonActor {
+    type Result = Option<Again>;
+
+    fn handle(&mut self, msg: SendAgain, _: &mut Self::Context) -> Self::Result {
+        if !self.want || msg.disconnects != self.disconnects {
+            return None;
+        }
+        let target = self.target(msg.without_state);
+        let connecting = target
+            .avr
+            .is_none()
+            .then(|| self.running_connect())
+            .flatten();
+        let early = (connecting.is_some() && msg.without_state).then(|| self.early_tx.subscribe());
+        Some(Again {
+            target,
+            connecting,
+            early,
+        })
+    }
+}
+
 impl Handler<InfoChanged> for DenonActor {
     type Result = ();
 
@@ -1977,6 +2056,7 @@ impl Handler<Disconnect> for DenonActor {
     type Result = ();
 
     fn handle(&mut self, _: Disconnect, ctx: &mut Self::Context) {
+        self.disconnects += 1;
         // Not connected and not asked to connect: nothing to end. The entities keep their shown
         // state.
         if !self.want && self.avr.is_none() && self.status == DeviceStatus::Disconnected {
@@ -2091,6 +2171,8 @@ impl Handler<UpdateConfig> for DenonActor {
         self.cfg_version += 1;
         if reconnect && self.want {
             info!("[{}] configuration changed, reconnecting", self.cfg.name);
+            // A command from before the change is not sent again on the new connection.
+            self.disconnects += 1;
             self.lost_connection(ctx);
             self.attempts = 0;
             self.connect(ctx);
@@ -2149,6 +2231,133 @@ pub(super) async fn send_command(
         debug!("[{name}] {} done in {took} ms", command_name(msg));
     }
     result
+}
+
+/// What [`send_again`] needs.
+pub(super) struct Resend {
+    pub(super) addr: WeakAddr<DenonActor>,
+    /// See [`commands::without_state`]. False when the receiver was connected.
+    pub(super) without_state: bool,
+    /// The value of `DenonActor::disconnects` when the command came.
+    pub(super) disconnects: u64,
+    /// When the command came.
+    pub(super) received: Instant,
+}
+
+impl Resend {
+    const fn ask(&self) -> SendAgain {
+        SendAgain {
+            without_state: self.without_state,
+            disconnects: self.disconnects,
+        }
+    }
+}
+
+/// Send a command to `target`, and with [`send_again`] once more if it was surely not sent.
+async fn send_to(
+    target: Target,
+    resend: &Resend,
+    cfg: &DeviceConfig,
+    expected: &Expected,
+    msg: &Command,
+    name: &str,
+) -> Result<(), ServiceError> {
+    let first = match &target.avr {
+        Some(avr) => {
+            let heos = target.heos.as_ref();
+            send_command(avr, heos, cfg, expected, msg, target.attempt, name).await
+        }
+        None => Err(ServiceError::NotConnected),
+    };
+    match first {
+        // Boxed: the state of a resend is not kept in the future of every command.
+        Err(ServiceError::NotConnected) => {
+            Box::pin(send_again(resend, cfg, expected, msg, name)).await
+        }
+        other => other,
+    }
+}
+
+/// Send once more a command that was surely not sent: there was no receiver, or the library
+/// answered `NotConnected`. The caller holds the command lock. It waits for a running connect, at
+/// most [`CONNECT_WAIT`] and until [`SEND_TIME`] before the deadline of `msg`. Nothing is sent after
+/// a [`Disconnect`] or a reconnect after a setup change since the command came. When nothing is
+/// sent, the answer is `Timeout` if the time was over or the connect still runs after the wait,
+/// else `NotConnected`.
+/// A source command sends power on and then the source: power on can be sent twice.
+pub(super) async fn send_again(
+    resend: &Resend,
+    cfg: &DeviceConfig,
+    expected: &Expected,
+    msg: &Command,
+    name: &str,
+) -> Result<(), ServiceError> {
+    let cmd = command_name(msg);
+    let not_sent = |reason: &str| {
+        debug!("[{name}] {cmd} not sent: {reason}");
+        Err(ServiceError::NotConnected)
+    };
+    let no_time = || {
+        log_no_time(name, msg, resend.received);
+        Err(ServiceError::Timeout)
+    };
+    let Some(end) = msg
+        .deadline
+        .checked_sub(SEND_TIME)
+        .filter(|end| tokio::time::Instant::now() < *end)
+    else {
+        return no_time();
+    };
+    let Some(addr) = resend.addr.upgrade() else {
+        return not_sent("stopped");
+    };
+    // An error means that the actor is gone.
+    let Ok(Some(again)) = addr.send(resend.ask()).await else {
+        return not_sent("disconnected, setup changed or stopped");
+    };
+    let mut target = again.target;
+    let mut still_connecting = false;
+    if target.avr.is_none() {
+        let Some(connecting) = again.connecting else {
+            return not_sent("no connect runs");
+        };
+        let wait = async {
+            match again.early {
+                Some(early) => connect_usable(Some(connecting), early).await,
+                None => connect_ended(Some(connecting)).await,
+            }
+        };
+        let _ = timeout_at(end, wait).await;
+        let Ok(Some(again)) = addr.send(resend.ask()).await else {
+            return not_sent("disconnected, setup changed or stopped");
+        };
+        still_connecting = again.connecting.is_some();
+        target = again.target;
+    }
+    let Some(avr) = target.avr else {
+        return if still_connecting {
+            no_time()
+        } else {
+            not_sent("no receiver")
+        };
+    };
+    if tokio::time::Instant::now() >= end {
+        return no_time();
+    }
+    // The send can end after the answer: it does not keep the actor address.
+    drop(addr);
+    let waited = resend.received.elapsed().as_millis();
+    info!("[{name}] {cmd} not sent, sending again after {waited} ms");
+    send_command(
+        &avr,
+        target.heos.as_ref(),
+        cfg,
+        expected,
+        msg,
+        target.attempt,
+        name,
+    )
+    .await
 }
 
 /// The answer to a sent command, and its log. `late`: the command was answered with a timeout
@@ -2231,6 +2440,7 @@ impl Handler<Command> for DenonActor {
         let cfg = self.cfg.clone();
         let expected = self.expected.clone();
         let received = Instant::now();
+        let disconnects = self.disconnects;
         // Only a command during a connect can run before the start ends.
         let without_state = self.avr.is_none()
             && commands::without_state(&cfg, msg.kind, &msg.cmd_id, msg.params.as_ref());
@@ -2252,19 +2462,10 @@ impl Handler<Command> for DenonActor {
         Box::pin(
             async move { wait_turn(lock, connecting, early, without_state, deadline).await }
                 .into_actor(self)
-                .then(move |guard, act, _| {
-                    let early = act.avr.is_none() && without_state;
-                    let avr = if early {
-                        act.early_tx.borrow().clone()
-                    } else {
-                        act.avr.clone()
-                    };
-                    let heos = act.heos.clone();
+                .then(move |guard, act, ctx| {
+                    let target = act.target(without_state);
                     let name = act.cfg.name.clone();
-                    // Before the start ends, the network of the Remote can still be down after
-                    // wake-up. The library tries the command again then, but not after standby or
-                    // a new wake-up.
-                    let attempt = early.then(|| act.attempt.subscribe());
+                    let addr = act.me.clone().unwrap_or_else(|| ctx.address().downgrade());
                     async move {
                         let guard = match guard {
                             Ok(guard) => guard,
@@ -2274,27 +2475,24 @@ impl Handler<Command> for DenonActor {
                             }
                             Err(e) => return Err(e),
                         };
-                        let Some(avr) = avr else {
-                            return Err(ServiceError::NotConnected);
-                        };
                         // The wait can end late when the actor is busy.
                         if tokio::time::Instant::now() >= deadline {
                             log_no_time(&name, &msg, received);
                             return Err(ServiceError::Timeout);
                         }
-                        log_sending(&name, &msg, received, early);
+                        if target.avr.is_some() {
+                            log_sending(&name, &msg, received, target.attempt.is_some());
+                        }
+                        let resend = Resend {
+                            addr,
+                            without_state,
+                            disconnects,
+                            received,
+                        };
                         let send = async move {
                             let _guard = guard;
-                            let result = send_command(
-                                &avr,
-                                heos.as_ref(),
-                                &cfg,
-                                &expected,
-                                &msg,
-                                attempt,
-                                &name,
-                            )
-                            .await;
+                            let result =
+                                send_to(target, &resend, &cfg, &expected, &msg, &name).await;
                             (result, name, msg)
                         };
                         let finish = |(result, name, msg): (_, String, Command), late| {

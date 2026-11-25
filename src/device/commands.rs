@@ -442,12 +442,12 @@ async fn action_run(
             let muted = fresh(&expected.mute)
                 .or_else(|| read(avr, |s| s.zone(Zone::Main).muted))
                 .unwrap_or(false);
-            store(&expected.mute, !muted);
             zone.set_mute(!muted).await?;
+            store(&expected.mute, !muted);
         }
         Action::Mute(mute) => {
-            store(&expected.mute, mute);
             zone.set_mute(mute).await?;
+            store(&expected.mute, mute);
         }
         Action::CursorUp => send(avr, Command::CursorUp).await?,
         Action::CursorDown => send(avr, Command::CursorDown).await?,

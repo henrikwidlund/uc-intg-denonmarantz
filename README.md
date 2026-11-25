@@ -155,6 +155,12 @@ Commands with a number are sent as raw text with the remote entity:
   Commands keep their order: a command after one that waits also waits. A command whose connection cannot be
   opened is tried again for up to 3 seconds; a command sent before the start ends stops when the Remote goes to
   standby or wakes up again. If the receiver is not connected and no connect runs, a command fails at once.
+- A command that was surely not sent is sent once more: there was no receiver after the wait, or the telnet
+  connection was not open. It waits for a connect that runs, and the next try goes over HTTP if telnet is still
+  down. It is not sent again after standby, a disconnect or a setup change that connects again, or for a
+  command that goes to HEOS (HEOS may have received it). When less than 1 second is left of the 9 seconds
+  below, or the connect still runs after the wait, the answer is a timeout. Remote commands with more than one
+  step are not sent again.
 - A command is answered at most 9 seconds after it came (the Remote waits 10 seconds). If it cannot be sent before
   then, the answer is a timeout and nothing is sent. A send that still runs then gets a timeout answer and ends later.
 

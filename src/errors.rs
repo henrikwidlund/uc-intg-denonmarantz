@@ -19,6 +19,9 @@ pub enum ServiceError {
     BadRequest(String),
     #[error("Not found: {0}")]
     NotFound(String),
+    /// Nothing was sent: there is no receiver, or its connection is not open. A single entity
+    /// command (not a remote run with more than one step) that gets it on the first try can be sent
+    /// once more, see `actor::send_again`.
     #[error("Receiver is not connected")]
     NotConnected,
     #[error("Service unavailable: {0}")]
@@ -118,11 +121,12 @@ impl From<denon_marantz::heos::Error> for ServiceError {
     fn from(e: denon_marantz::heos::Error) -> Self {
         use denon_marantz::heos::Error;
         match e {
-            Error::NotConnected => Self::NotConnected,
             Error::Timeout { .. } => Self::Timeout,
             Error::InvalidCommand(_) | Error::InvalidConfig(_) => Self::BadRequest(e.to_string()),
             // For example an item that cannot pause. The device gives the reason.
             Error::Failed { .. } => Self::Blocked(e.to_string()),
+            // Also `NotConnected`: the connection can end after the command was written. Only a
+            // command that was surely not sent gets `ServiceError::NotConnected`.
             _ => Self::ServiceUnavailable(e.to_string()),
         }
     }
@@ -216,5 +220,11 @@ mod tests {
             ServiceError::NotConnected,
             ServiceError::from(Error::NotConnected)
         );
+    }
+
+    #[test]
+    fn a_closed_heos_connection_is_unavailable_and_not_sent_again() {
+        let e = ServiceError::from(denon_marantz::heos::Error::NotConnected);
+        assert!(matches!(e, ServiceError::ServiceUnavailable(_)), "{e:?}");
     }
 }
