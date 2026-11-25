@@ -3,6 +3,7 @@
 
 //! Entity commands against a fake receiver: the commands that the library sends.
 
+use super::Command;
 use super::commands::{Expected, run};
 use crate::config_store::DeviceConfig;
 use crate::entities::{EntityKind, NumberKind, SelectKind, SwitchKind};
@@ -58,16 +59,8 @@ async fn send(
 ) -> (Result<(), ServiceError>, Vec<String>) {
     let fake = Fake::start(power_on).await;
     let avr = fake.avr().await;
-    let result = run(
-        &avr,
-        None,
-        &cfg(),
-        &Expected::default(),
-        kind,
-        cmd_id,
-        params,
-    )
-    .await;
+    let msg = Command::new(kind, cmd_id.into(), params.cloned());
+    let result = run(&avr, None, &cfg(), &Expected::default(), &msg).await;
     (result, fake.commands())
 }
 
@@ -90,9 +83,7 @@ async fn stop_without_heos_is_refused_on_marantz() {
         None,
         &marantz,
         &Expected::default(),
-        EntityKind::MediaPlayer,
-        "stop",
-        None,
+        &Command::new(EntityKind::MediaPlayer, "stop".into(), None),
     )
     .await;
     assert!(

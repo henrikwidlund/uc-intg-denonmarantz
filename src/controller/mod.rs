@@ -46,7 +46,6 @@ state_machine! {
     },
     Running => {
         SetupDriverRequest => SetupFlow [SetupFlowTimer],
-        R2Request => Running,
         AbortSetup => RequireSetup,
     },
     // The configured receivers stay usable during a setup flow.
@@ -55,20 +54,17 @@ state_machine! {
         Successful => Running [CancelSetupFlowTimer],
         SetupError => SetupError [CancelSetupFlowTimer],
         AbortSetup => RequireSetup [CancelSetupFlowTimer],
-        R2Request => SetupFlow,
     },
     WaitSetupUserData => {
         SetupUserData => SetupFlow,
         SetupError => SetupError [CancelSetupFlowTimer],
         AbortSetup => RequireSetup [CancelSetupFlowTimer],
-        R2Request => WaitSetupUserData,
     },
     SetupError => {
         ConfigurationAvailable => Running,
         AbortSetup => RequireSetup,
         SetupDriverRequest => SetupFlow [SetupFlowTimer],
         SetupError => SetupError,
-        R2Request => SetupError,
     }
 }
 

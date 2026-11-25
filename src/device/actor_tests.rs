@@ -395,19 +395,11 @@ async fn names_are_asked_only_while_they_are_used_and_then_stored() {
 
     // A saved favorite has a new name: the names are read again.
     let names = rig.telnet.count("NSH");
-    let save = Command {
-        kind: EntityKind::MediaPlayer,
-        cmd_id: "NSC01".into(),
-        params: None,
-    };
+    let save = Command::new(EntityKind::MediaPlayer, "NSC01".into(), None);
     rig.actor.send(save).await.expect("send").expect("save");
     until("the names again", 5, || rig.telnet.count("NSH") > names).await;
     let presets = rig.telnet.count("OPTPN ?");
-    let save = Command {
-        kind: EntityKind::MediaPlayer,
-        cmd_id: "TPANMEM03".into(),
-        params: None,
-    };
+    let save = Command::new(EntityKind::MediaPlayer, "TPANMEM03".into(), None);
     rig.actor.send(save).await.expect("send").expect("save");
     until("the presets again", 5, || {
         rig.telnet.count("OPTPN ?") > presets
@@ -643,11 +635,7 @@ async fn a_pause_shows_paused_until_the_source_changes() {
         media_state(&rig.events) == Some("PLAYING".into())
     })
     .await;
-    let command = Command {
-        kind: EntityKind::MediaPlayer,
-        cmd_id: "play_pause".into(),
-        params: None,
-    };
+    let command = Command::new(EntityKind::MediaPlayer, "play_pause".into(), None);
     rig.actor.send(command).await.expect("send").expect("pause");
     until("paused", 5, || {
         media_state(&rig.events) == Some("PAUSED".into())
@@ -700,11 +688,7 @@ async fn a_command_sends_only_the_media_player_and_only_when_the_pause_changes()
     })
     .await;
     until_quiet(&rig.events).await;
-    let command = |cmd_id: &str| Command {
-        kind: EntityKind::MediaPlayer,
-        cmd_id: cmd_id.into(),
-        params: None,
-    };
+    let command = |cmd_id: &str| Command::new(EntityKind::MediaPlayer, cmd_id.into(), None);
     // The receiver does not answer the cursor: nothing changed, so nothing is sent.
     let before = changes_count(&rig.events);
     rig.actor
@@ -733,16 +717,27 @@ async fn a_command_sends_only_the_media_player_and_only_when_the_pause_changes()
 }
 
 #[actix::test]
-async fn stop_send_stops_a_running_sequence() {
+async fn a_late_sequence_does_not_start_and_stop_send_stops_a_running_one() {
     let rig = rig(answers_all, QUICK).await;
     until("the first read", 5, || rig.telnet.count("SLP?") >= 1).await;
     rig.telnet.send("PWON");
-    let remote = |cmd_id: &str, params: Option<Value>| Command {
-        kind: EntityKind::Remote,
-        cmd_id: cmd_id.into(),
-        params: params.and_then(|p| p.as_object().cloned()),
+    let remote = |cmd_id: &str, params: Option<Value>| {
+        Command::new(
+            EntityKind::Remote,
+            cmd_id.into(),
+            params.and_then(|p| p.as_object().cloned()),
+        )
     };
     let params = serde_json::json!({ "sequence": ["cursor_up"], "repeat": 10, "delay": 200 });
+    // A run after its deadline does not start.
+    let late = Command {
+        deadline: tokio::time::Instant::now(),
+        ..remote("send_cmd_sequence", Some(params.clone()))
+    };
+    let result = rig.actor.send(late).await.expect("send");
+    assert_eq!(Err(ServiceError::Timeout), result);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(0, rig.telnet.count("MNCUP"));
     // The run is answered at once.
     rig.actor
         .send(remote("send_cmd_sequence", Some(params)))
@@ -769,11 +764,11 @@ async fn a_repeated_toggle_switches_each_time() {
     rig.telnet.send("PWON");
     tokio::time::sleep(Duration::from_millis(300)).await;
     let params = serde_json::json!({ "command": "DYNAMIC_EQ_TOGGLE", "repeat": 2 });
-    let command = Command {
-        kind: EntityKind::Remote,
-        cmd_id: "send_cmd".into(),
-        params: params.as_object().cloned(),
-    };
+    let command = Command::new(
+        EntityKind::Remote,
+        "send_cmd".into(),
+        params.as_object().cloned(),
+    );
     rig.actor.send(command).await.expect("send").expect("run");
     until("both steps", 5, || {
         rig.telnet.count("PSDYNEQ ON") + rig.telnet.count("PSDYNEQ OFF") >= 2
@@ -788,11 +783,7 @@ async fn stop_send_is_answered_while_the_receiver_is_not_connected() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let collector = Collector(events).start();
     let actor = DenonActor::new("SERIAL0000001".into(), cfg(), collector.recipient()).start();
-    let stop = Command {
-        kind: EntityKind::Remote,
-        cmd_id: "stop_send".into(),
-        params: None,
-    };
+    let stop = Command::new(EntityKind::Remote, "stop_send".into(), None);
     actor.send(stop).await.expect("send").expect("stop");
 }
 
@@ -801,11 +792,11 @@ async fn a_command_that_the_state_of_the_receiver_does_not_allow_is_answered_wit
     let rig = rig(with_a_dirac_filter, QUICK).await;
     until("the filter", 5, || rig.telnet.count("PSDIRAC ?") >= 1).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let command = Command {
-        kind: EntityKind::Switch(SwitchKind::ToneControl),
-        cmd_id: "on".into(),
-        params: None,
-    };
+    let command = Command::new(
+        EntityKind::Switch(SwitchKind::ToneControl),
+        "on".into(),
+        None,
+    );
     // The library refuses it and sends nothing. The Remote gets OK and shows no error.
     rig.actor.send(command).await.expect("send").expect("ok");
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -844,11 +835,7 @@ async fn a_reconnect_asks_for_each_group_of_the_start_once() {
 async fn a_command_sent_before_standby_reaches_the_receiver() {
     let rig = rig(answers_all, QUICK).await;
     until("the first read", 5, || rig.telnet.count("SLP?") >= 1).await;
-    let command = Command {
-        kind: EntityKind::MediaPlayer,
-        cmd_id: "off".into(),
-        params: None,
-    };
+    let command = Command::new(EntityKind::MediaPlayer, "off".into(), None);
     // A failed connect before can have sent this status already.
     let before = status_count(&rig.events, DeviceStatus::Disconnected);
     // The disconnect comes while the command runs.
@@ -1165,11 +1152,7 @@ async fn a_connect_during_the_disconnect_wait_keeps_the_connection_like_a_new_on
     .await;
     let connected = http.app_commands();
     until("the first poll", 5, || http.app_commands() > connected).await;
-    let command = Command {
-        kind: EntityKind::MediaPlayer,
-        cmd_id: "off".into(),
-        params: None,
-    };
+    let command = Command::new(EntityKind::MediaPlayer, "off".into(), None);
     let disconnects = status_count(&events, DeviceStatus::Disconnected);
     // The disconnect waits for the command, and the connect comes during that wait.
     let sent = actor.send(command);
@@ -1574,7 +1557,7 @@ async fn another_receiver_at_the_stored_address_is_not_used() {
 }
 
 #[actix::test]
-async fn repeat_and_shuffle_go_to_heos() {
+async fn repeat_and_shuffle_go_to_heos_until_their_deadline() {
     let heos = FakeHeos::start("127.0.0.1", HeosItem::song()).await;
     TEST_HEOS.with(|slot| slot.set(Some(heos.config())));
     let rig = rig(answers_all, QUICK).await;
@@ -1589,10 +1572,12 @@ async fn repeat_and_shuffle_go_to_heos() {
     assert_eq!(Some(Value::from("OFF")), attr("repeat"));
     assert_eq!(Some(Value::from(false)), attr("shuffle"));
 
-    let send = |cmd_id: &str, params: Value| Command {
-        kind: EntityKind::MediaPlayer,
-        cmd_id: cmd_id.into(),
-        params: params.as_object().cloned(),
+    let send = |cmd_id: &str, params: Value| {
+        Command::new(
+            EntityKind::MediaPlayer,
+            cmd_id.into(),
+            params.as_object().cloned(),
+        )
     };
     let repeat = send("repeat", serde_json::json!({"repeat": "ALL"}));
     rig.actor.send(repeat).await.expect("send").expect("repeat");
@@ -1618,6 +1603,18 @@ async fn repeat_and_shuffle_go_to_heos() {
         modes
     );
 
+    // A command after its deadline is not sent.
+    let late = Command {
+        deadline: tokio::time::Instant::now(),
+        ..send("repeat", serde_json::json!({"repeat": "OFF"}))
+    };
+    assert_eq!(
+        Err(ServiceError::Timeout),
+        rig.actor.send(late).await.expect("send")
+    );
+    let modes = |l: &String| l.starts_with("player/set_play_mode");
+    assert_eq!(2, heos.received().iter().filter(|l| modes(l)).count());
+
     // Without HEOS in use, the command does nothing and the answer is OK.
     rig.telnet.send("SIDVD");
     until("DVD", 5, || attr("media_title") == Some("DVD".into())).await;
@@ -1638,11 +1635,7 @@ async fn the_media_player_shows_heos_on_network_audio() {
     until("the HEOS title", 5, || title() == Some("A Song".into())).await;
     assert_eq!(Some("PLAYING".into()), media_state(&rig.events));
 
-    let command = Command {
-        kind: EntityKind::MediaPlayer,
-        cmd_id: "play_pause".into(),
-        params: None,
-    };
+    let command = Command::new(EntityKind::MediaPlayer, "play_pause".into(), None);
     rig.actor.send(command).await.expect("send").expect("pause");
     assert!(
         heos.received()
@@ -1740,11 +1733,7 @@ async fn a_heos_command_without_an_answer_does_not_hold_up_the_receiver_commands
     let title = || entity_state(&rig.events, EntityKind::MediaPlayer, "media_title");
     until("the HEOS title", 5, || title() == Some("A Song".into())).await;
     heos.hang();
-    let command = |cmd_id: &str| Command {
-        kind: EntityKind::MediaPlayer,
-        cmd_id: cmd_id.into(),
-        params: None,
-    };
+    let command = |cmd_id: &str| Command::new(EntityKind::MediaPlayer, cmd_id.into(), None);
     let start = Instant::now();
     let pause = async {
         let result = rig.actor.send(command("play_pause")).await;
@@ -2060,11 +2049,7 @@ async fn a_failed_connect_with_the_stored_values_looks_the_receiver_up_at_once()
 
 /// A media player command without parameters.
 fn media_command(cmd_id: &str) -> Command {
-    Command {
-        kind: EntityKind::MediaPlayer,
-        cmd_id: cmd_id.into(),
-        params: None,
-    }
+    Command::new(EntityKind::MediaPlayer, cmd_id.into(), None)
 }
 
 /// A rig whose receiver values are stored, connected again with a start that reads slowly. Also
@@ -2087,6 +2072,32 @@ async fn slow_start_rig() -> (Rig, usize) {
     let connected = status_count(&rig.events, DeviceStatus::Connected);
     rig.actor.send(Connect).await.expect("connect");
     (rig, connected)
+}
+
+#[actix::test]
+async fn a_command_that_waits_for_the_start_is_answered_before_its_deadline() {
+    let (rig, connected) = slow_start_rig().await;
+    let start = Instant::now();
+    // Leaves 200 ms for the wait: less than the start takes.
+    let command = Command {
+        deadline: tokio::time::Instant::now() + Duration::from_millis(1200),
+        ..media_command("mute_toggle")
+    };
+    let result = rig.actor.send(command).await.expect("send");
+    assert_eq!(Err(ServiceError::Timeout), result);
+    let waited = start.elapsed();
+    assert!(waited >= Duration::from_millis(200), "{waited:?}");
+    assert!(waited < Duration::from_millis(1200), "{waited:?}");
+    // Nothing is sent, also after the start.
+    until("connected", 10, || {
+        status_count(&rig.events, DeviceStatus::Connected) > connected
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let sent = |line: &str| {
+        rig.telnet.count(line) + rig.http.commands().iter().filter(|c| *c == line).count()
+    };
+    assert_eq!(0, sent("MUON") + sent("MUOFF"));
 }
 
 #[actix::test]

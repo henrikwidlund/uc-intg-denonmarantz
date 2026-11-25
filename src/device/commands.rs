@@ -4,7 +4,7 @@
 //! Run entity commands on a receiver.
 
 use crate::config_store::DeviceConfig;
-use crate::device::{discovery, heos};
+use crate::device::{Command as EntityCommand, discovery, heos};
 use crate::entities::media_player::{self, Action};
 use crate::entities::{
     EntityKind, SelectKind, View, is_off, number, remote, select, simple_commands, switch,
@@ -91,7 +91,7 @@ pub async fn run_steps(
                     }
                     simple_run(avr, cfg, entry, &state).await?;
                 }
-                _ => action_run(avr, heos, cfg, expected, action.clone()).await?,
+                _ => action_run(avr, heos, cfg, expected, action.clone(), None).await?,
             }
         }
     }
@@ -148,20 +148,19 @@ fn action_without_state(cfg: &DeviceConfig, action: &Action) -> bool {
     }
 }
 
-/// Run an entity command.
+/// Run an entity command. A HEOS action ends at the deadline of `msg` at the latest.
 pub async fn run(
     avr: &Avr,
     heos: Option<&heos::Link>,
     cfg: &DeviceConfig,
     expected: &Expected,
-    kind: EntityKind,
-    cmd_id: &str,
-    params: Option<&Map<String, Value>>,
+    msg: &EntityCommand,
 ) -> Result<(), ServiceError> {
-    match kind {
+    let (cmd_id, params, deadline) = (msg.cmd_id.as_str(), msg.params.as_ref(), msg.deadline);
+    match msg.kind {
         EntityKind::MediaPlayer => {
             let action = media_player::command(cmd_id, params)?;
-            action_run(avr, heos, cfg, expected, action).await
+            action_run(avr, heos, cfg, expected, action, Some(deadline)).await
         }
         EntityKind::Remote => {
             let run = remote::command(cmd_id, params)?;
@@ -173,7 +172,7 @@ pub async fn run(
                         sleep(run.delay).await;
                     }
                     first = false;
-                    action_run(avr, heos, cfg, expected, action.clone()).await?;
+                    action_run(avr, heos, cfg, expected, action.clone(), Some(deadline)).await?;
                 }
             }
             Ok(())
@@ -291,7 +290,8 @@ const fn command_view<'a>(state: &'a State, cfg: &'a DeviceConfig) -> View<'a> {
 }
 
 /// Longest wait for HEOS to answer a command. The HEOS client sends one command at a time, so a
-/// command can wait behind a slow one. A command that is still waiting then is not sent.
+/// command can wait behind a slow one. A command that is still waiting then is not sent. A command
+/// with a deadline ends at its deadline when that comes first.
 const HEOS_COMMAND_LIMIT: Duration = Duration::from_secs(5);
 
 /// Play, pause, stop, next, previous, repeat and shuffle: the actions that go to HEOS while it
@@ -314,8 +314,19 @@ pub fn heos_in_use(heos: &heos::Link, state: &State) -> bool {
         .unwrap_or(false)
 }
 
-/// Run an action of [`is_heos_action`] on HEOS, for at most [`HEOS_COMMAND_LIMIT`].
-pub async fn heos_run(heos: &heos::Link, action: &Action) -> Result<(), ServiceError> {
+/// Run an action of [`is_heos_action`] on HEOS, for at most [`HEOS_COMMAND_LIMIT`] and not after
+/// `deadline`. Nothing is sent when `deadline` is over.
+pub async fn heos_run(
+    heos: &heos::Link,
+    action: &Action,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<(), ServiceError> {
+    let now = tokio::time::Instant::now();
+    let limit = now + HEOS_COMMAND_LIMIT;
+    let end = deadline.map_or(limit, |deadline| deadline.min(limit));
+    if now >= end {
+        return Err(ServiceError::Timeout);
+    }
     let run = async {
         match action {
             Action::PlayPause => heos.play_pause().await,
@@ -327,7 +338,7 @@ pub async fn heos_run(heos: &heos::Link, action: &Action) -> Result<(), ServiceE
             _ => Err(ServiceError::NotSupported("not a HEOS action".into())),
         }
     };
-    tokio::time::timeout(HEOS_COMMAND_LIMIT, run)
+    tokio::time::timeout_at(end, run)
         .await
         .map_err(|_| ServiceError::Timeout)?
 }
@@ -338,12 +349,13 @@ async fn heos_transport(
     heos: Option<&heos::Link>,
     avr: &Avr,
     action: &Action,
+    deadline: Option<tokio::time::Instant>,
 ) -> Option<Result<(), ServiceError>> {
     if !is_heos_action(action) {
         return None;
     }
     let heos = heos.filter(|link| heos_in_use(link, &avr.state().borrow()))?;
-    Some(heos_run(heos, action).await)
+    Some(heos_run(heos, action, deadline).await)
 }
 
 /// Read a value of the state. The state is not copied, and the borrow ends before any wait.
@@ -378,9 +390,10 @@ async fn action_run(
     cfg: &DeviceConfig,
     expected: &Expected,
     action: Action,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<(), ServiceError> {
     let zone = avr.zone(Zone::Main)?;
-    if let Some(result) = heos_transport(heos, avr, &action).await {
+    if let Some(result) = heos_transport(heos, avr, &action, deadline).await {
         return result;
     }
     match action {

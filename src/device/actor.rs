@@ -26,13 +26,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, watch};
-use tokio::time::timeout;
+use tokio::time::{sleep_until, timeout, timeout_at};
 use tokio_stream::wrappers::{BroadcastStream, WatchStream};
 
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// Longest wait for a running connect before a command runs: as long as the fast retries of the
-/// connect while the network is not ready ([`discovery::NETWORK_RETRY_TIMEOUT`]). The core waits
-/// 10 s for the answer.
+/// connect while the network is not ready ([`discovery::NETWORK_RETRY_TIMEOUT`]). The deadline
+/// of the command can end it earlier.
 const CONNECT_WAIT: Duration = Duration::from_secs(3);
 /// A connection that stayed up this long resets the reconnect delay.
 const STABLE_CONNECTION: Duration = Duration::from_secs(60);
@@ -46,9 +46,10 @@ const RELOAD_DELAY: Duration = Duration::from_millis(1500);
 /// Reads over HTTP that fail in a row, while telnet is down, before the receiver is searched
 /// again.
 const POLL_FAILURES_BEFORE_RECONNECT: u32 = 3;
-/// A command waits at most this long for the connect and for the commands before it. Nothing is
-/// sent when the time is over.
-const SEND_WAIT_LIMIT: Duration = Duration::from_secs(8);
+/// The wait of a command for the connect and for the commands before it ends this long before
+/// the deadline of the command, so that the send has this time. Nothing is sent when the wait
+/// ends this way.
+const SEND_TIME: Duration = Duration::from_secs(1);
 /// A disconnect waits at most this long for a command that is running.
 const DISCONNECT_WAIT: Duration = Duration::from_secs(2);
 /// Time between reads of the state over HTTP, while telnet does not run. The Python integration
@@ -810,9 +811,25 @@ impl DenonActor {
         changed
     }
 
-    /// Run play, pause, stop, next and previous on HEOS while the media player shows HEOS. They do
-    /// not wait for the commands of the receiver: HEOS is another connection. `None` if the command
-    /// does not go to HEOS.
+    /// The answer to a command that needs no receiver. A stop only ends the running remote
+    /// commands. A command that waited in the mailbox until its time is over does nothing, also no
+    /// connect. A remote command with more steps can run longer once it has started.
+    fn answer_at_once(&self, msg: &Command) -> Option<Result<(), ServiceError>> {
+        if msg.kind == EntityKind::Remote && remote::is_stop(&msg.cmd_id) {
+            self.run_stop.fetch_add(1, Ordering::Relaxed);
+            return Some(Ok(()));
+        }
+        if tokio::time::Instant::now() >= msg.deadline {
+            let name = &self.cfg.name;
+            info!("[{name}] {} not sent: no time left", command_name(msg));
+            return Some(Err(ServiceError::Timeout));
+        }
+        None
+    }
+
+    /// Run the actions of [`commands::is_heos_action`] on HEOS while the media player shows HEOS.
+    /// They do not wait for the commands of the receiver: HEOS is another connection. `None` if the
+    /// command does not go to HEOS.
     fn heos_command(
         &self,
         msg: &Command,
@@ -837,23 +854,13 @@ impl DenonActor {
         {
             return None;
         }
+        let deadline = msg.deadline;
         let name = self.cfg.name.clone();
-        let cmd_id = msg.cmd_id.clone();
+        let cmd_name = command_name(msg).to_owned();
         Some(Box::pin(
             async move {
-                match commands::heos_run(&link, &action).await {
-                    // As for the receiver: the Remote gets OK, and the log says why nothing
-                    // happened.
-                    Err(ServiceError::Blocked(reason)) => {
-                        info!("[{name}] {cmd_id} ignored: {reason}");
-                        Ok(())
-                    }
-                    Err(e) => {
-                        warn!("[{name}] {cmd_id} failed: {e}");
-                        Err(e)
-                    }
-                    Ok(()) => Ok(()),
-                }
+                let result = commands::heos_run(&link, &action, Some(deadline)).await;
+                sent(result, &name, &cmd_name, false)
             }
             .into_actor(self),
         ))
@@ -1349,7 +1356,7 @@ impl DenonActor {
                     };
                     log_sending(&name, &msg, received, false);
                     let stopped = || stop.load(Ordering::Relaxed) != started;
-                    match commands::run_steps(
+                    let result = commands::run_steps(
                         &avr,
                         heos.as_ref(),
                         &cfg,
@@ -1358,14 +1365,8 @@ impl DenonActor {
                         &lock,
                         stopped,
                     )
-                    .await
-                    {
-                        Err(ServiceError::Blocked(reason)) => {
-                            info!("[{name}] {} ignored: {reason}", command_name(&msg));
-                        }
-                        Err(e) => warn!("[{name}] {} failed: {e}", command_name(&msg)),
-                        Ok(()) => {}
-                    }
+                    .await;
+                    let _ = sent(result, &name, command_name(&msg), false);
                 }
                 .into_actor(act)
             }),
@@ -1528,8 +1529,8 @@ fn other_receiver(cfg: &DeviceConfig, info: &Info) -> Option<AvrError> {
     })
 }
 
-/// Wait until a command can be sent. Nothing is sent while it waits: it can answer with a timeout
-/// and be tried again.
+/// Wait until a command can be sent, until [`SEND_TIME`] before `deadline`. Nothing is sent while
+/// it waits: it can answer with a timeout and be tried again.
 ///
 /// The commands keep their order: one that waits for the connect holds the lock, so the ones after
 /// it wait too. One that does not read the state waits only for the receiver.
@@ -1538,8 +1539,15 @@ async fn wait_turn(
     connecting: Option<watch::Receiver<DeviceStatus>>,
     early: watch::Receiver<Option<Arc<Avr>>>,
     without_state: bool,
+    deadline: tokio::time::Instant,
 ) -> Result<tokio::sync::OwnedMutexGuard<()>, ServiceError> {
-    timeout(SEND_WAIT_LIMIT, async {
+    let Some(end) = deadline
+        .checked_sub(SEND_TIME)
+        .filter(|end| tokio::time::Instant::now() < *end)
+    else {
+        return Err(ServiceError::Timeout);
+    };
+    timeout_at(end, async {
         let guard = lock.lock_owned().await;
         if without_state {
             connect_usable(connecting, early).await;
@@ -1550,6 +1558,28 @@ async fn wait_turn(
     })
     .await
     .map_err(|_| ServiceError::Timeout)
+}
+
+/// Answer with the result of `send`, or with a timeout at `deadline`. A send that is not done then
+/// is not stopped: it ends in the background, so that a telnet line is not cut. A lock that `send`
+/// holds stays held until the send ends, so the next commands still come after it. `finish` gets
+/// the output of the send, and `true` when the answer was a timeout.
+async fn answer_by<T>(
+    send: impl Future<Output = T> + 'static,
+    deadline: tokio::time::Instant,
+    finish: impl FnOnce(T, bool) -> Result<(), ServiceError> + 'static,
+) -> Result<(), ServiceError> {
+    let mut send = Box::pin(send);
+    tokio::select! {
+        biased;
+        result = &mut send => finish(result, false),
+        () = sleep_until(deadline) => {
+            actix::spawn(async move {
+                let _ = finish(send.await, true);
+            });
+            Err(ServiceError::Timeout)
+        }
+    }
 }
 
 /// Wait until a running connect has a receiver that takes commands, or has ended, at most
@@ -2081,19 +2111,14 @@ pub(super) async fn send_command(
     attempt: Option<watch::Receiver<u64>>,
     name: &str,
 ) -> Result<(), ServiceError> {
-    let send = commands::run(
-        avr,
-        heos,
-        cfg,
-        expected,
-        msg.kind,
-        &msg.cmd_id,
-        msg.params.as_ref(),
-    );
+    let send = commands::run(avr, heos, cfg, expected, msg);
     let started = Instant::now();
     let result = if let Some(mut attempt) = attempt {
         if attempt.has_changed().unwrap_or(true) {
-            info!("[{name}] {} not sent: standby or a new wake-up", msg.cmd_id);
+            info!(
+                "[{name}] {} not sent: standby or a new wake-up",
+                command_name(msg)
+            );
             return Ok(());
         }
         tokio::select! {
@@ -2102,7 +2127,7 @@ pub(super) async fn send_command(
             _ = attempt.changed() => {
                 info!(
                     "[{name}] {} stopped by standby or a new wake-up, it may have run",
-                    msg.cmd_id
+                    command_name(msg)
                 );
                 return Ok(());
             }
@@ -2115,6 +2140,45 @@ pub(super) async fn send_command(
         debug!("[{name}] {} done in {took} ms", command_name(msg));
     }
     result
+}
+
+/// The answer to a sent command, and its log. `late`: the command was answered with a timeout
+/// before the send ended.
+fn sent(
+    result: Result<(), ServiceError>,
+    name: &str,
+    cmd_name: &str,
+    late: bool,
+) -> Result<(), ServiceError> {
+    let after = if late { " after the answer" } else { "" };
+    match result {
+        // The state of the receiver does not allow it. The Remote shows an error banner for any
+        // other answer than OK that the user must close, and the Python integration did nothing
+        // here: the answer is OK, and the log says why nothing happened.
+        Err(ServiceError::Blocked(reason)) => {
+            info!("[{name}] {cmd_name} ignored{after}: {reason}");
+            Ok(())
+        }
+        Err(e) => {
+            warn!("[{name}] {cmd_name} failed{after}: {e}");
+            Err(e)
+        }
+        Ok(()) => {
+            if late {
+                info!("[{name}] {cmd_name} done after the answer");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Log a command that is not sent because its time is over.
+fn log_no_time(name: &str, msg: &Command, received: Instant) {
+    let waited = received.elapsed().as_millis();
+    info!(
+        "[{name}] {} not sent: no time left after {waited} ms",
+        command_name(msg)
+    );
 }
 
 /// Log how long a command waited before it goes to the receiver.
@@ -2131,10 +2195,8 @@ impl Handler<Command> for DenonActor {
     type Result = ResponseActFuture<Self, Result<(), ServiceError>>;
 
     fn handle(&mut self, msg: Command, ctx: &mut Self::Context) -> Self::Result {
-        // A stop needs no receiver: it only ends the running remote commands.
-        if msg.kind == EntityKind::Remote && remote::is_stop(&msg.cmd_id) {
-            self.run_stop.fetch_add(1, Ordering::Relaxed);
-            return Box::pin(fut::ready(Ok(())));
+        if let Some(answer) = self.answer_at_once(&msg) {
+            return Box::pin(fut::ready(answer));
         }
         // The core can send a command before `exit_standby`. While a retry after a failed connect
         // is pending, the receiver is not reachable: the command fails at once.
@@ -2177,8 +2239,9 @@ impl Handler<Command> for DenonActor {
                 .map(str::to_owned),
             _ => None,
         };
+        let deadline = msg.deadline;
         Box::pin(
-            async move { wait_turn(lock, connecting, early, without_state).await }
+            async move { wait_turn(lock, connecting, early, without_state, deadline).await }
                 .into_actor(self)
                 .then(move |guard, act, _| {
                     let early = act.avr.is_none() && without_state;
@@ -2194,36 +2257,41 @@ impl Handler<Command> for DenonActor {
                     // a new wake-up.
                     let attempt = early.then(|| act.attempt.subscribe());
                     async move {
-                        let _guard = guard?;
+                        let guard = match guard {
+                            Ok(guard) => guard,
+                            Err(ServiceError::Timeout) => {
+                                log_no_time(&name, &msg, received);
+                                return Err(ServiceError::Timeout);
+                            }
+                            Err(e) => return Err(e),
+                        };
                         let Some(avr) = avr else {
                             return Err(ServiceError::NotConnected);
                         };
-                        log_sending(&name, &msg, received, early);
-                        let result = send_command(
-                            &avr,
-                            heos.as_ref(),
-                            &cfg,
-                            &expected,
-                            &msg,
-                            attempt,
-                            &name,
-                        )
-                        .await;
-                        match result {
-                            // The state of the receiver does not allow it. The Remote shows an error
-                            // banner for any other answer than OK that the user must close, and the
-                            // Python integration did nothing here: the answer is OK, and the log says
-                            // why nothing happened.
-                            Err(ServiceError::Blocked(reason)) => {
-                                info!("[{name}] {} ignored: {reason}", msg.cmd_id);
-                                Ok(())
-                            }
-                            Err(e) => {
-                                warn!("[{name}] {} failed: {e}", msg.cmd_id);
-                                Err(e)
-                            }
-                            Ok(()) => Ok(()),
+                        // The wait can end late when the actor is busy.
+                        if tokio::time::Instant::now() >= deadline {
+                            log_no_time(&name, &msg, received);
+                            return Err(ServiceError::Timeout);
                         }
+                        log_sending(&name, &msg, received, early);
+                        let send = async move {
+                            let _guard = guard;
+                            let result = send_command(
+                                &avr,
+                                heos.as_ref(),
+                                &cfg,
+                                &expected,
+                                &msg,
+                                attempt,
+                                &name,
+                            )
+                            .await;
+                            (result, name, msg)
+                        };
+                        let finish = |(result, name, msg): (_, String, Command), late| {
+                            sent(result, &name, command_name(&msg), late)
+                        };
+                        answer_by(send, deadline, finish).await
                     }
                     .into_actor(act)
                 })
@@ -2258,6 +2326,108 @@ fn signal_every(cfg: &DeviceConfig, poll: Duration) -> Option<Duration> {
 mod tests {
     use super::*;
 
+    /// A deadline that leaves `wait` for the wait before the send.
+    fn deadline_after(wait: Duration) -> tokio::time::Instant {
+        tokio::time::Instant::now() + SEND_TIME + wait
+    }
+
+    fn no_receiver() -> watch::Receiver<Option<Arc<Avr>>> {
+        watch::channel(None).1
+    }
+
+    #[actix::test]
+    async fn the_wait_for_the_lock_ends_before_the_deadline() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let _held = lock.clone().lock_owned().await;
+        let start = Instant::now();
+        let deadline = deadline_after(Duration::from_millis(200));
+        let result = wait_turn(lock, None, no_receiver(), false, deadline).await;
+        assert!(matches!(result, Err(ServiceError::Timeout)));
+        let waited = start.elapsed();
+        assert!(waited >= Duration::from_millis(200), "{waited:?}");
+        assert!(waited < Duration::from_secs(1), "{waited:?}");
+    }
+
+    #[actix::test]
+    async fn the_wait_for_a_connect_ends_before_the_deadline() {
+        let (_status, connecting) = watch::channel(DeviceStatus::Connecting);
+        for without_state in [false, true] {
+            let start = Instant::now();
+            let deadline = deadline_after(Duration::from_millis(200));
+            let lock = Arc::default();
+            let connecting = Some(connecting.clone());
+            // The actor keeps the sender while it runs.
+            let (_early_tx, early) = watch::channel(None);
+            let result = wait_turn(lock, connecting, early, without_state, deadline).await;
+            assert!(matches!(result, Err(ServiceError::Timeout)));
+            // After the wait and before the end of `CONNECT_WAIT`.
+            let waited = start.elapsed();
+            assert!(waited >= Duration::from_millis(200), "{waited:?}");
+            assert!(waited < Duration::from_secs(1), "{waited:?}");
+        }
+    }
+
+    #[actix::test]
+    async fn a_command_without_time_left_for_the_send_does_not_wait() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let _held = lock.clone().lock_owned().await;
+        let start = Instant::now();
+        let deadline = tokio::time::Instant::now() + SEND_TIME / 2;
+        let result = wait_turn(lock, None, no_receiver(), false, deadline).await;
+        assert!(matches!(result, Err(ServiceError::Timeout)));
+        let waited = start.elapsed();
+        assert!(waited < SEND_TIME / 4, "{waited:?}");
+    }
+
+    #[actix::test]
+    async fn a_long_send_is_answered_at_the_deadline_and_ends_later() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = lock.clone().lock_owned().await;
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let send_done = done.clone();
+        let send = async move {
+            let _guard = guard;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            send_done.store(true, Ordering::SeqCst);
+            Ok(())
+        };
+        let start = Instant::now();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        let (late_tx, late_rx) = tokio::sync::oneshot::channel();
+        let finish = move |result, late| {
+            let _ = late_tx.send(late);
+            result
+        };
+        assert_eq!(
+            Err(ServiceError::Timeout),
+            answer_by(send, deadline, finish).await
+        );
+        let waited = start.elapsed();
+        assert!(waited >= Duration::from_millis(100), "{waited:?}");
+        assert!(waited < Duration::from_millis(400), "{waited:?}");
+        // The send goes on and keeps the lock: the next command waits for it.
+        assert!(lock.try_lock().is_err());
+        let _next = timeout(Duration::from_secs(2), lock.lock())
+            .await
+            .expect("the send ends");
+        assert!(done.load(Ordering::SeqCst));
+        assert_eq!(Ok(true), late_rx.await);
+    }
+
+    #[actix::test]
+    async fn a_send_before_the_deadline_gives_its_result() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let failed = async { Err(ServiceError::NotConnected) };
+        assert_eq!(
+            Err(ServiceError::NotConnected),
+            answer_by(failed, deadline, |result, late| {
+                assert!(!late);
+                result
+            })
+            .await
+        );
+    }
+
     #[test]
     fn the_signal_timer_is_a_multiple_of_the_http_poll() {
         let every = |use_telnet, secs| {
@@ -2285,10 +2455,12 @@ mod tests {
 
     #[test]
     fn the_log_names_the_remote_command_else_the_command_id() {
-        let cmd = |kind, cmd_id: &str, command: Option<&str>| Command {
-            kind,
-            cmd_id: cmd_id.to_owned(),
-            params: command.map(|c| Map::from_iter([("command".to_owned(), c.into())])),
+        let cmd = |kind, cmd_id: &str, command: Option<&str>| {
+            Command::new(
+                kind,
+                cmd_id.to_owned(),
+                command.map(|c| Map::from_iter([("command".to_owned(), c.into())])),
+            )
         };
         let remote = cmd(EntityKind::Remote, "send_cmd", Some("MUTE_TOGGLE"));
         assert_eq!("MUTE_TOGGLE", command_name(&remote));

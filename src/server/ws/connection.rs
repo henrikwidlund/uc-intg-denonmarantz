@@ -463,10 +463,7 @@ fn service_error_to_ws_message(id: &str, req_id: u32, error: ServiceError) -> Ws
         ServiceError::ServiceUnavailable(e) => {
             (503, WsResultMsgData::new("SERVICE_UNAVAILABLE", e))
         }
-        ServiceError::Timeout => (
-            408,
-            WsResultMsgData::new("TIMEOUT", "Receiver did not answer"),
-        ),
+        ServiceError::Timeout => (408, WsResultMsgData::new("TIMEOUT", "Command timed out")),
         ServiceError::NotFound(e) => (404, WsResultMsgData::new("NOT_FOUND", e)),
         ServiceError::NotSupported(e) => (501, WsResultMsgData::new("NOT_IMPLEMENTED", e)),
         ServiceError::Blocked(e) => (409, WsResultMsgData::new("CONFLICT", e)),

@@ -155,6 +155,8 @@ Commands with a number are sent as raw text with the remote entity:
   Commands keep their order: a command after one that waits also waits. A command whose connection cannot be
   opened is tried again for up to 3 seconds; a command sent before the start ends stops when the Remote goes to
   standby or wakes up again. If the receiver is not connected and no connect runs, a command fails at once.
+- A command is answered at most 9 seconds after it came (the Remote waits 10 seconds). If it cannot be sent before
+  then, the answer is a timeout and nothing is sent. A send that still runs then gets a timeout answer and ends later.
 
 ## Requirements
 

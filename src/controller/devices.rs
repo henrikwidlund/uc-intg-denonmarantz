@@ -405,11 +405,8 @@ impl Controller {
                 command.entity_id
             )));
         }
-        let request = addr.send(Command {
-            kind,
-            cmd_id: command.cmd_id,
-            params: command.params,
-        });
+        // The deadline starts here. The actor answers by then, so this wait needs no timeout.
+        let request = addr.send(Command::new(kind, command.cmd_id, command.params));
         Box::pin(async move {
             request
                 .await

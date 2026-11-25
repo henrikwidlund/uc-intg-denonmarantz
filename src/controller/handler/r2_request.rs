@@ -6,7 +6,7 @@
 
 use crate::controller::devices::ConnectTrigger;
 use crate::controller::handler::setup::{SetDriverUserDataMsg, SetupDriverMsg};
-use crate::controller::{Controller, R2RequestMsg, SendWsMessage, operation_mode};
+use crate::controller::{Controller, R2RequestMsg, SendWsMessage};
 use crate::errors::ServiceError;
 use crate::util::{DeserializeMsgData, return_fut_err, return_fut_ok};
 use crate::{APP_VERSION, built_info};
@@ -99,7 +99,7 @@ impl Handler<R2RequestMsg> for Controller {
             )));
         };
 
-        // Requests that are allowed in setup flow and running mode.
+        // Requests that do not need the receivers.
         match msg.request {
             R2Request::GetDriverVersion => {
                 return_fut_ok!(Some(WsMessage::response(
@@ -144,16 +144,8 @@ impl Handler<R2RequestMsg> for Controller {
             _ => {}
         }
 
-        // The other requests need a configuration: the running mode or a setup flow.
-        if self
-            .sm_consume(&msg.ws_id, &operation_mode::Input::R2Request, ctx)
-            .is_err()
-        {
-            return_fut_err!(ServiceError::ServiceUnavailable(
-                "Request cannot be handled: setup required".into()
-            ));
-        }
-
+        // Without a configuration, the other requests see no receivers: empty lists and states, and
+        // "not found" for a command.
         match msg.request {
             R2Request::GetAvailableEntities => {
                 let filter = match msg.msg_data {

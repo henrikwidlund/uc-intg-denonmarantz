@@ -10,6 +10,7 @@ use crate::controller::test_util::{
 use crate::controller::{Controller, R2EventMsg, R2RequestMsg, R2SessionDisconnect};
 use crate::device::{DenonActor, DeviceEvent, DeviceStatus, Wants};
 use crate::entities::EntityKind;
+use crate::errors::ServiceError;
 use actix::Addr;
 use serde_json::{Map, json};
 use std::sync::Arc;
@@ -394,5 +395,38 @@ async fn subscribe_and_unsubscribe_without_msg_data_mean_all_entities() {
             .await
             .expect("send")
             .want
+    );
+}
+
+#[actix::test]
+async fn requests_without_a_configuration_get_normal_answers() {
+    use_closed_port();
+    let controller = controller("no-config", None);
+    let remote = connect(&controller, "a").await;
+    let available = request(&controller, "a", R2Request::GetAvailableEntities, None)
+        .await
+        .expect("available entities")
+        .expect("answer");
+    let data = serde_json::to_value(available).expect("json");
+    assert_eq!(json!([]), data["msg_data"]["available_entities"]);
+    assert_eq!(
+        Vec::<String>::new(),
+        entity_states(&controller, &remote).await
+    );
+    request(&controller, "a", R2Request::SubscribeEvents, None)
+        .await
+        .expect("subscribe");
+    request(&controller, "a", R2Request::UnsubscribeEvents, None)
+        .await
+        .expect("unsubscribe");
+    let command = json!({
+        "entity_type": "media_player",
+        "entity_id": format!("media_player.{LOOPBACK_KEY}"),
+        "cmd_id": "on",
+    });
+    let answer = request(&controller, "a", R2Request::EntityCommand, Some(command)).await;
+    assert!(
+        matches!(answer, Err(ServiceError::NotFound(_))),
+        "{answer:?}"
     );
 }

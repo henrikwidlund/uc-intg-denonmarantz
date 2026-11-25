@@ -261,6 +261,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_command_after_its_deadline_is_not_sent() {
+        use crate::device::commands::heos_run;
+        use crate::entities::media_player::Action;
+        let fake = FakeHeos::start("127.0.0.1", HeosItem::song()).await;
+        let (_heos, link) = link(&fake).await;
+        let repeat = Action::Repeat(RepeatMode::OnAll);
+        let deadline = Some(tokio::time::Instant::now());
+        let result = heos_run(&link, &repeat, deadline).await;
+        assert!(matches!(result, Err(ServiceError::Timeout)), "{result:?}");
+        // Shuffle sends the repeat mode that HEOS has: still off.
+        heos_run(&link, &Action::Shuffle(true), None)
+            .await
+            .expect("shuffle");
+        let modes: Vec<String> = fake
+            .received()
+            .into_iter()
+            .filter(|l| l.starts_with("player/set_play_mode"))
+            .collect();
+        assert_eq!(
+            vec!["player/set_play_mode?pid=7&repeat=off&shuffle=on"],
+            modes
+        );
+    }
+
+    #[tokio::test]
     async fn play_pause_pauses_a_song_that_plays() {
         let fake = FakeHeos::start("127.0.0.1", HeosItem::song()).await;
         let (_heos, link) = link(&fake).await;

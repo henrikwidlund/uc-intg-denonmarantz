@@ -22,6 +22,12 @@ use crate::errors::ServiceError;
 use actix::Message;
 use serde_json::{Map, Value};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::Instant;
+
+/// An entity command is answered at most this long after it came. The core waits 10 s for the
+/// answer.
+pub const COMMAND_LIMIT: Duration = Duration::from_secs(9);
 
 /// Connection status of a receiver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,4 +89,18 @@ pub struct Command {
     pub kind: EntityKind,
     pub cmd_id: String,
     pub params: Option<Map<String, Value>>,
+    /// The answer comes at the latest at this time.
+    pub deadline: Instant,
+}
+
+impl Command {
+    /// A command that came now: the deadline is [`COMMAND_LIMIT`] from now.
+    pub fn new(kind: EntityKind, cmd_id: String, params: Option<Map<String, Value>>) -> Self {
+        Self {
+            kind,
+            cmd_id,
+            params,
+            deadline: Instant::now() + COMMAND_LIMIT,
+        }
+    }
 }
