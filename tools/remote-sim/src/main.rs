@@ -16,9 +16,72 @@ mod ws;
 
 use driver::Driver;
 use std::fmt::{self, Display};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use ws::Client;
+
+/// All steps in the order of [`run`].
+const STEPS: [&str; 29] = [
+    "metadata",
+    "setup",
+    "entities",
+    "states",
+    "values",
+    "heos",
+    "remote_ui",
+    "standby",
+    "remote_wake",
+    "unused_receiver",
+    "selects",
+    "remote_commands",
+    "mute",
+    "source",
+    "sound_mode",
+    "volume",
+    "power",
+    "http_mode",
+    "backup_restore",
+    "unreachable",
+    "config_file",
+    "python_config",
+    "broken_config",
+    "select_sweep",
+    "extra_entities",
+    "settings_restore",
+    "simple_commands",
+    "restore_power",
+    "log",
+];
+/// Steps that set up the driver and connect it. The other checks need them.
+const BASE_STEPS: [&str; 3] = ["setup", "entities", "states"];
+/// Steps at the end that switch the receiver back off and check the driver log. They always run.
+const END_STEPS: [&str; 2] = ["restore_power", "log"];
+/// Steps that run only if `--only` names them.
+const OPT_IN_STEPS: [&str; 0] = [];
+
+/// A step in [`END_STEPS`] always runs. Else `--skip` wins. Without `--only`, all steps except
+/// [`OPT_IN_STEPS`] run. With `--only`, the named steps and [`BASE_STEPS`] run.
+fn selected(only: &[String], skip: &[String], name: &str) -> bool {
+    if END_STEPS.contains(&name) {
+        return true;
+    }
+    if skip.iter().any(|n| n == name) {
+        return false;
+    }
+    if only.is_empty() {
+        !OPT_IN_STEPS.contains(&name)
+    } else {
+        BASE_STEPS.contains(&name) || only.iter().any(|n| n == name)
+    }
+}
+
+/// The repository folder. Results and the restore file go there, whatever the current folder is.
+pub fn repo_root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("tools/remote-sim is in the repository")
+}
 
 /// A failed or skipped check.
 pub struct Fail {
@@ -133,8 +196,7 @@ impl Ctx {
             .await?;
         let ids: Vec<&str> = data["available_entities"]
             .as_array()
-            .map(|a| a.iter().filter_map(|e| e["entity_id"].as_str()).collect())
-            .unwrap_or_default();
+            .map_or_default(|a| a.iter().filter_map(|e| e["entity_id"].as_str()).collect());
         self.client
             .request_ok("subscribe_events", serde_json::json!({ "entity_ids": ids }))
             .await?;
@@ -142,8 +204,7 @@ impl Ctx {
     }
 
     fn selected(&self, name: &str) -> bool {
-        (self.opt.only.is_empty() || self.opt.only.iter().any(|n| n == name))
-            && !self.opt.skip.iter().any(|n| n == name)
+        selected(&self.opt.only, &self.opt.skip, name)
     }
 
     /// Run a check and print the result. Returns false for a failure.
@@ -177,34 +238,43 @@ impl Ctx {
 }
 
 fn parse() -> Result<Options, String> {
-    let mut args = std::env::args().skip(1);
+    parse_from(std::env::args().skip(1))
+}
+
+/// Parse the arguments without the program name.
+fn parse_from(mut args: impl Iterator<Item = String>) -> Result<Options, String> {
     let mut opt = Options {
         address: String::new(),
-        bin: PathBuf::from("target/release/uc-intg-denonmarantz"),
+        bin: repo_root().join("target/release/uc-intg-denonmarantz"),
         only: Vec::new(),
         skip: Vec::new(),
         no_power: false,
         no_oracle: false,
         port: 19090,
-        commands: PathBuf::from("resources/commands.tsv"),
+        commands: repo_root().join("resources/commands.tsv"),
         kinds: Vec::new(),
         avoid_sources: Vec::new(),
-    };
-    let list = |v: Option<String>| -> Vec<String> {
-        v.unwrap_or_default()
-            .split(',')
-            .filter(|item| !item.is_empty())
-            .map(str::to_owned)
-            .collect()
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--driver" => opt.bin = args.next().ok_or("--driver needs a path")?.into(),
-            "--only" => opt.only = list(args.next()),
-            "--skip" => opt.skip = list(args.next()),
+            "--only" => opt.only.extend(step_list("--only", args.next())?),
+            "--skip" => {
+                let list = step_list("--skip", args.next())?;
+                if let Some(base) = list.iter().find(|n| BASE_STEPS.contains(&n.as_str())) {
+                    return Err(format!(
+                        "--skip: {base} cannot be skipped, the other checks need it. Steps that cannot be skipped: {}",
+                        BASE_STEPS.join(", ")
+                    ));
+                }
+                opt.skip.extend(list);
+            }
             "--commands" => opt.commands = args.next().ok_or("--commands needs a path")?.into(),
-            "--kinds" => opt.kinds = list(args.next()),
-            "--avoid-sources" => opt.avoid_sources = list(args.next()),
+            "--kinds" => opt.kinds.extend(name_list("--kinds", args.next())?),
+            "--avoid-sources" => {
+                opt.avoid_sources
+                    .extend(name_list("--avoid-sources", args.next())?);
+            }
             "--no-oracle" => opt.no_oracle = true,
             "--no-power" => opt.no_power = true,
             "--port" => {
@@ -214,6 +284,12 @@ fn parse() -> Result<Options, String> {
                     .ok_or("--port needs a number")?;
             }
             other if other.starts_with('-') => return Err(format!("unknown option {other}")),
+            other if !opt.address.is_empty() => {
+                return Err(format!(
+                    "more than one receiver address: {} and {other}",
+                    opt.address
+                ));
+            }
             other => opt.address = other.to_owned(),
         }
     }
@@ -221,6 +297,52 @@ fn parse() -> Result<Options, String> {
         return Err("the receiver address is missing".into());
     }
     Ok(opt)
+}
+
+/// A note if `--skip` names an end step: end steps are not skipped.
+fn skip_note(skip: &[String]) -> Option<String> {
+    skip.iter()
+        .any(|n| END_STEPS.contains(&n.as_str()))
+        .then(|| format!("{} always run", END_STEPS.join(" and ")))
+}
+
+/// Names of `--kinds` or `--avoid-sources`, separated by commas. Spaces around a name are removed
+/// and empty names are left out. Refuses a missing value, a value that starts with `-` and a value
+/// without names.
+fn name_list(flag: &str, value: Option<String>) -> Result<Vec<String>, String> {
+    let value = value.ok_or_else(|| format!("{flag} needs names"))?;
+    if value.starts_with('-') {
+        return Err(format!("{flag} needs names, not the option {value}"));
+    }
+    let names: Vec<String> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if names.is_empty() {
+        return Err(format!("{flag}: no names in {value:?}"));
+    }
+    Ok(names)
+}
+
+/// Step names of `--only` or `--skip`, separated by commas. Refuses a missing value and unknown
+/// or empty names.
+fn step_list(flag: &str, value: Option<String>) -> Result<Vec<String>, String> {
+    let value = value.ok_or_else(|| format!("{flag} needs step names"))?;
+    value
+        .split(',')
+        .map(|name| {
+            if STEPS.contains(&name) {
+                Ok(name.to_owned())
+            } else {
+                Err(format!(
+                    "{flag}: unknown step {name:?}. Steps: {}",
+                    STEPS.join(", ")
+                ))
+            }
+        })
+        .collect()
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -234,6 +356,9 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    if let Some(note) = skip_note(&opt.skip) {
+        println!("{note}");
+    }
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -279,25 +404,34 @@ async fn main() {
     println!("\n{summary}");
     ctx.report.push(String::new());
     ctx.report.push(summary);
-    let file = format!("remote-sim-results-{stamp}.md");
-    if tokio::fs::write(&file, ctx.report.join("\n") + "\n")
-        .await
-        .is_ok()
-    {
-        println!("Results: {file}");
+    let dir = repo_root().join("test-results");
+    let file = dir.join(format!("remote-sim-results-{stamp}.md"));
+    let written = async {
+        tokio::fs::create_dir_all(&dir).await?;
+        tokio::fs::write(&file, ctx.report.join("\n") + "\n").await
+    };
+    match written.await {
+        Ok(()) => println!("Results: {}", file.display()),
+        Err(e) => eprintln!("cannot write {}: {e}", file.display()),
     }
     std::process::exit(i32::from(ctx.failed > 0));
 }
 
 async fn run(ctx: &mut Ctx) {
-    // A failed setup or connect makes all other checks fail, so the run ends there.
-    if !ctx.step("metadata", checks::metadata).await
-        || !ctx.step("setup", checks::setup_first).await
-        || !ctx.step("entities", checks::entities).await
-        || !ctx.step("states", checks::states).await
+    // A failed setup or connect makes the other checks fail, so only the end steps run then.
+    if ctx.step("metadata", checks::metadata).await
+        && ctx.step("setup", checks::setup_first).await
+        && ctx.step("entities", checks::entities).await
+        && ctx.step("states", checks::states).await
     {
-        return;
+        middle_steps(ctx).await;
     }
+    ctx.step("restore_power", checks::restore_power).await;
+    ctx.step("log", checks::log).await;
+}
+
+/// The checks between the base steps and the end steps.
+async fn middle_steps(ctx: &mut Ctx) {
     ctx.step("values", checks::values).await;
     ctx.step("heos", checks::heos).await;
     ctx.step("remote_ui", checks::remote_ui).await;
@@ -321,8 +455,6 @@ async fn run(ctx: &mut Ctx) {
     ctx.step("extra_entities", checks::extra_entities).await;
     ctx.step("settings_restore", checks::settings_restore).await;
     ctx.step("simple_commands", checks::simple_commands).await;
-    ctx.step("restore_power", checks::restore_power).await;
-    ctx.step("log", checks::log).await;
 }
 
 #[cfg(test)]
@@ -342,6 +474,216 @@ mod tests {
             kinds: Vec::new(),
             avoid_sources: avoid.iter().map(|a| (*a).to_owned()).collect(),
         }
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|&n| n.to_owned()).collect()
+    }
+
+    #[test]
+    fn step_selection() {
+        for name in STEPS {
+            assert!(selected(&[], &[], name), "no --only runs {name}");
+        }
+        let only = names(&["volume"]);
+        for name in [
+            "volume",
+            "setup",
+            "entities",
+            "states",
+            "restore_power",
+            "log",
+        ] {
+            assert!(selected(&only, &[], name), "{name}");
+        }
+        assert!(!selected(&only, &[], "metadata"));
+        assert!(!selected(&only, &[], "mute"));
+        assert!(!selected(&only, &only, "volume"), "--skip wins");
+        assert!(!selected(&[], &names(&["mute"]), "mute"));
+        let end = names(&["restore_power", "log"]);
+        for name in END_STEPS {
+            assert!(selected(&[], &end, name), "--skip keeps {name}");
+            assert!(
+                selected(&names(&["mute"]), &end, name),
+                "--only keeps {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn step_lists_are_parts_of_steps() {
+        for name in BASE_STEPS.iter().chain(&END_STEPS).chain(&OPT_IN_STEPS) {
+            assert!(STEPS.contains(name), "{name}");
+        }
+        for name in OPT_IN_STEPS {
+            assert!(
+                !BASE_STEPS.contains(&name) && !END_STEPS.contains(&name),
+                "{name}"
+            );
+            assert!(!selected(&[], &[], name), "{name} runs without --only");
+        }
+    }
+
+    /// Body of the fn that starts with `head`.
+    fn body<'a>(src: &'a str, head: &str) -> &'a str {
+        let start = src.find(head).unwrap_or_else(|| panic!("{head}"));
+        let len = src[start..].find("\n}\n").expect("end of fn");
+        &src[start..start + len]
+    }
+
+    /// `STEPS` has the steps of `run` and `middle_steps` in the order they run.
+    #[test]
+    fn steps_match_run() {
+        let src = include_str!("main.rs");
+        let middle = body(src, "async fn middle_steps(");
+        let raw_run = body(src, "async fn run(");
+        // The end steps also run when a base step fails, so they come after the `if`.
+        let call_at = raw_run
+            .find("middle_steps(ctx).await;\n    }\n")
+            .expect("end of if");
+        for name in END_STEPS {
+            let call = format!("ctx.step(\"{name}\"");
+            assert!(!middle.contains(&call), "{name} in middle_steps");
+            assert!(
+                raw_run.find(&call).expect(name) > call_at,
+                "{name} not after the if"
+            );
+        }
+        let run = raw_run.replace("middle_steps(ctx).await", middle);
+        let mut last = 0;
+        for name in STEPS {
+            let at = run
+                .find(&format!("ctx.step(\"{name}\""))
+                .unwrap_or_else(|| panic!("{name} not in run"));
+            assert!(at > last, "{name} out of order");
+            last = at;
+        }
+        assert_eq!(
+            STEPS.len(),
+            run.matches("ctx.step(\"").count(),
+            "a step of run is not in STEPS"
+        );
+        // The base steps run before the middle steps; the end steps run last.
+        let middle_at = run.find("async fn middle_steps(").expect("middle_steps");
+        for name in BASE_STEPS {
+            let at = run.find(&format!("ctx.step(\"{name}\"")).expect(name);
+            assert!(at < middle_at, "{name} is not a base step");
+        }
+        assert!(STEPS.ends_with(&END_STEPS), "end steps are not last");
+    }
+
+    fn parse(args: &[&str]) -> Result<Options, String> {
+        parse_from(args.iter().map(|&a| a.to_owned()))
+    }
+
+    #[test]
+    fn step_names() {
+        let only = |v: &str| step_list("--only", Some(v.to_owned()));
+        assert_eq!(Ok(names(&["volume", "log"])), only("volume,log"));
+        assert!(step_list("--only", None).is_err(), "missing value");
+        for bad in ["", "volum", "volume,", "a,,b", ",volume"] {
+            let e = only(bad).expect_err(bad);
+            assert!(e.contains("Steps: metadata, setup"), "{e}");
+        }
+    }
+
+    #[test]
+    fn only_and_skip_can_repeat() {
+        let opt = parse(&[
+            "192.0.2.1",
+            "--only",
+            "mute",
+            "--only",
+            "volume,power",
+            "--skip",
+            "heos",
+            "--skip",
+            "log",
+        ])
+        .expect("valid");
+        assert_eq!("192.0.2.1", opt.address);
+        assert_eq!(names(&["mute", "volume", "power"]), opt.only);
+        assert_eq!(names(&["heos", "log"]), opt.skip);
+        assert!(parse(&["192.0.2.1", "--only", "mutee"]).is_err());
+        assert!(parse(&["192.0.2.1", "--skip", ""]).is_err());
+        assert!(parse(&["192.0.2.1", "--skip"]).is_err());
+        let opt = parse(&[
+            "192.0.2.1",
+            "--avoid-sources",
+            "oppo",
+            "--avoid-sources",
+            "bluray",
+        ])
+        .expect("valid");
+        assert_eq!(names(&["oppo", "bluray"]), opt.avoid_sources);
+        let opt = parse(&["192.0.2.1", "--kinds", "dimmer", "--kinds", "eco"]).expect("valid");
+        assert_eq!(names(&["dimmer", "eco"]), opt.kinds);
+    }
+
+    #[test]
+    fn list_names_are_trimmed_and_one_address_is_allowed() {
+        let opt = parse(&["192.0.2.1", "--avoid-sources", "bluray, oppo"]).expect("valid");
+        assert_eq!(names(&["bluray", "oppo"]), opt.avoid_sources);
+        assert!(!opt.may_select("OPPO"));
+        let Err(e) = parse(&["192.0.2.1", "--avoid-sources", "bluray,", "oppo"]) else {
+            panic!("two addresses accepted");
+        };
+        assert!(e.contains("more than one receiver address"), "{e}");
+    }
+
+    #[test]
+    fn list_options_refuse_bad_values() {
+        for flag in ["--kinds", "--avoid-sources"] {
+            let e = parse(&["192.0.2.1", flag]).err();
+            assert!(
+                e.is_some_and(|e| e.contains("needs names")),
+                "{flag} missing"
+            );
+            let e = parse(&["192.0.2.1", flag, "--no-power"]).err();
+            assert!(
+                e.is_some_and(|e| e.contains("not the option")),
+                "{flag} option"
+            );
+            for empty in ["", ",", " ", " , "] {
+                let e = parse(&["192.0.2.1", flag, empty]).err();
+                assert!(
+                    e.is_some_and(|e| e.contains("no names")),
+                    "{flag} {empty:?}"
+                );
+            }
+            assert_eq!(
+                Ok(names(&["a", "b"])),
+                name_list(flag, Some("a,,b,".to_owned()))
+            );
+        }
+    }
+
+    #[test]
+    fn base_steps_cannot_be_skipped() {
+        for name in BASE_STEPS {
+            let e = parse(&["192.0.2.1", "--skip", &format!("mute,{name}")]).err();
+            let e = e.unwrap_or_else(|| panic!("{name} was skipped"));
+            assert!(e.contains("cannot be skipped"), "{e}");
+        }
+        assert!(parse(&["192.0.2.1", "--skip", "metadata"]).is_ok());
+    }
+
+    #[test]
+    fn skipped_end_steps_give_a_note() {
+        assert_eq!(None, skip_note(&names(&["mute"])));
+        assert_eq!(
+            Some("restore_power and log always run".to_owned()),
+            skip_note(&names(&["mute", "log"]))
+        );
+    }
+
+    #[test]
+    fn default_paths_are_in_the_repository() {
+        let opt = parse(&["192.0.2.1"]).expect("valid");
+        assert!(opt.bin.ends_with("target/release/uc-intg-denonmarantz"));
+        assert!(opt.bin.starts_with(repo_root()));
+        assert!(opt.commands.starts_with(repo_root()));
+        assert!(repo_root().join("resources/commands.tsv").is_file());
     }
 
     #[test]

@@ -1,13 +1,12 @@
 /target
 /test-config
-/manual-test-results-*.md
+/test-results/
 /.manual-test-setup
 /.config-backup-*/
 /config.json.before-link-test
 /config.json
 /cache_*.json
 /driver.log
-remote-sim-results-*.md
 /tools/remote-sim/target
 /settings.json
 remote-sim-restore.txt

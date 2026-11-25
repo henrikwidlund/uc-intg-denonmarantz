@@ -8,12 +8,15 @@
 use crate::Fail;
 use crate::oracle::Oracle;
 use denon_marantz::{Ask, Avr, Command, Zone};
-use std::path::Path;
+use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
 
-/// The file with the saved settings. It exists only while settings are changed.
-pub const FILE: &str = "remote-sim-restore.txt";
+/// The file with the saved settings, in the repository folder. It exists only while settings are
+/// changed.
+pub static FILE: LazyLock<PathBuf> =
+    LazyLock::new(|| crate::repo_root().join("remote-sim-restore.txt"));
 
 /// Queries of the settings, in the order in which they are set back. The sound mode goes first: it
 /// can change the sound settings. The speaker preset goes before the Dirac filter: each preset has
@@ -290,17 +293,18 @@ const TONE_ON: &str = "PSTONE CTRL ON";
 
 /// Write the saved lines to [`FILE`].
 pub async fn save(lines: &[String]) -> Result<(), Fail> {
-    tokio::fs::write(FILE, lines.join("\n") + "\n")
+    tokio::fs::write(&*FILE, lines.join("\n") + "\n")
         .await
-        .map_err(|e| Fail::new(format!("{FILE}: {e}")))
+        .map_err(|e| Fail::new(format!("{}: {e}", FILE.display())))
 }
 
 /// Skip a check that saves the settings while [`FILE`] still holds the settings of an earlier run:
 /// the check would replace them.
 pub fn ensure_nothing_left() -> Result<(), Fail> {
-    if Path::new(FILE).exists() {
+    if FILE.exists() {
         return Err(Fail::skip(format!(
-            "settings of the last run are not set back. They are in {FILE}"
+            "settings of the last run are not set back. They are in {}",
+            FILE.display()
         )));
     }
     Ok(())
@@ -308,13 +312,13 @@ pub fn ensure_nothing_left() -> Result<(), Fail> {
 
 /// Remove [`FILE`] after all settings are set back.
 pub async fn forget() {
-    let _ = tokio::fs::remove_file(FILE).await;
+    let _ = tokio::fs::remove_file(&*FILE).await;
 }
 
 /// Set back the settings of a run that stopped early. Returns what was done, or `None` if there is
 /// nothing to set back.
 pub async fn after_early_stop(host: &str) -> Option<String> {
-    let text = tokio::fs::read_to_string(FILE).await.ok()?;
+    let text = tokio::fs::read_to_string(&*FILE).await.ok()?;
     let lines: Vec<String> = text.lines().map(str::to_owned).collect();
     let result = async {
         let oracle = Oracle::connect(host).await?;
@@ -331,12 +335,12 @@ pub async fn after_early_stop(host: &str) -> Option<String> {
         // The file stays: the next run tries again.
         Ok(missed) => format!(
             "settings of the last run set back, not taken: {missed:?}. They stay in {}",
-            Path::new(FILE).display()
+            FILE.display()
         ),
         Err(e) => format!(
             "settings of the last run not set back: {}. They are in {}",
             e.msg,
-            Path::new(FILE).display()
+            FILE.display()
         ),
     })
 }

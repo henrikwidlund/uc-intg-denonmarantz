@@ -262,7 +262,7 @@ cargo deny check
 
 `tools/manual_test.sh` runs the tests that need a real Remote or a person, one step at a time: the setup pages,
 the entity lists, the buttons, the sleep of the Remote and a real signal. It saves the results to
-`manual-test-results-<time>.md`. Run `tools/remote-sim` (below) for everything else.
+`test-results/manual-test-results-<time>.md`. Run `tools/remote-sim` (below) for everything else.
 
 `tools/remote-sim` is a program that acts as the Remote and runs most of these tests by itself with a real
 receiver. It opens a second connection to the receiver and checks that every select and sensor shows what the
@@ -270,10 +270,10 @@ receiver has, after each change. It also sends the simple commands of the remote
 the remote lock and the LFE level of the 7.1 input. It starts the driver without mDNS, so it needs no root
 rights. The checks switch the receiver on and off and change source, sound mode and some settings, and restore
 them. While the simple commands are sent, the sound can stop for some seconds, for example when HDMI audio
-goes to the TV. The settings that they change are saved in `remote-sim-restore.txt` first. If a run stops
-before they are set back, the next run sets them back at its start. While the file is still there, the checks
-that change these settings are skipped. A source change stops HEOS and AirPlay, and they do not start again.
-The volume never goes above -40 dB. The `heos` check compares
+goes to the TV. The settings that they change are saved in `remote-sim-restore.txt` in the repository folder
+first. If a run stops before they are set back, the next run sets them back at its start. While the file is
+still there, the checks that change these settings are skipped. A source change stops HEOS and AirPlay, and
+they do not start again. The volume never goes above -40 dB. The `heos` check compares
 the media player with a second HEOS connection, pauses and plays once. Start HEOS Music on the main zone
 before the run, else the check is skipped.
 
@@ -284,26 +284,36 @@ cargo run --release --manifest-path tools/remote-sim/Cargo.toml -- <receiver add
 
 Options:
 
-- `--only a,b` and `--skip a,b` select checks by name. `--only` must also name the first checks
-  `metadata,setup,entities,states`: the other checks need them.
+- `--only a,b` and `--skip a,b` select checks by name. Both can be given more than once. Unknown step names
+  are refused. `--only` also runs `setup`, `entities` and `states`, because the other checks need them, and
+  `--skip` refuses them. `restore_power` and `log` always run at the end, also with `--only` and `--skip`.
+  If `metadata`, `setup`, `entities` or `states` fails, only `restore_power` and `log` run after it.
 - `--kinds a,b` limits the select sweep to these selects, for example `dirac_filter`.
 - `--avoid-sources a,b`: the checks never select a source whose name contains one of these, without case.
   Without this option the checks select no source: the `source` check is skipped and `http_mode` does not
   change the source. The simple command check never sends source commands.
+- `--kinds` and `--avoid-sources` can be given more than once; the lists are joined. A missing value, a value
+  without names and a value that starts with `-` are refused. Spaces around names are removed.
+- Only one receiver address is allowed.
 - `--no-power` skips the power check. The other checks still switch the receiver on if it is off.
 - `--no-oracle` does not open the second connection. The values are then not compared with the receiver.
 - `--driver <path>`, `--port <port>` and `--commands <path>` change the driver binary, the port and the
-  command table.
-- `RUST_LOG` is passed to the driver, for example `info,denon_marantz=trace,denon_marantz_heos=trace`.
+  command table. The default driver binary is `target/release/uc-intg-denonmarantz` and the default command
+  table is `resources/commands.tsv`, both in the repository folder, so the tool works from any folder.
+- `RUST_LOG` is added after the default driver log filter. A level in it replaces the default level for the
+  same name, for example
+  `denon_marantz=trace,denon_marantz_heos=trace`. The checks read debug lines of the driver, so do not set
+  `uc_intg_denonmarantz` or `denon_marantz` below `debug`.
   The trace shows the full telnet and HEOS lines only if the driver is built with
   `cargo build --release --features sensitive-logs`. These lines can hold titles and account names: do not
   share such a log.
 
-The results go to `remote-sim-results-<time>.md`. To check only the selects and the switches:
+The results go to `test-results/remote-sim-results-<time>.md` in the repository folder. To check only the
+selects and the switches:
 
 ```shell
 cargo run --release --manifest-path tools/remote-sim/Cargo.toml -- <receiver address> \
-  --only metadata,setup,entities,states,selects,select_sweep,extra_entities --no-power
+  --only selects,select_sweep,extra_entities --no-power
 ```
 
 ## License

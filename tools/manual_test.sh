@@ -32,7 +32,8 @@ set -u
 
 cd "$(dirname "$0")/.." || exit 1
 
-RESULTS="$PWD/manual-test-results-$(date +%Y%m%d-%H%M%S).md"
+mkdir -p test-results || exit 1
+RESULTS="$PWD/test-results/manual-test-results-$(date +%Y%m%d-%H%M%S).md"
 BIN="$PWD/target/release/uc-intg-denonmarantz"
 DRIVER_PID=""
 SELECTION="$*"
@@ -327,8 +328,9 @@ the volume buttons still work while it runs." \
 
 step "Configure, remove and options" \
 "At least one receiver is configured." \
-"Setup > Configure the receiver: change the volume step, 'Show all sources' and the debug log option.
-Then add and remove a receiver if you have a second one." \
+"Setup > Configure selected device: change the volume step and 'Show all sources'. Setup > Configuration
+mode: change the debug log option and choose 'Save settings'. Then add and remove a receiver if you have a
+second one." \
 "The changes work without a restart. A new volume step is used at once. With 'Show all sources' the
 input source select has more sources. The debug log option writes more lines and stays on after a restart." \
 "$LOG_PROBLEMS"

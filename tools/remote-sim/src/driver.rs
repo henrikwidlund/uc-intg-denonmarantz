@@ -45,12 +45,9 @@ impl Driver {
             .env("UC_INTEGRATION_INTERFACE", "127.0.0.1")
             .env("UC_INTEGRATION_HTTP_PORT", self.port.to_string())
             .env("UC_DISABLE_MDNS_PUBLISH", "true")
-            // `RUST_LOG` of the caller, if set, for example to trace the telnet lines.
             .env(
                 "RUST_LOG",
-                std::env::var("RUST_LOG").unwrap_or_else(|_| {
-                    "info,uc_intg_denonmarantz=debug,denon_marantz=debug".to_owned()
-                }),
+                log_filter(std::env::var("RUST_LOG").ok().as_deref()),
             )
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
@@ -96,5 +93,32 @@ impl Driver {
         tokio::fs::read_to_string(&self.log)
             .await
             .unwrap_or_default()
+    }
+}
+
+/// Log filter of the driver. Checks read its info and debug lines. A `RUST_LOG` of the caller is
+/// added after the default, for example to trace the telnet lines. A level in it for the same
+/// target, or a global level, replaces the one in the default.
+fn log_filter(caller: Option<&str>) -> String {
+    const DEFAULT: &str = "info,uc_intg_denonmarantz=debug,denon_marantz=debug";
+    match caller {
+        Some(caller) if !caller.is_empty() => format!("{DEFAULT},{caller}"),
+        _ => DEFAULT.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn caller_filter_is_added_after_the_default() {
+        let default = "info,uc_intg_denonmarantz=debug,denon_marantz=debug";
+        assert_eq!(default, log_filter(None));
+        assert_eq!(default, log_filter(Some("")));
+        assert_eq!(
+            format!("{default},denon_marantz=trace"),
+            log_filter(Some("denon_marantz=trace"))
+        );
     }
 }

@@ -1754,7 +1754,12 @@ pub async fn broken_config(ctx: &mut Ctx) -> Check {
 
 // ---------------------------------------------------------------- end
 
+/// Switch the receiver off if it was off at the start. Does nothing without a device key (set by
+/// `entities`).
 pub async fn restore_power(ctx: &mut Ctx) -> Check {
+    if ctx.key.is_empty() {
+        return Ok("no device key, nothing to do".into());
+    }
     if ctx.was_on {
         return Ok(String::new());
     }
@@ -2190,13 +2195,13 @@ pub async fn settings_restore(ctx: &mut Ctx) -> Check {
     ensure!(
         missed.is_empty(),
         "not set back: {missed:?}. They stay in {}",
-        restore::FILE
+        restore::FILE.display()
     );
     restore::forget().await;
     ensure!(
-        !std::path::Path::new(restore::FILE).exists(),
+        !restore::FILE.exists(),
         "{} was not removed",
-        restore::FILE
+        restore::FILE.display()
     );
     Ok(format!(
         "{} settings read, {sleep} -> {other} -> {sleep}, all set back",
@@ -2516,8 +2521,7 @@ pub async fn heos(ctx: &mut Ctx) -> Check {
     let features = entities
         .iter()
         .find(|e| e["entity_id"] == json!(mp))
-        .map(|e| strings(&e["features"]))
-        .unwrap_or_default();
+        .map_or_default(|e| strings(&e["features"]));
     let heos = match Heos::connect(ctx.opt.address.as_str()).await {
         Ok(heos) => heos,
         Err(e) => {
