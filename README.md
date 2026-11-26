@@ -257,6 +257,13 @@ The port is 9090. Set `UC_INTEGRATION_HTTP_PORT` to change it.
 For an error report, turn on the debug log: tick _Debug log_ in the setup and save. The driver and the
 library then write more lines to the log. It stays on after a restart. `RUST_LOG` overrides this setting.
 
+Log line layout: `[<UTC time> <level> <target>] <message> <fields> <spans>`. The spans name the receiver connection
+of the library, for example `avr{id=1 host=192.168.1.20}` or `heos{id=1 host=192.168.1.20}`. On Linux, when the
+output goes to the systemd journal (`JOURNAL_STREAM` names the stderr of the driver), each log entry starts with a
+priority prefix such as `<7>`. The journal then gets the level of each entry, and `journalctl -p warning` shows only
+warnings and errors. The second and later lines of a message with more than one line, and the output of a panic, get
+the default priority of the journal.
+
 ## Backup and restore
 
 Run the setup again and choose _Backup configuration_. Copy the text and keep it in a safe place. To restore,
