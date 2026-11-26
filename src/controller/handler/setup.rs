@@ -1075,7 +1075,7 @@ impl Controller {
                 devices
             }
         };
-        devices.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        devices.sort_unstable_by(|a, b| a.cmp_list_order(b));
         let save = self.store.save_devices(&devices).map_err(|e| {
             warn!("Saving the configuration failed: {e}");
             IntegrationSetupError::Other
@@ -1324,7 +1324,7 @@ impl Controller {
 
     fn config_mode_page(&self) -> Value {
         let mut devices: Vec<_> = self.devices.values().map(|d| &d.cfg).collect();
-        devices.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        devices.sort_unstable_by(|a, b| a.cmp_list_order(b));
         let mut items: Vec<Value> = devices
             .iter()
             .map(|c| json!({ "id": c.id, "label": { "en": format!("{} ({} - {})", c.name, c.id, c.shown_address()) } }))

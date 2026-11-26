@@ -16,6 +16,8 @@ use bytestring::ByteString;
 use log::{debug, info, warn};
 use serde::Serialize;
 use serde_json::{Map, Value};
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::sync::Arc;
 use uc_api::EntityType;
 use uc_api::intg::{AvailableIntgEntity, DeviceState, EntityCommand};
@@ -162,10 +164,10 @@ impl Controller {
         Some(device.cfg)
     }
 
-    /// The configuration of all devices, sorted by name.
+    /// The configuration of all devices, in [`DeviceConfig::cmp_list_order`].
     pub(super) fn sorted_configs(&self) -> Vec<DeviceConfig> {
         let mut devices: Vec<DeviceConfig> = self.devices.values().map(|d| d.cfg.clone()).collect();
-        devices.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        devices.sort_unstable_by(|a, b| a.cmp_list_order(b));
         devices
     }
 
@@ -173,19 +175,22 @@ impl Controller {
     /// [`Controller::config_writes`].
     pub(super) fn queue_devices(&mut self) -> Result<(), ServiceError> {
         let mut devices: Vec<&DeviceConfig> = self.devices.values().map(|d| &d.cfg).collect();
-        devices.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        devices.sort_unstable_by(|a, b| a.cmp_list_order(b));
         self.store.queue_devices(&devices)?;
         self.config_writes = self.config_writes.wrapping_add(1);
         Ok(())
     }
 
-    /// The entity definitions of all receivers, only of `entity_type` if it is given.
+    /// The entity definitions of all receivers, only of `entity_type` if it is given. The
+    /// receivers are in [`DeviceConfig::cmp_list_order`].
     pub(super) fn available_entities(
         &self,
         entity_type: Option<EntityType>,
     ) -> Vec<AvailableIntgEntity> {
-        self.devices
-            .values()
+        let mut devices: Vec<&Device> = self.devices.values().collect();
+        devices.sort_unstable_by(|a, b| a.cfg.cmp_list_order(&b.cfg));
+        devices
+            .into_iter()
             .flat_map(|d| {
                 EntityKind::all(&d.cfg)
                     .filter(|k| entity_type.is_none_or(|t| k.entity_type() == t))
@@ -218,7 +223,8 @@ impl Controller {
             .filter(|(id, _)| session.is_none_or(|s| !s.has_subscriptions() || s.subscribed(id)))
             .filter_map(|(id, attrs)| entity_change(id, attrs))
             .collect();
-        states.sort_by_key(|s| send_order(s.entity_id));
+        let devices = &self.devices;
+        states.sort_unstable_by(|a, b| send_order(devices, a.entity_id, b.entity_id));
         states
     }
 
@@ -271,7 +277,8 @@ impl Controller {
             let (all, subscribed) = (session.subscribe_all, &session.subscribed_entities);
             session.missed.retain(|id| all || subscribed.contains(id));
         }
-        send.sort_by_key(|id| send_order(id));
+        let devices = &self.devices;
+        send.sort_unstable_by(|a, b| send_order(devices, a, b));
         for id in &send {
             if let Some(change) = self.entities.get(id).and_then(|a| entity_change(id, a)) {
                 self.send_entity_change(ws_id, &change);
@@ -300,7 +307,8 @@ impl Controller {
             .missed
             .extract_if(|id| all || subscribed.contains(id))
             .collect();
-        missed.sort_by_key(|id| send_order(id));
+        let devices = &self.devices;
+        missed.sort_unstable_by(|a, b| send_order(devices, a, b));
         for id in &missed {
             if let Some(change) = self.entities.get(id).and_then(|a| entity_change(id, a)) {
                 self.send_entity_change(ws_id, &change);
@@ -570,12 +578,30 @@ fn stamp_first_position(attrs: &mut Map<String, Value>) {
     }
 }
 
-/// The media player and the remote are sent first: they are the most important on the Remote.
-fn send_order(entity_id: &str) -> u8 {
+/// The order in which entity states are sent: first all media players, then all remotes, then all
+/// other entities. Media players and remotes are the most important on the Remote. Inside each
+/// group: by receiver name, receiver key and entity id, so that the order does not change between
+/// calls. The names are read only when the keys differ. An entity id that does not parse is in the
+/// last group.
+fn send_order(devices: &HashMap<Arc<str>, Device>, a: &str, b: &str) -> Ordering {
+    let (rank_a, key_a) = rank_and_key(a);
+    let (rank_b, key_b) = rank_and_key(b);
+    rank_a.cmp(&rank_b).then_with(|| {
+        if key_a == key_b {
+            return a.cmp(b);
+        }
+        let name = |key: &str| devices.get(key).map_or("", |d| d.cfg.name.as_str());
+        name(key_a).cmp(name(key_b)).then_with(|| key_a.cmp(key_b))
+    })
+}
+
+/// The rank of an entity in `send_order` and the key of its receiver.
+fn rank_and_key(entity_id: &str) -> (u8, &str) {
     match EntityKind::parse(entity_id) {
-        Some((_, EntityKind::MediaPlayer)) => 0,
-        Some((_, EntityKind::Remote)) => 1,
-        _ => 2,
+        Some((key, EntityKind::MediaPlayer)) => (0, key),
+        Some((key, EntityKind::Remote)) => (1, key),
+        Some((key, _)) => (2, key),
+        None => (2, ""),
     }
 }
 
@@ -667,6 +693,17 @@ mod tests {
         }
     }
 
+    /// A Remote with room for `capacity` messages. The test sends all messages before the Remote
+    /// reads them.
+    fn big_remote(texts: &Arc<Mutex<Vec<String>>>, capacity: usize) -> R2Session {
+        let texts = Arc::clone(texts);
+        let addr = Remote::create(move |ctx| {
+            ctx.set_mailbox_capacity(capacity);
+            Remote(texts)
+        });
+        R2Session::new(addr.recipient())
+    }
+
     fn sent(texts: &Mutex<Vec<String>>) -> Vec<String> {
         texts.lock().expect("lock").clone()
     }
@@ -750,6 +787,117 @@ mod tests {
         assert_eq!(5, sent_now.len());
         assert!(sent_now[0].contains("media_player.KEY"), "{}", sent_now[0]);
         assert!(sent_now[1].contains("remote.KEY"), "{}", sent_now[1]);
+    }
+
+    #[actix::test]
+    async fn receivers_with_the_same_name_keep_their_order() {
+        let mut controller = new_controller();
+        let devices = [
+            ("E", "Same"),
+            ("B", "Same"),
+            ("G", "Same"),
+            ("C", "Alpha"),
+            ("D", "Same"),
+            ("F", "Same"),
+            ("A", "Same"),
+        ];
+        for (key, name) in devices {
+            add_idle_device(&mut controller, key);
+            controller.devices.get_mut(key).expect("device").cfg.name = name.into();
+            let ids = [
+                format!("sensor.mute.{key}"),
+                format!("remote.{key}"),
+                format!("select.dimmer.{key}"),
+                format!("media_player.{key}"),
+            ];
+            for id in ids {
+                controller
+                    .entities
+                    .insert(id, map(json!({ "state": "ON" })));
+            }
+        }
+        let keys: Vec<String> = controller
+            .sorted_configs()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        let sorted = ["C", "A", "B", "D", "E", "F", "G"];
+        assert_eq!(sorted.to_vec(), keys);
+        let players: Vec<String> = controller
+            .available_entities(Some(EntityType::MediaPlayer))
+            .into_iter()
+            .map(|e| e.entity_id)
+            .collect();
+        let expected: Vec<String> = sorted.iter().map(|k| format!("media_player.{k}")).collect();
+        assert_eq!(expected, players);
+        // Media players, then remotes, then the other entities of each receiver in turn.
+        let mut order: Vec<String> = ["media_player", "remote"]
+            .iter()
+            .flat_map(|ty| sorted.iter().map(move |k| format!("{ty}.{k}")))
+            .collect();
+        for k in sorted {
+            order.extend([format!("select.dimmer.{k}"), format!("sensor.mute.{k}")]);
+        }
+        let texts = Arc::default();
+        let session_a = R2Session::new(Remote(Arc::clone(&texts)).start().recipient());
+        controller.sessions.insert("a".into(), session_a);
+        let states: Vec<&str> = controller
+            .entity_states("a")
+            .iter()
+            .map(|s| s.entity_id)
+            .collect();
+        assert_eq!(order, states);
+        let check = |texts: &Arc<_>| {
+            let sent_now = sent(texts);
+            assert_eq!(order.len(), sent_now.len());
+            for (text, id) in sent_now.iter().zip(&order) {
+                assert!(text.contains(&format!(r#""{id}""#)), "{id}: {text}");
+            }
+        };
+        // A Remote that did not read all states gets them in the same order when it subscribes.
+        let texts = Arc::default();
+        let session_b = big_remote(&texts, order.len());
+        controller.sessions.insert("b".into(), session_b);
+        session(&mut controller, "b").read_states = true;
+        controller.subscribe("b", Some(order.iter().rev().cloned().collect()));
+        settle().await;
+        check(&texts);
+        // The states missed in standby come in the same order.
+        let texts = Arc::default();
+        let session_c = big_remote(&texts, order.len());
+        controller.sessions.insert("c".into(), session_c);
+        controller.subscribe("c", None);
+        session(&mut controller, "c")
+            .missed
+            .extend(order.iter().cloned());
+        controller.send_missed_states("c");
+        settle().await;
+        check(&texts);
+    }
+
+    #[actix::test]
+    async fn ids_that_do_not_parse_and_unknown_receivers_have_a_fixed_place() {
+        let mut controller = new_controller();
+        add_idle_device(&mut controller, "A");
+        let mut ids = [
+            "sensor.mute.A",
+            "sensor.mute.GONE",
+            "remote.GONE",
+            "media_player.A",
+            "not an id",
+        ];
+        ids.sort_unstable_by(|a, b| send_order(&controller.devices, a, b));
+        // A receiver that is not in the list has no name, so it comes before "A".
+        assert_eq!(
+            [
+                "media_player.A",
+                "remote.GONE",
+                "not an id",
+                "sensor.mute.GONE",
+                "sensor.mute.A",
+            ],
+            ids
+        );
     }
 
     #[actix::test]

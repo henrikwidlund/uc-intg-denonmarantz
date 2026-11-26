@@ -36,6 +36,9 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 /// while the network comes up after wake-up. Such a request was not sent, so this is safe for
 /// commands too.
 const CONNECT_RETRY: Duration = Duration::from_secs(3);
+/// Time without telnet data after which the library sends a query. The link counts as lost when
+/// there is still no data after the same time again.
+const TELNET_KEEP_ALIVE: Duration = Duration::from_secs(10);
 /// Time between connects while the network is not ready, for example right after wake-up. The fast
 /// tries end after [`NETWORK_RETRY_TIMEOUT`].
 pub(crate) const NETWORK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
@@ -226,10 +229,12 @@ fn builder(host: &str, known: Option<Known>, signal_secs: u16) -> AvrBuilder {
 
 /// The telnet settings with the signal check of the library every `signal_secs` (see
 /// `DeviceConfig::signal_secs`). 0 turns the check off. Less than `MIN_SIGNAL_SECS` counts as
-/// `MIN_SIGNAL_SECS`: the library does not accept it.
+/// `MIN_SIGNAL_SECS`: the library does not accept it. A link without data is checked after
+/// `TELNET_KEEP_ALIVE` and counts as lost after twice that time.
 fn telnet_config(signal_secs: u16) -> TelnetConfig {
     let secs = signal_secs.max(config_store::MIN_SIGNAL_SECS);
     TelnetConfig {
+        keep_alive: TELNET_KEEP_ALIVE,
         signal_check: (signal_secs > 0).then(|| Duration::from_secs(u64::from(secs))),
         ..TelnetConfig::default()
     }
@@ -1161,6 +1166,14 @@ mod telnet_config_tests {
             let lowest = telnet_config(secs);
             assert!(lowest.signal_check.is_some_and(|c| c > lowest.answer_quiet));
         }
+    }
+
+    #[test]
+    fn the_keep_alive_time_is_set() {
+        let config = telnet_config(0);
+        assert_eq!(TELNET_KEEP_ALIVE, config.keep_alive);
+        // The library does not accept a power-on hold above the keep-alive time.
+        assert!(config.power_on_hold <= config.keep_alive);
     }
 }
 

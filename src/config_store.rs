@@ -306,6 +306,13 @@ impl DeviceConfig {
         &self.id
     }
 
+    /// The order of the receivers in lists and in the configuration file: by name, then by key.
+    pub fn cmp_list_order(&self, other: &Self) -> std::cmp::Ordering {
+        self.name
+            .cmp(&other.name)
+            .then_with(|| self.key().cmp(other.key()))
+    }
+
     /// The serial number: the stored one, or the id if it is the serial number.
     pub fn serial(&self) -> Option<&str> {
         match self.id_kind {
