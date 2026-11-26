@@ -611,12 +611,13 @@ dependencies = [
 [[package]]
 name = "denon-marantz"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=91013ede904e43dee4e9ddac8eafb92e045a2bbe#91013ede904e43dee4e9ddac8eafb92e045a2bbe"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=2993c738d1fc731ad5fe3a88a960d16e4c6d6c2b#2993c738d1fc731ad5fe3a88a960d16e4c6d6c2b"
 dependencies = [
  "bytes",
  "denon-marantz-discovery",
  "denon-marantz-heos",
  "denon-marantz-proto",
+ "denon-marantz-shared",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -632,7 +633,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz-discovery"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=91013ede904e43dee4e9ddac8eafb92e045a2bbe#91013ede904e43dee4e9ddac8eafb92e045a2bbe"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=2993c738d1fc731ad5fe3a88a960d16e4c6d6c2b#2993c738d1fc731ad5fe3a88a960d16e4c6d6c2b"
 dependencies = [
  "http 1.5.0",
 ]
@@ -640,9 +641,10 @@ dependencies = [
 [[package]]
 name = "denon-marantz-heos"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=91013ede904e43dee4e9ddac8eafb92e045a2bbe#91013ede904e43dee4e9ddac8eafb92e045a2bbe"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=2993c738d1fc731ad5fe3a88a960d16e4c6d6c2b#2993c738d1fc731ad5fe3a88a960d16e4c6d6c2b"
 dependencies = [
  "denon-marantz-heos-proto",
+ "denon-marantz-shared",
  "serde",
  "thiserror",
  "tokio",
@@ -652,7 +654,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz-heos-proto"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=91013ede904e43dee4e9ddac8eafb92e045a2bbe#91013ede904e43dee4e9ddac8eafb92e045a2bbe"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=2993c738d1fc731ad5fe3a88a960d16e4c6d6c2b#2993c738d1fc731ad5fe3a88a960d16e4c6d6c2b"
 dependencies = [
  "serde",
  "serde_json",
@@ -662,11 +664,21 @@ dependencies = [
 [[package]]
 name = "denon-marantz-proto"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=91013ede904e43dee4e9ddac8eafb92e045a2bbe#91013ede904e43dee4e9ddac8eafb92e045a2bbe"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=2993c738d1fc731ad5fe3a88a960d16e4c6d6c2b#2993c738d1fc731ad5fe3a88a960d16e4c6d6c2b"
 dependencies = [
  "quick-xml",
  "serde",
  "thiserror",
+]
+
+[[package]]
+name = "denon-marantz-shared"
+version = "0.1.0"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=2993c738d1fc731ad5fe3a88a960d16e4c6d6c2b#2993c738d1fc731ad5fe3a88a960d16e4c6d6c2b"
+dependencies = [
+ "socket2",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

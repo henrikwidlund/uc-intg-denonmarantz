@@ -141,15 +141,24 @@ Commands with a number are sent as raw text with the remote entity:
 - The driver connects with the address and the values (`info`) of the last full connect. This sends no request:
   the start checks them. If the values changed, the driver saves them; if the type, the port or the read method
   changed, it connects again. If the start fails, or another receiver answers, the driver looks the receiver up:
-  the last address first, then it searches the network for its MAC address or serial number and saves the new
-  address.
+  the last address first, then the IP addresses of the host name (from the setup, or an old address), then it
+  searches the network for its MAC address or serial number. It saves the new address.
+- The setup accepts an IP address or a host name. For a host name, the driver saves the name (`host` in
+  `config.json`) and its IP address (`address`). It connects to the IP address, so a normal connect does not
+  look up the name. It uses the first IP address where the receiver answers. The setup waits at most 3 seconds
+  for the name. When you add a receiver and the setup cannot look up the name, it connects with the
+  name; if that fails, nothing is saved. When you change the address of a configured receiver, the setup saves
+  the first IP address if the receiver answers at none, and the name as the address if it cannot look up the
+  name. If `address` in `config.json` is a host name and `host` is not set, the driver moves the name to `host`
+  when it saves a new address.
 - After the Remote wakes up, the network of the Remote can be down for a short time. The driver tries again
   for up to 3 seconds. A connection to the receiver that does not open in 0.25 seconds is tried again. A start or
   lookup of the receiver that takes more than 3 times as long as the fastest of the last 5 starts (at least 0.2
   seconds) is started again, at most 4 times. There is no such limit for the first connect, or if that start took
   more than about 0.7 seconds. If telnet or HEOS cannot connect after wake-up, they are tried again every 0.05
   seconds for 3 seconds, then less often (HEOS only if the receiver has it).
-- A command that comes while the first connect runs waits for it, at most 3 seconds. Commands that do not need the
+- A command that comes while the first connect runs waits until it ends, within the 9 seconds below. It is not
+  sent if the Remote goes to standby or the setup connects again during the wait. Commands that do not need the
   state of the receiver (power, volume, mute, cursor keys, back, info, channel up and down, raw text, and next,
   previous and stop on receivers without HEOS) are sent when the receiver is known, before the start ends.
   Commands keep their order: a command after one that waits also waits. A command whose connection cannot be
@@ -169,7 +178,7 @@ Commands with a number are sent as raw text with the remote entity:
 - A Denon or Marantz network receiver.
 - The receiver and the Remote are on the same network, or you enter the address of the receiver in the setup.
 - Network control is on in the receiver, also in standby. A fixed IP address (reservation in the router)
-  is recommended.
+  or a host name is recommended.
 - Some old receivers allow only one telnet connection. If telnet does not work for you, use the connection
   mode _Use HTTP connection_. In this mode the driver reads the receiver every 10 seconds and after each
   command. All receivers have the media player and the remote. The selects, sensors, switches and numbers

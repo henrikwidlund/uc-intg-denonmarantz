@@ -240,6 +240,7 @@ mod tests {
             mac: None,
             name: "N".into(),
             address: "h".into(),
+            host: None,
             support_sound_mode: true,
             show_all_inputs: false,
             use_telnet,

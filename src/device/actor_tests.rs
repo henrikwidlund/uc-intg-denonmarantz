@@ -5,9 +5,7 @@
 //! The tests check what the actor asks for and shows when the receiver answers, does not answer,
 //! sends events or closes the connection.
 
-use super::actor::{
-    CONNECT_WAIT, CurrentAvr, Refreshing, Resend, read_differently, send_again, send_command,
-};
+use super::actor::{CurrentAvr, Refreshing, Resend, read_differently, send_again, send_command};
 use super::commands;
 use super::discovery::{
     self, Known, TEST_BUILDER, TEST_DISCOVERY, TEST_SIGNAL_CHECKS, TestBuilder,
@@ -65,6 +63,7 @@ fn cfg() -> DeviceConfig {
         mac: Some(FAKE_MAC.into()),
         name: "AVR".into(),
         address: "127.0.0.1".into(),
+        host: None,
         support_sound_mode: true,
         show_all_inputs: false,
         use_telnet: true,
@@ -951,6 +950,48 @@ async fn a_receiver_with_a_new_address_is_found_by_its_serial_number() {
         .find(|c| c.address == NEW)
         .expect("saved");
     assert!(first.info.is_some_and(|i| i.host == NEW));
+    // The old address was a host name: it is kept.
+    assert_eq!(Some(OLD), first.host.as_deref());
+}
+
+#[actix::test]
+async fn the_host_name_is_resolved_when_the_stored_address_fails() {
+    const STORED: &str = "::1";
+    const RESOLVED: &str = "127.0.0.1";
+    let (http, telnet) = (
+        Fake::start(true).await,
+        FakeTelnet::start(answers_all).await,
+    );
+    let live = (http.port(), telnet.port);
+    // Nothing answers at the stored address: port 1 is closed.
+    let setup: TestBuilder = Rc::new(move |host, builder| {
+        let (http, telnet) = if host == RESOLVED { live } else { (1, 1) };
+        test_builder(http, telnet, builder)
+    });
+    TEST_BUILDER.with(|slot| *slot.borrow_mut() = Some(setup));
+    TEST_DISCOVERY.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let collector = Collector(events.clone()).start();
+    let cfg = DeviceConfig {
+        address: STORED.into(),
+        host: Some("localhost".into()),
+        ..cfg()
+    };
+    let actor = DenonActor::new("SERIAL0000001".into(), cfg, collector.recipient())
+        .with_retry_delay(QUICK)
+        .start();
+    actor.send(Connect).await.expect("connect");
+    until("the new address", 10, || {
+        configs(&events).iter().any(|c| c.address == RESOLVED)
+    })
+    .await;
+    until("the connection", 5, || telnet.connections() >= 1).await;
+    let saved = configs(&events)
+        .into_iter()
+        .find(|c| c.address == RESOLVED)
+        .expect("saved");
+    assert_eq!(Some("localhost"), saved.host.as_deref());
+    assert_eq!(0, status_count(&events, DeviceStatus::Error));
 }
 
 /// The last state of an entity that the actor sent.
@@ -2311,17 +2352,21 @@ fn mute_lines(rig: &Rig) -> usize {
 }
 
 #[actix::test]
-async fn a_command_is_sent_again_once_a_connect_that_takes_longer_than_its_wait_ends() {
-    // The start takes about 4 s: longer than the wait for the connect.
+async fn a_command_waits_until_a_long_connect_ends() {
+    // The start takes about 5 s, within the time of the command.
     let (rig, connected) =
-        slow_start_rig_with(Duration::from_secs(3), Duration::from_secs(5)).await;
+        slow_start_rig_with(Duration::from_secs(4), Duration::from_secs(8)).await;
     let start = Instant::now();
     rig.actor
         .send(media_command("mute_toggle"))
         .await
         .expect("send")
         .expect("mute toggle");
-    assert!(start.elapsed() > CONNECT_WAIT, "{:?}", start.elapsed());
+    assert!(
+        start.elapsed() > Duration::from_secs(3),
+        "{:?}",
+        start.elapsed()
+    );
     assert!(status_count(&rig.events, DeviceStatus::Connected) > connected);
     until("the command", 5, || mute_lines(&rig) >= 1).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2329,12 +2374,12 @@ async fn a_command_is_sent_again_once_a_connect_that_takes_longer_than_its_wait_
 }
 
 #[actix::test]
-async fn a_command_is_not_sent_again_after_a_standby_and_a_wake_up() {
-    // The start takes about 6 s: it still runs when the wait for it starts again.
+async fn a_command_that_waits_for_a_connect_is_not_sent_after_a_standby_and_a_wake_up() {
+    // The start takes about 6 s.
     let (rig, _) = slow_start_rig_with(Duration::from_secs(5), Duration::from_secs(8)).await;
     let toggle = rig.actor.send(media_command("mute_toggle"));
-    // The first wait for the connect is over, and the send waits for it again.
-    tokio::time::sleep(CONNECT_WAIT + Duration::from_millis(400)).await;
+    // The command waits for the connect.
+    tokio::time::sleep(Duration::from_secs(1)).await;
     rig.http.set_read_delay(Duration::ZERO);
     let connected = status_count(&rig.events, DeviceStatus::Connected);
     rig.actor.do_send(Disconnect);
@@ -2346,6 +2391,61 @@ async fn a_command_is_not_sent_again_after_a_standby_and_a_wake_up() {
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(0, mute_lines(&rig));
+}
+
+/// The wait for the connect ends at once. The command is not sent: the check of the first send
+/// and the one of the resend both stop it.
+#[actix::test]
+async fn a_command_that_waits_for_a_connect_is_answered_at_once_after_a_setup_change() {
+    // The start takes about 6 s, also the one after the setup change.
+    let (rig, _) = slow_start_rig_with(Duration::from_secs(5), Duration::from_secs(8)).await;
+    let toggle = rig.actor.send(media_command("mute_toggle"));
+    // The command waits for the connect.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // A new signal time connects again.
+    let setup = DeviceConfig {
+        signal_poll_secs: Some(60),
+        ..cfg()
+    };
+    let start = Instant::now();
+    rig.actor.send(UpdateConfig(setup)).await.expect("update");
+    assert_eq!(Err(ServiceError::NotConnected), toggle.await.expect("send"));
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        start.elapsed()
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(0, mute_lines(&rig));
+}
+
+/// No step goes to the new connection. The end of the wait at the disconnect and the check of the
+/// run both stop it.
+#[actix::test]
+async fn a_sequence_that_waits_for_a_connect_is_not_sent_after_a_standby_and_a_wake_up() {
+    // The start takes about 6 s.
+    let (rig, _) = slow_start_rig_with(Duration::from_secs(5), Duration::from_secs(8)).await;
+    let params = serde_json::json!({ "sequence": ["cursor_up"], "repeat": 3 });
+    let run = Command::new(
+        EntityKind::Remote,
+        "send_cmd_sequence".into(),
+        params.as_object().cloned(),
+    );
+    rig.actor.send(run).await.expect("send").expect("run");
+    // The run waits for the connect.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    rig.http.set_read_delay(Duration::ZERO);
+    let connected = status_count(&rig.events, DeviceStatus::Connected);
+    rig.actor.do_send(Disconnect);
+    rig.actor.do_send(Connect);
+    until("connected", 5, || {
+        status_count(&rig.events, DeviceStatus::Connected) > connected
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let sent =
+        rig.telnet.count("MNCUP") + rig.http.commands().iter().filter(|c| *c == "MNCUP").count();
+    assert_eq!(0, sent);
 }
 
 /// The disconnect ends the connect: the command is not sent, also without the checks of the
@@ -2455,28 +2555,6 @@ async fn a_resend_that_waits_for_a_connect_until_its_time_is_over_is_a_timeout()
 }
 
 #[actix::test]
-async fn a_resend_whose_connect_still_runs_after_its_wait_is_a_timeout() {
-    // The start takes about 6 s: longer than the wait.
-    let (rig, connected) =
-        slow_start_rig_with(Duration::from_secs(5), Duration::from_secs(8)).await;
-    let (cfg, expected) = (cfg(), commands::Expected::default());
-    let msg = media_command("mute_toggle");
-    let start = Instant::now();
-    // `slow_start_rig_with` disconnected once.
-    let result = send_again(&resend(&rig, false, 1), &cfg, &expected, &msg, "AVR").await;
-    assert_eq!(Err(ServiceError::Timeout), result);
-    let waited = start.elapsed();
-    assert!(waited >= CONNECT_WAIT, "{waited:?}");
-    assert!(waited < CONNECT_WAIT + Duration::from_secs(1), "{waited:?}");
-    until("connected", 10, || {
-        status_count(&rig.events, DeviceStatus::Connected) > connected
-    })
-    .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(0, mute_lines(&rig));
-}
-
-#[actix::test]
 async fn a_resend_whose_connect_fails_during_the_wait_is_not_connected() {
     // The reads take longer than the request timeout: the start fails after about 2 s.
     let (rig, _) = slow_start_rig_with(Duration::from_secs(2), Duration::from_millis(500)).await;
@@ -2486,7 +2564,11 @@ async fn a_resend_whose_connect_fails_during_the_wait_is_not_connected() {
     // `slow_start_rig_with` disconnected once.
     let result = send_again(&resend(&rig, false, 1), &cfg, &expected, &msg, "AVR").await;
     assert_eq!(Err(ServiceError::NotConnected), result);
-    assert!(start.elapsed() < CONNECT_WAIT, "{:?}", start.elapsed());
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        start.elapsed()
+    );
     assert_eq!(0, mute_lines(&rig));
 }
 

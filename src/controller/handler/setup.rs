@@ -6,7 +6,7 @@
 
 use crate::config_store::{
     DEFAULT_SIGNAL_SECS, DeviceConfig, DriverSettings, Feature, MIN_SIGNAL_SECS, SaveWait,
-    backup_json, parse_backup,
+    backup_json, is_ip, parse_backup,
 };
 use crate::controller::devices::ConnectTrigger;
 use crate::controller::handler::AbortDriverSetup;
@@ -57,7 +57,9 @@ pub struct SetDriverUserDataMsg {
 #[derive(Debug, Clone)]
 pub struct Found {
     /// Address of the receiver. Identifies the receiver on the setup pages.
-    host: String,
+    address: String,
+    /// The host name that the user entered.
+    host: Option<String>,
     name: String,
     model: String,
     serial: Option<String>,
@@ -74,7 +76,8 @@ pub struct Found {
 impl Found {
     fn new(receiver: &denon_marantz::DiscoveredReceiver, detected: Detected) -> Self {
         Self {
-            host: receiver.host.clone(),
+            address: receiver.host.clone(),
+            host: None,
             name: receiver
                 .friendly_name
                 .clone()
@@ -93,10 +96,16 @@ impl Found {
         }
     }
 
-    /// A receiver that the user gave the address of.
-    fn from_identified(host: &str, id: &discovery::Identified, has_tuner: Option<bool>) -> Self {
+    /// A receiver that the user gave the address of. `host`: the entered host name.
+    fn from_identified(
+        address: String,
+        host: Option<String>,
+        id: &discovery::Identified,
+        has_tuner: Option<bool>,
+    ) -> Self {
         Self {
-            host: host.to_owned(),
+            address,
+            host,
             name: id.name.clone(),
             model: id.model.clone(),
             serial: id.serial.clone(),
@@ -317,10 +326,10 @@ enum DeviceChange {
     Restore(Vec<DeviceConfig>),
     /// Remove the device with this key.
     Remove(String),
-    /// Set the options of the device with this key. `None` keeps the address.
+    /// Set the options of the device with this key. `None` keeps the address and the host name.
     Configure {
         key: String,
-        address: Option<String>,
+        address: Option<Entered>,
         options: Options,
     },
     /// Add a receiver. `update`: the receiver was configured when the setup read it.
@@ -332,16 +341,84 @@ enum DeviceChange {
     },
 }
 
-/// Set the options of a setup page. `None` keeps the address.
-fn set_options(cfg: &mut DeviceConfig, address: Option<&str>, options: Options) {
+/// An address of a setup page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Entered {
+    /// See `DeviceConfig::address`.
+    address: String,
+    /// See `DeviceConfig::host`.
+    host: Option<String>,
+}
+
+impl Entered {
+    /// An IP address, without a host name.
+    const fn ip(address: String) -> Self {
+        Self {
+            address,
+            host: None,
+        }
+    }
+
+    /// The host name `host` with the first of its IP addresses where the receiver of `cfg` answers,
+    /// or a receiver that cannot be compared with it. If none answers, the first IP address. If the
+    /// name cannot be resolved, the name.
+    async fn resolve(host: String, cfg: DeviceConfig) -> Self {
+        let ips = resolve_name(&host).await;
+        let mut address = None;
+        for ip in &ips {
+            match discovery::identify(ip, None).await {
+                Ok(avr) => {
+                    let info = avr.info();
+                    let same = cfg
+                        .same_receiver(info.serial_number.as_deref(), info.mac_address.as_deref());
+                    if same != Some(false) {
+                        address = Some(ip.clone());
+                        break;
+                    }
+                    debug!("[{host}] another receiver answers at {ip}");
+                }
+                Err(e) => debug!("[{host}] address {ip} failed: {e}"),
+            }
+        }
+        Self {
+            address: address
+                .or_else(|| ips.into_iter().next())
+                .unwrap_or_else(|| host.clone()),
+            host: Some(host),
+        }
+    }
+}
+
+/// The IP addresses of a host name. Empty if it cannot be resolved within
+/// [`discovery::NETWORK_RETRY_TIMEOUT`].
+async fn resolve_name(host: &str) -> Vec<String> {
+    match tokio::time::timeout(discovery::NETWORK_RETRY_TIMEOUT, discovery::resolve(host)).await {
+        Ok(Ok(ips)) => {
+            info!("[{host}] host name resolved to {ips:?}");
+            ips
+        }
+        Ok(Err(e)) => {
+            info!("[{host}] host name not resolved: {e}");
+            Vec::new()
+        }
+        Err(_) => {
+            info!("[{host}] host name not resolved in time");
+            Vec::new()
+        }
+    }
+}
+
+/// Set the options of a setup page. `None` keeps the address and the host name.
+fn set_options(cfg: &mut DeviceConfig, address: Option<&Entered>, options: Options) {
     cfg.show_all_inputs = options.show_all_inputs;
     cfg.is_denon = options.is_denon;
     cfg.use_telnet = options.use_telnet;
     cfg.is_dirac_supported = Some(options.is_dirac_supported);
     cfg.tuner = Some(options.has_tuner);
     cfg.signal_poll_secs = Some(options.signal_poll_secs);
-    if let Some(address) = address {
-        address.clone_into(&mut cfg.address);
+    if let Some(entered) = address {
+        entered.address.clone_into(&mut cfg.address);
+        cfg.host.clone_from(&entered.host);
     }
 }
 
@@ -554,7 +631,7 @@ impl Controller {
             SetupState::ConfigMode => self.config_mode(ws_id, values, ctx)?,
             SetupState::ChooseDevice { mut found } => {
                 let choice = values.get("choice").map_or_default(String::as_str);
-                let Some(i) = found.iter().position(|f| f.host == choice) else {
+                let Some(i) = found.iter().position(|f| f.address == choice) else {
                     return Err(InputError::Invalid(
                         Box::new(SetupState::ChooseDevice { found }),
                         "Unknown device".into(),
@@ -586,27 +663,45 @@ impl Controller {
                         ));
                     }
                 };
-                let options = match self
-                    .devices
-                    .get(key.as_str())
-                    .map(|d| Options::of(&d.cfg))
-                    .map(|o| o.read(values))
-                {
-                    Some(Ok(o)) => o,
-                    Some(Err(e)) => {
+                let Some(device) = self.devices.get(key.as_str()) else {
+                    return Err(InputError::Failed(IntegrationSetupError::NotFound));
+                };
+                let options = match Options::of(&device.cfg).read(values) {
+                    Ok(o) => o,
+                    Err(e) => {
                         return Err(InputError::Invalid(
                             Box::new(SetupState::Configure { key }),
                             e,
                         ));
                     }
-                    None => return Err(InputError::Failed(IntegrationSetupError::NotFound)),
                 };
-                let change = DeviceChange::Configure {
-                    key,
-                    address,
-                    options,
-                };
-                self.apply_after_save(ws_id, change, ctx);
+                // The address that the page showed keeps the address and the host name.
+                let address = address.filter(|a| a != device.cfg.shown_address());
+                match address {
+                    Some(host) if !is_ip(&host) => {
+                        let cfg = device.cfg.clone();
+                        ctx.spawn(Entered::resolve(host, cfg).into_actor(self).map(
+                            move |entered, act, ctx| {
+                                if act.is_setup_flow(flow, &ws_id) {
+                                    let change = DeviceChange::Configure {
+                                        key,
+                                        address: Some(entered),
+                                        options,
+                                    };
+                                    act.apply_after_save(ws_id, change, ctx);
+                                }
+                            },
+                        ));
+                    }
+                    address => {
+                        let change = DeviceChange::Configure {
+                            key,
+                            address: address.map(Entered::ip),
+                            options,
+                        };
+                        self.apply_after_save(ws_id, change, ctx);
+                    }
+                }
             }
         }
         Ok(())
@@ -708,7 +803,7 @@ impl Controller {
     fn add_found(&self, ws_id: String, found: Found, options: Options, ctx: &mut Context<Self>) {
         info!("[{ws_id}] adding {} ({})", found.name, found.model);
         let flow = self.setup_flow;
-        let host = found.host.clone();
+        let host = found.address.clone();
         ctx.spawn(
             async move { identify_host(&host).await }
                 .into_actor(self)
@@ -738,7 +833,8 @@ impl Controller {
                         serial: identified.serial,
                         mac: identified.mac,
                         name: identified.name,
-                        address: found.host,
+                        address: found.address,
+                        host: found.host,
                         support_sound_mode: identified.support_sound_mode,
                         show_all_inputs: options.show_all_inputs,
                         use_telnet: options.use_telnet,
@@ -958,7 +1054,7 @@ impl Controller {
                     .get(key.as_str())
                     .ok_or(IntegrationSetupError::NotFound)?;
                 let mut cfg = device.cfg.clone();
-                set_options(&mut cfg, address.as_deref(), *options);
+                set_options(&mut cfg, address.as_ref(), *options);
                 configured = cfg;
                 self.devices
                     .iter()
@@ -1018,7 +1114,7 @@ impl Controller {
             } => {
                 // A device that was removed during the write is not added again.
                 if let Some(device) = self.devices.get_mut(key.as_str()) {
-                    set_options(&mut device.cfg, address.as_deref(), options);
+                    set_options(&mut device.cfg, address.as_ref(), options);
                     device.send_config();
                     Ok(())
                 } else {
@@ -1231,7 +1327,7 @@ impl Controller {
         devices.sort_unstable_by(|a, b| a.name.cmp(&b.name));
         let mut items: Vec<Value> = devices
             .iter()
-            .map(|c| json!({ "id": c.id, "label": { "en": format!("{} ({} - {})", c.name, c.id, c.address) } }))
+            .map(|c| json!({ "id": c.id, "label": { "en": format!("{} ({} - {})", c.name, c.id, c.shown_address()) } }))
             .collect();
         let mut actions = vec![json!({ "id": "add", "label": { "en": "Add a new device" } })];
         if items.is_empty() {
@@ -1353,19 +1449,20 @@ fn debug_log_field(value: bool) -> Value {
 }
 
 fn device_label(f: &Found) -> String {
-    format!("{} ({} - {})", f.name, f.model, f.host)
+    let address = f.host.as_deref().unwrap_or(&f.address);
+    format!("{} ({} - {address})", f.name, f.model)
 }
 
 fn choose_device_page(found: &[Found]) -> Value {
     let items: Vec<Value> = found
         .iter()
-        .map(|f| json!({ "id": f.host, "label": { "en": device_label(f) } }))
+        .map(|f| json!({ "id": f.address, "label": { "en": device_label(f) } }))
         .collect();
     let first = &found[0];
     let mut settings = vec![json!({
         "id": "choice",
         "label": { "en": "Choose your Denon or Marantz AVR" },
-        "field": { "dropdown": { "value": first.host, "items": items } }
+        "field": { "dropdown": { "value": first.address, "items": items } }
     })];
     settings.extend(Options::for_found(first).fields());
     json!({
@@ -1378,7 +1475,7 @@ fn configure_page(cfg: &DeviceConfig) -> Value {
     let mut settings = vec![json!({
         "id": "address",
         "label": { "en": "IP address or hostname (leave unchanged to keep it)" },
-        "field": { "text": { "value": cfg.address } }
+        "field": { "text": { "value": cfg.shown_address() } }
     })];
     settings.extend(Options::of(cfg).fields());
     json!({
@@ -1389,12 +1486,13 @@ fn configure_page(cfg: &DeviceConfig) -> Value {
 
 /// The receivers at one address, or all that answer the search.
 async fn find_receivers(address: Option<String>) -> Result<Vec<Found>, AvrError> {
-    if let Some(host) = address {
-        let avr = discovery::identify(&host, None).await?;
-        let id = discovery::Identified::new(&avr)
-            .map_err(|reason| AvrError::InvalidRequest(format!("[{host}] not used: {reason}")))?;
+    if let Some(entered) = address {
+        let (avr, address, host) = identify_entered(entered).await?;
+        let id = discovery::Identified::new(&avr).map_err(|reason| {
+            AvrError::InvalidRequest(format!("[{address}] not used: {reason}"))
+        })?;
         let tuner = detect_tuner(&avr).await;
-        return Ok(vec![Found::from_identified(&host, &id, tuner)]);
+        return Ok(vec![Found::from_identified(address, host, &id, tuner)]);
     }
     let receivers = discovery::discover().await?;
     // The search does not say if the receiver has Dirac or a tuner: ask each one.
@@ -1404,6 +1502,32 @@ async fn find_receivers(address: Option<String>) -> Result<Vec<Found>, AvrError>
         .zip(detected)
         .map(|(r, d)| Found::new(r, d))
         .collect())
+}
+
+/// Identify the receiver at an entered address. A host name is resolved: the first of its IP
+/// addresses that answers is used. If it cannot be resolved, the receiver is identified by the
+/// name. Gives the receiver, the address that answered and the host name.
+async fn identify_entered(entered: String) -> Result<(Avr, String, Option<String>), AvrError> {
+    if is_ip(&entered) {
+        let avr = discovery::identify(&entered, None).await?;
+        return Ok((avr, entered, None));
+    }
+    let ips = resolve_name(&entered).await;
+    let mut last_error = None;
+    for ip in ips {
+        match discovery::identify(&ip, None).await {
+            Ok(avr) => return Ok((avr, ip, Some(entered))),
+            Err(e) => {
+                debug!("[{entered}] address {ip} failed: {e}");
+                last_error = Some(e);
+            }
+        }
+    }
+    if let Some(e) = last_error {
+        return Err(e);
+    }
+    let avr = discovery::identify(&entered, None).await?;
+    Ok((avr, entered.clone(), Some(entered)))
 }
 
 /// Time to wait for the answer of a receiver to the Dirac question.
@@ -1574,7 +1698,8 @@ mod tests {
     fn the_tuner_field_asks_when_the_setup_could_not_find_it_out() {
         let field = |has_tuner| {
             let found = Found {
-                host: "h".into(),
+                address: "h".into(),
+                host: None,
                 name: "N".into(),
                 model: "M".into(),
                 serial: None,
@@ -1632,7 +1757,8 @@ mod tests {
         let high = of(r#"{"id":"A","name":"N","address":"h","signal_poll_secs":60000}"#);
         assert_eq!(MAX_SIGNAL_POLL_SECS, high.signal_poll_secs);
         let found = Found {
-            host: "h".into(),
+            address: "h".into(),
+            host: None,
             name: "N".into(),
             model: "M".into(),
             serial: None,
@@ -1696,7 +1822,7 @@ mod tests {
         use crate::config_store::DeviceConfig;
         use crate::config_store::backup_json;
         use crate::controller::handler::setup::{
-            DeviceChange, Options, SetDriverUserDataMsg, SetupDriverMsg,
+            DeviceChange, Entered, Options, SetDriverUserDataMsg, SetupDriverMsg,
         };
         use crate::controller::test_util::{
             DeviceAddr, FlushStore, Subscribed, SubscribesAll, TestRemote, config_file, connect,
@@ -2341,6 +2467,81 @@ mod tests {
             assert_eq!("192.0.2.6", cfg.address);
         }
 
+        /// Open the options of the Python receiver and save them with `address`. The setup must
+        /// end with OK. Gives the address that the page showed and the configuration after the
+        /// save.
+        async fn configure_address(
+            controller: &Addr<Controller>,
+            events: &TestRemote,
+            address: &str,
+        ) -> (Value, DeviceConfig) {
+            controller
+                .send(start_setup("a", true))
+                .await
+                .expect("send")
+                .expect("setup started");
+            pause().await;
+            controller
+                .send(values(
+                    "a",
+                    &[("choice", "SERIAL0000001"), ("action", "configure")],
+                ))
+                .await
+                .expect("send")
+                .expect("ok");
+            wait_page(events, "connection_mode").await;
+            let page = last(events);
+            let shown =
+                page["require_user_action"]["input"]["settings"][0]["field"]["text"]["value"]
+                    .clone();
+            controller
+                .send(values("a", &[("address", address)]))
+                .await
+                .expect("send")
+                .expect("ok");
+            wait_state(events, "OK").await;
+            controller.send(FlushStore).await.expect("send");
+            let cfg = controller
+                .send(DeviceCfg("SERIAL0000001"))
+                .await
+                .expect("send")
+                .expect("device");
+            (shown, cfg)
+        }
+
+        #[actix::test]
+        async fn the_options_store_a_host_name_with_its_ip_address() {
+            use_closed_port();
+            let name = "configure-host-name";
+            let controller = controller(name, Some(PYTHON_CONFIG));
+            let events = connect(&controller, "a").await;
+            let (shown, cfg) = configure_address(&controller, &events, "localhost").await;
+            assert_eq!(json!("192.0.2.6"), shown);
+            assert_eq!(
+                ("127.0.0.1", Some("localhost")),
+                (cfg.address.as_str(), cfg.host.as_deref())
+            );
+            assert_eq!(json!("localhost"), config_file(name)[0]["host"]);
+            assert_eq!(json!("127.0.0.1"), config_file(name)[0]["address"]);
+            // The page shows the host name. Unchanged, it keeps both.
+            let (shown, cfg) = configure_address(&controller, &events, "localhost").await;
+            assert_eq!(json!("localhost"), shown);
+            assert_eq!(
+                ("127.0.0.1", Some("localhost")),
+                (cfg.address.as_str(), cfg.host.as_deref())
+            );
+            // A host name that cannot be resolved is stored as the address too.
+            let (_, cfg) = configure_address(&controller, &events, "receiver.invalid").await;
+            assert_eq!(
+                ("receiver.invalid", Some("receiver.invalid")),
+                (cfg.address.as_str(), cfg.host.as_deref())
+            );
+            // An IP address removes the host name.
+            let (_, cfg) = configure_address(&controller, &events, "[::1]").await;
+            assert_eq!(("::1", None), (cfg.address.as_str(), cfg.host.as_deref()));
+            assert_eq!(None, config_file(name)[0].get("host"));
+        }
+
         #[actix::test]
         async fn invalid_config_mode_input_does_not_change_the_debug_log() {
             use_closed_port();
@@ -2435,7 +2636,7 @@ mod tests {
         fn to_http() -> DeviceChange {
             DeviceChange::Configure {
                 key: "SERIAL0000001".into(),
-                address: Some("192.0.2.7".into()),
+                address: Some(Entered::ip("192.0.2.7".into())),
                 options: Options {
                     use_telnet: false,
                     ..super::options()
@@ -2761,6 +2962,16 @@ mod tests {
         /// Start the setup and give the address of the fake receiver. `reconfigure` keeps the
         /// configured receivers.
         async fn setup_fake(controller: &Addr<Controller>, events: &TestRemote, reconfigure: bool) {
+            setup_fake_at(controller, events, reconfigure, FAKE_HOST).await;
+        }
+
+        /// As [`setup_fake`], with this address.
+        async fn setup_fake_at(
+            controller: &Addr<Controller>,
+            events: &TestRemote,
+            reconfigure: bool,
+            address: &str,
+        ) {
             controller
                 .send(start_setup("a", reconfigure))
                 .await
@@ -2779,7 +2990,7 @@ mod tests {
                 .expect("ok");
             pause().await;
             controller
-                .send(values("a", &[("address", FAKE_HOST)]))
+                .send(values("a", &[("address", address)]))
                 .await
                 .expect("send")
                 .expect("ok");
@@ -2813,12 +3024,45 @@ mod tests {
             assert_eq!(json!("mac"), device["id_kind"]);
             assert_eq!(json!("0123456789AB"), device["mac"]);
             assert_eq!(json!("XXX"), device["serial"]);
+            // An IP address is stored without a host name.
+            assert_eq!(json!(FAKE_HOST), device["address"]);
+            assert_eq!(None, device.get("host"));
             assert!(
                 entity_ids(&controller)
                     .await
                     .iter()
                     .any(|id| id == "media_player.0123456789AB")
             );
+        }
+
+        #[actix::test]
+        async fn a_host_name_is_stored_with_its_ip_address() {
+            let _fake = fake_receiver().await;
+            let controller = controller("host-name", None);
+            let events = connect(&controller, "a").await;
+            setup_fake_at(&controller, &events, false, "localhost").await;
+            // The page names the receiver by the host name, the choice is its IP address.
+            let page = last(&events);
+            let choice = &page["require_user_action"]["input"]["settings"][0]["field"]["dropdown"];
+            assert_eq!(json!(FAKE_HOST), choice["value"]);
+            assert!(
+                choice["items"][0]["label"]["en"]
+                    .as_str()
+                    .is_some_and(|l| l.ends_with("- localhost)")),
+                "{choice}"
+            );
+            controller
+                .send(values(
+                    "a",
+                    &[("choice", FAKE_HOST), ("connection_mode", "use_http")],
+                ))
+                .await
+                .expect("send")
+                .expect("ok");
+            wait_state(&events, "OK").await;
+            let device = &config_file("host-name")[0];
+            assert_eq!(json!(FAKE_HOST), device["address"]);
+            assert_eq!(json!("localhost"), device["host"]);
         }
 
         /// Identify the fake receiver like the setup does. The fake answers for the AVR-X and the

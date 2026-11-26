@@ -372,6 +372,7 @@ pub(crate) mod tests {
             mac: None,
             name: "AVR".into(),
             address: "192.0.2.1".into(),
+            host: None,
             support_sound_mode: true,
             show_all_inputs: false,
             use_telnet,

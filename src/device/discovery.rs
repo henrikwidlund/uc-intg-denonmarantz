@@ -13,6 +13,7 @@ use denon_marantz::{
 };
 use log::debug;
 use std::borrow::Cow;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::{sleep, timeout};
@@ -47,6 +48,22 @@ pub async fn discover() -> Result<Vec<DiscoveredReceiver>, Error> {
     denon_marantz::discover_all(&denon_marantz::DiscoveryConfig::default()).await
 }
 
+/// Search the network until the receiver of `cfg` answers, see [`find`]. If it does not answer,
+/// the search takes its full time.
+#[cfg(not(test))]
+pub async fn discover_for(cfg: &DeviceConfig) -> Result<Vec<DiscoveredReceiver>, Error> {
+    denon_marantz::discover_all_until(&denon_marantz::DiscoveryConfig::default(), |r| {
+        cfg.same_receiver(r.serial_number.as_deref(), r.mac_address.as_deref()) == Some(true)
+    })
+    .await
+}
+
+/// Tests never search the network: they get [`TEST_DISCOVERY`], or no receivers.
+#[cfg(test)]
+pub async fn discover_for(_: &DeviceConfig) -> Result<Vec<DiscoveredReceiver>, Error> {
+    discover().await
+}
+
 /// Tests never search the network: they get [`TEST_DISCOVERY`], or no receivers.
 #[cfg(test)]
 #[expect(clippy::unused_async, reason = "same signature as the search")]
@@ -54,6 +71,22 @@ pub async fn discover() -> Result<Vec<DiscoveredReceiver>, Error> {
     Ok(TEST_DISCOVERY
         .with(|slot| slot.borrow().clone())
         .unwrap_or_default())
+}
+
+/// The IP addresses of a host name, IPv4 first, without repeats. An IPv6 address has no brackets,
+/// like the addresses of the setup.
+pub async fn resolve(host: &str) -> std::io::Result<Vec<String>> {
+    let mut ips: Vec<IpAddr> = tokio::net::lookup_host((host, 80))
+        .await?
+        .map(|a| a.ip())
+        .collect();
+    ips.sort_by_key(IpAddr::is_ipv6);
+    Ok(ips
+        .iter()
+        .enumerate()
+        .filter(|(i, ip)| !ips[..*i].contains(ip))
+        .map(|(_, ip)| ip.to_string())
+        .collect())
 }
 
 /// Find the receiver of a configuration in the discovered ones, by its MAC address or serial
@@ -1091,6 +1124,26 @@ mod page_tests {
         .await;
         drop(held);
         assert_eq!(1, web.requests(AUDIO_PAGE));
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_host_name_gives_ipv4_first_without_repeats() {
+        let ips = resolve("localhost").await.expect("resolved");
+        assert_eq!(
+            Some("127.0.0.1"),
+            ips.first().map(String::as_str),
+            "{ips:?}"
+        );
+        let mut unique = ips.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(ips.len(), unique.len(), "{ips:?}");
+        assert!(ips.iter().all(|ip| !ip.contains('[')), "{ips:?}");
     }
 }
 

@@ -30,11 +30,6 @@ use tokio::time::{sleep_until, timeout, timeout_at};
 use tokio_stream::wrappers::{BroadcastStream, WatchStream};
 
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
-/// Longest wait for a running connect before a command runs: as long as the fast retries of the
-/// connect while the network is not ready ([`discovery::NETWORK_RETRY_TIMEOUT`]). The deadline
-/// of the command can end it earlier. A command that is sent again can wait once more, see
-/// [`send_again`].
-pub(super) const CONNECT_WAIT: Duration = Duration::from_secs(3);
 /// A connection that stayed up this long resets the reconnect delay.
 const STABLE_CONNECTION: Duration = Duration::from_secs(60);
 /// Changes come in bursts. Entity attributes are sent once after the last one.
@@ -96,11 +91,18 @@ struct Target {
     attempt: Option<watch::Receiver<u64>>,
 }
 
+/// A running connect that a command waits for, see [`DenonActor::running_connect`].
+struct Connecting {
+    status: watch::Receiver<DeviceStatus>,
+    /// Changes when the connection is closed or another connect starts: the wait then ends.
+    attempt: watch::Receiver<u64>,
+}
+
 /// The answer to [`SendAgain`].
 struct Again {
     target: Target,
-    /// The status of a running connect, if the command must wait for it.
-    connecting: Option<watch::Receiver<DeviceStatus>>,
+    /// A running connect, if the command must wait for it.
+    connecting: Option<Connecting>,
     /// The receiver before the start ends, for a command that does not read the state.
     early: Option<watch::Receiver<Option<Arc<Avr>>>>,
 }
@@ -286,14 +288,15 @@ pub struct DenonActor {
     attempts: u32,
     /// The connects look the receiver up and do not use the stored values, until one succeeds.
     look_up: bool,
-    /// Incremented on each connect attempt and on close. Results of older attempts are ignored, and
-    /// commands sent before the start ends stop when it changes.
+    /// Incremented on each connect attempt and on close. Results of older attempts are ignored,
+    /// commands sent before the start ends stop when it changes, and the waits for a connect end,
+    /// see [`Connecting`] and [`stale`].
     attempt: watch::Sender<u64>,
     /// The address of this actor, set when it starts. A weak address costs no allocation per
     /// command.
     me: Option<WeakAddr<Self>>,
     /// Incremented on each [`Disconnect`] and on each reconnect after a setup change. A command is
-    /// not sent again after one.
+    /// not sent again after one, see also [`stale`].
     disconnects: u64,
     /// How long the last connects took. They set the time limit of the connect tries, see
     /// [`discovery::Stall`].
@@ -582,14 +585,22 @@ impl DenonActor {
         }
     }
 
-    /// Status updates while the first connect after a connect request runs. Commands wait for
-    /// it. A retry after a failure does not count: the receiver is not reachable, so a command
-    /// fails at once and does not wait.
-    fn running_connect(&self) -> Option<watch::Receiver<DeviceStatus>> {
+    /// The status and the attempt of the first connect after a connect request, while it runs.
+    /// Commands wait for it. A retry after a failure does not count: the receiver is not reachable,
+    /// so a command fails at once and does not wait.
+    fn running_connect(&self) -> Option<Connecting> {
         (self.avr.is_none()
             && self.attempts == 0
             && *self.status_tx.borrow() == DeviceStatus::Connecting)
-            .then(|| self.status_tx.subscribe())
+            .then(|| Connecting {
+                status: self.status_tx.subscribe(),
+                attempt: self.attempt.subscribe(),
+            })
+    }
+
+    /// See [`stale`].
+    fn stale(&self, attempt: Option<&watch::Receiver<u64>>, disconnects: u64) -> bool {
+        stale(attempt, disconnects, self.disconnects)
     }
 
     /// Set the status and show it, if the shown status is different.
@@ -1095,8 +1106,9 @@ impl DenonActor {
         }
     }
 
-    /// Take the address that was found by the search. Returns true if the configuration changed:
-    /// the caller sends it to the controller, which saves it.
+    /// Take the address that was found by the host name or the search, see
+    /// `DeviceConfig::set_address`. Returns true if the configuration changed: the caller sends it
+    /// to the controller, which saves it.
     fn update_address(&mut self, address: Option<String>, version: u64) -> bool {
         let Some(address) = address else { return false };
         if self.cfg_version != version || address == self.cfg.address {
@@ -1106,7 +1118,11 @@ impl DenonActor {
             "[{}] address changed: {} -> {address}",
             self.cfg.name, self.cfg.address
         );
-        self.cfg.address = address;
+        let had_host = self.cfg.host.is_some();
+        self.cfg.set_address(address);
+        if !had_host && let Some(host) = &self.cfg.host {
+            info!("[{}] host name kept: {host}", self.cfg.name);
+        }
         // The times of the old address do not apply.
         self.connect_times = discovery::ConnectTimes::default();
         true
@@ -1349,7 +1365,7 @@ impl DenonActor {
     fn remote_run(
         &self,
         msg: &Command,
-        connecting: &mut Option<watch::Receiver<DeviceStatus>>,
+        connecting: &mut Option<Connecting>,
         ctx: &mut Context<Self>,
     ) -> Option<Result<(), ServiceError>> {
         match remote::command(&msg.cmd_id, msg.params.as_ref()) {
@@ -1367,7 +1383,7 @@ impl DenonActor {
         &self,
         run: remote::RemoteRun,
         msg: Command,
-        connecting: Option<watch::Receiver<DeviceStatus>>,
+        connecting: Option<Connecting>,
         ctx: &mut Context<Self>,
     ) {
         let lock = self.cmd_lock.clone();
@@ -1375,18 +1391,26 @@ impl DenonActor {
         let expected = self.expected.clone();
         let received = Instant::now();
         let stop = self.run_stop.subscribe();
+        let disconnects = self.disconnects;
+        let attempt = connecting.as_ref().map(|c| c.attempt.clone());
+        let deadline = msg.deadline;
         ctx.spawn(
             async move {
-                connect_ended(connecting).await;
+                let _ = timeout_at(deadline, connect_ended(connecting)).await;
             }
             .into_actor(self)
             .then(move |(), act, _| {
                 let avr = act.avr.clone();
                 let heos = act.heos.clone();
                 let name = act.cfg.name.clone();
+                let stale = act.stale(attempt.as_ref(), disconnects);
                 async move {
                     if stop.has_changed().unwrap_or(true) {
                         debug!("[{name}] {} stopped, steps sent: 0", command_name(&msg));
+                        return;
+                    }
+                    if stale {
+                        log_stale(&name, &msg);
                         return;
                     }
                     let Some(avr) = avr else {
@@ -1527,8 +1551,8 @@ async fn start_avr(
     })
 }
 
-/// Identify the receiver at the stored address, else search for it. Also gives the address if it
-/// is not the one of the configuration.
+/// Identify the receiver at the stored address, else at the addresses of the host name, else search
+/// for it. Also gives the address if it is not the one of the configuration.
 ///
 /// Another receiver at the stored address is not used: the receiver is then searched by its MAC
 /// address or serial number.
@@ -1557,9 +1581,18 @@ async fn look_up(
             }
         }
     }
+    // The host name can point to a new address.
+    if found.is_none()
+        && let Some(host) = cfg.host.as_deref().filter(|h| *h != cfg.address)
+        && let Some((avr, ip)) =
+            identify_by_name(cfg, host, known, deadline, stall, &mut last_error).await
+    {
+        address = Some(ip);
+        found = Some(avr);
+    }
     // The address can have changed: search for the MAC address or serial number.
     if found.is_none() {
-        let receivers = discovery::discover().await.map_err(Some)?;
+        let receivers = discovery::discover_for(cfg).await.map_err(Some)?;
         let Some(receiver) = discovery::find(cfg, &receivers) else {
             return Err(last_error);
         };
@@ -1573,6 +1606,51 @@ async fn look_up(
         found = Some(avr);
     }
     Ok((found.ok_or(last_error)?, address))
+}
+
+/// Resolve the host name and identify the receiver at its addresses, but not at the stored one.
+/// Gives the receiver and its address. The checks are the ones of the stored address. A failed
+/// identify goes to `last_error`.
+///
+/// The stored address can take all the time until `deadline`: the name then gets
+/// [`discovery::NETWORK_RETRY_TIMEOUT`] from now for the resolve and the identify.
+async fn identify_by_name(
+    cfg: &DeviceConfig,
+    host: &str,
+    known: Option<discovery::Known>,
+    deadline: Instant,
+    stall: &mut discovery::Stall,
+    last_error: &mut Option<AvrError>,
+) -> Option<(Avr, String)> {
+    let deadline = deadline.max(Instant::now() + discovery::NETWORK_RETRY_TIMEOUT);
+    let ips = match timeout_at(deadline.into(), discovery::resolve(host)).await {
+        Ok(Ok(ips)) => ips,
+        Ok(Err(e)) => {
+            info!("[{}] host name {host} not resolved: {e}", cfg.name);
+            return None;
+        }
+        Err(_) => {
+            info!("[{}] host name {host} not resolved in time", cfg.name);
+            return None;
+        }
+    };
+    info!("[{}] host name {host} resolved to {ips:?}", cfg.name);
+    for ip in ips.into_iter().filter(|ip| *ip != cfg.address) {
+        match discovery::identify_retry(&ip, known, deadline, stall).await {
+            Ok(avr) => match other_receiver(cfg, avr.info()) {
+                Some(e) => {
+                    info!("[{}] {e}", cfg.name);
+                    *last_error = Some(e);
+                }
+                None => return Some((avr, ip)),
+            },
+            Err(e) => {
+                debug!("[{}] address {ip} of {host} failed: {e}", cfg.name);
+                *last_error = Some(e);
+            }
+        }
+    }
+    None
 }
 
 /// The new values change how the receiver is read: the type, the port or the update method.
@@ -1601,7 +1679,7 @@ fn other_receiver(cfg: &DeviceConfig, info: &Info) -> Option<AvrError> {
 /// it wait too. One that does not read the state waits only for the receiver.
 async fn wait_turn(
     lock: Arc<tokio::sync::Mutex<()>>,
-    connecting: Option<watch::Receiver<DeviceStatus>>,
+    connecting: Option<Connecting>,
     early: watch::Receiver<Option<Arc<Avr>>>,
     without_state: bool,
     deadline: tokio::time::Instant,
@@ -1647,29 +1725,38 @@ async fn answer_by<T>(
     }
 }
 
-/// Wait until a running connect has a receiver that takes commands, or has ended, at most
-/// [`CONNECT_WAIT`].
+/// Wait until a running connect has a receiver that takes commands or has ended, or until the
+/// connection is closed or another connect starts. The caller limits the wait.
 async fn connect_usable(
-    status: Option<watch::Receiver<DeviceStatus>>,
+    connecting: Option<Connecting>,
     mut early: watch::Receiver<Option<Arc<Avr>>>,
 ) {
-    let Some(mut status) = status else { return };
-    let ended = status.wait_for(|s| *s != DeviceStatus::Connecting);
-    let usable = early.wait_for(Option::is_some);
-    let _ = timeout(CONNECT_WAIT, async {
-        tokio::select! {
-            _ = ended => {}
-            _ = usable => {}
-        }
-    })
-    .await;
+    let Some(Connecting {
+        mut status,
+        mut attempt,
+    }) = connecting
+    else {
+        return;
+    };
+    tokio::select! {
+        _ = status.wait_for(|s| *s != DeviceStatus::Connecting) => {}
+        _ = attempt.changed() => {}
+        _ = early.wait_for(Option::is_some) => {}
+    }
 }
 
-/// Wait until a running connect has ended, at most [`CONNECT_WAIT`].
-async fn connect_ended(status: Option<watch::Receiver<DeviceStatus>>) {
-    if let Some(mut status) = status {
-        let ended = status.wait_for(|s| *s != DeviceStatus::Connecting);
-        let _ = timeout(CONNECT_WAIT, ended).await;
+/// Wait until a running connect has ended, or until the connection is closed or another connect
+/// starts. The caller limits the wait.
+async fn connect_ended(connecting: Option<Connecting>) {
+    if let Some(Connecting {
+        mut status,
+        mut attempt,
+    }) = connecting
+    {
+        tokio::select! {
+            _ = status.wait_for(|s| *s != DeviceStatus::Connecting) => {}
+            _ = attempt.changed() => {}
+        }
     }
 }
 
@@ -2279,11 +2366,10 @@ async fn send_to(
 }
 
 /// Send once more a command that was surely not sent: there was no receiver, or the library
-/// answered `NotConnected`. The caller holds the command lock. It waits for a running connect, at
-/// most [`CONNECT_WAIT`] and until [`SEND_TIME`] before the deadline of `msg`. Nothing is sent after
-/// a [`Disconnect`] or a reconnect after a setup change since the command came. When nothing is
-/// sent, the answer is `Timeout` if the time was over or the connect still runs after the wait,
-/// else `NotConnected`.
+/// answered `NotConnected`. The caller holds the command lock. It waits for a running connect,
+/// until [`SEND_TIME`] before the deadline of `msg`. Nothing is sent after a [`Disconnect`] or a
+/// reconnect after a setup change since the command came. When nothing is sent, the answer is
+/// `Timeout` if the time was over or the connect still runs after the wait, else `NotConnected`.
 /// A source command sends power on and then the source: power on can be sent twice.
 pub(super) async fn send_again(
     resend: &Resend,
@@ -2294,7 +2380,7 @@ pub(super) async fn send_again(
 ) -> Result<(), ServiceError> {
     let cmd = command_name(msg);
     let not_sent = |reason: &str| {
-        debug!("[{name}] {cmd} not sent: {reason}");
+        info!("[{name}] {cmd} not sent: {reason}");
         Err(ServiceError::NotConnected)
     };
     let no_time = || {
@@ -2399,6 +2485,24 @@ fn log_no_time(name: &str, msg: &Command, received: Instant) {
     );
 }
 
+/// Whether a command that came during a connect must not be sent: since it came, a [`Disconnect`]
+/// or a reconnect after a setup change came (`then` differs from `now`), and the connection was
+/// closed or opened again. `attempt` is from [`Connecting`], `None` for a command that came while
+/// connected. Such a command, and one whose connection did not change, is sent before a
+/// disconnect closes the connection, if the disconnect gets the command lock in time, see the
+/// `Disconnect` handler.
+fn stale(attempt: Option<&watch::Receiver<u64>>, then: u64, now: u64) -> bool {
+    then != now && attempt.is_some_and(|a| a.has_changed().unwrap_or(true))
+}
+
+/// Log a command that waited for a connect and is not sent, see [`stale`].
+fn log_stale(name: &str, msg: &Command) {
+    info!(
+        "[{name}] {} not sent: disconnected or setup changed during the wait",
+        command_name(msg)
+    );
+}
+
 /// Log how long a command waited before it goes to the receiver.
 fn log_sending(name: &str, msg: &Command, received: Instant, early: bool) {
     let waited = received.elapsed().as_millis();
@@ -2441,6 +2545,7 @@ impl Handler<Command> for DenonActor {
         let expected = self.expected.clone();
         let received = Instant::now();
         let disconnects = self.disconnects;
+        let attempt = connecting.as_ref().map(|c| c.attempt.clone());
         // Only a command during a connect can run before the start ends.
         let without_state = self.avr.is_none()
             && commands::without_state(&cfg, msg.kind, &msg.cmd_id, msg.params.as_ref());
@@ -2466,6 +2571,7 @@ impl Handler<Command> for DenonActor {
                     let target = act.target(without_state);
                     let name = act.cfg.name.clone();
                     let addr = act.me.clone().unwrap_or_else(|| ctx.address().downgrade());
+                    let stale = act.stale(attempt.as_ref(), disconnects);
                     async move {
                         let guard = match guard {
                             Ok(guard) => guard,
@@ -2475,6 +2581,10 @@ impl Handler<Command> for DenonActor {
                             }
                             Err(e) => return Err(e),
                         };
+                        if stale {
+                            log_stale(&name, &msg);
+                            return Err(ServiceError::NotConnected);
+                        }
                         // The wait can end late when the actor is busy.
                         if tokio::time::Instant::now() >= deadline {
                             log_no_time(&name, &msg, received);
@@ -2556,19 +2666,58 @@ mod tests {
         assert!(waited < Duration::from_secs(1), "{waited:?}");
     }
 
+    #[test]
+    fn a_command_from_a_connect_is_stale_only_after_a_disconnect_that_closed() {
+        let (attempt_tx, attempt) = watch::channel(0);
+        // A disconnect that waits for the lock has not closed the connection yet.
+        assert!(!stale(Some(&attempt), 0, 1));
+        // A command that came while connected.
+        assert!(!stale(None, 0, 1));
+        attempt_tx.send_modify(|a| *a += 1);
+        assert!(stale(Some(&attempt), 0, 1));
+        // A reconnect that is not a disconnect or a setup change.
+        assert!(!stale(Some(&attempt), 1, 1));
+    }
+
+    #[actix::test]
+    async fn the_wait_for_a_connect_ends_when_another_connect_starts() {
+        let (_status, status) = watch::channel(DeviceStatus::Connecting);
+        let (attempt_tx, attempt) = watch::channel(0);
+        let (_early_tx, early) = watch::channel(None);
+        let connecting = || {
+            Some(Connecting {
+                status: status.clone(),
+                attempt: attempt.clone(),
+            })
+        };
+        let (usable, ended) = (
+            connect_usable(connecting(), early),
+            connect_ended(connecting()),
+        );
+        attempt_tx.send_modify(|a| *a += 1);
+        let both = async { tokio::join!(usable, ended) };
+        timeout(Duration::from_millis(500), both)
+            .await
+            .expect("the waits end");
+    }
+
     #[actix::test]
     async fn the_wait_for_a_connect_ends_before_the_deadline() {
-        let (_status, connecting) = watch::channel(DeviceStatus::Connecting);
+        let (_status, status) = watch::channel(DeviceStatus::Connecting);
+        let (_attempt, attempt) = watch::channel(0);
         for without_state in [false, true] {
             let start = Instant::now();
             let deadline = deadline_after(Duration::from_millis(200));
             let lock = Arc::default();
-            let connecting = Some(connecting.clone());
+            let connecting = Some(Connecting {
+                status: status.clone(),
+                attempt: attempt.clone(),
+            });
             // The actor keeps the sender while it runs.
             let (_early_tx, early) = watch::channel(None);
             let result = wait_turn(lock, connecting, early, without_state, deadline).await;
             assert!(matches!(result, Err(ServiceError::Timeout)));
-            // After the wait and before the end of `CONNECT_WAIT`.
+            // After the wait. The connect does not end.
             let waited = start.elapsed();
             assert!(waited >= Duration::from_millis(200), "{waited:?}");
             assert!(waited < Duration::from_secs(1), "{waited:?}");
@@ -2730,6 +2879,7 @@ mod tests {
             mac: None,
             name: "AVR".into(),
             address: "192.0.2.1".into(),
+            host: None,
             support_sound_mode: true,
             show_all_inputs: false,
             use_telnet: true,

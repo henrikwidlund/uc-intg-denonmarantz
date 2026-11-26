@@ -21,6 +21,7 @@ fn cfg() -> DeviceConfig {
         mac: None,
         name: "AVR".into(),
         address: "127.0.0.1".into(),
+        host: None,
         support_sound_mode: true,
         show_all_inputs: false,
         use_telnet: true,

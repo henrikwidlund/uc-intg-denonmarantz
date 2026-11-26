@@ -15,6 +15,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fs;
 use std::io::{self, Write};
+use std::net::{IpAddr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -81,8 +82,13 @@ pub struct DeviceConfig {
     )]
     pub mac: Option<String>,
     pub name: String,
-    /// IP address or host name.
+    /// The address that the driver connects to: an IP address, or a host name (not resolved in the
+    /// setup, or from an old configuration).
     pub address: String,
+    /// The host name from the setup, or an old `address` that was a host name. A connect resolves it
+    /// when the receiver does not answer at `address`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     #[serde(default = "default_true", deserialize_with = "true_if_null")]
     pub support_sound_mode: bool,
     #[serde(default, deserialize_with = "false_if_null")]
@@ -328,6 +334,25 @@ impl DeviceConfig {
         None
     }
 
+    /// The address for the user: the host name if there is one, else `address`.
+    pub fn shown_address(&self) -> &str {
+        self.host.as_deref().unwrap_or(&self.address)
+    }
+
+    /// Take a new address that a connect found. An old address that is not an IP address is
+    /// kept as `host` if no host name is stored. An empty old address is not kept, and neither is
+    /// an IPv6 address in brackets.
+    pub fn set_address(&mut self, address: String) {
+        let old = std::mem::replace(&mut self.address, address);
+        let bare = old
+            .strip_prefix('[')
+            .and_then(|a| a.strip_suffix(']'))
+            .unwrap_or(&old);
+        if self.host.is_none() && !bare.is_empty() && !is_ip(bare) {
+            self.host = Some(old);
+        }
+    }
+
     /// Store the serial number and the MAC address if they are not stored yet. Returns true if one
     /// was added.
     pub fn add_ids(&mut self, serial: Option<&str>, mac: Option<&str>) -> bool {
@@ -456,11 +481,11 @@ impl DeviceConfig {
         self.info.as_ref().is_none_or(|info| info.offers(query))
     }
 
-    /// Take what a device actor found on the receiver: the address, the receiver kind, the ids,
-    /// the receiver values, the missing sources, the form of the tuner presets and the names of the
-    /// presets and favorites. The other fields are settings and keep their values. `None` if
-    /// nothing changed, else whether the receiver kind, the receiver values or, in HTTP mode, the
-    /// missing sources changed: then the receiver can have other entities.
+    /// Take what a device actor found on the receiver: the address and the host name, the receiver
+    /// kind, the ids, the receiver values, the missing sources, the form of the tuner presets and
+    /// the names of the presets and favorites. The other fields are settings and keep their
+    /// values. `None` if nothing changed, else whether the receiver kind, the receiver values or,
+    /// in HTTP mode, the missing sources changed: then the receiver can have other entities.
     ///
     /// Without `current`, `found` was sent before the newest setup: only the names and the form of
     /// the tuner presets are taken, since a setup does not set them.
@@ -489,6 +514,7 @@ impl DeviceConfig {
         let new_info = found.info.is_some() && self.info != found.info;
         let new_missing = self.missing != found.missing;
         if self.address == found.address
+            && self.host == found.host
             && !new_kind
             && !new_ids
             && !new_info
@@ -513,6 +539,7 @@ impl DeviceConfig {
         }
         self.missing = found.missing;
         self.address = found.address;
+        self.host = found.host;
         self.set_kind(kind);
         // With telnet, the missing sources do not change the entities.
         Some(new_kind || new_info || (new_missing && !self.use_telnet))
@@ -561,6 +588,14 @@ fn default_if_unknown<'de, D: Deserializer<'de>, T: DeserializeOwned + Default>(
     d: D,
 ) -> Result<T, D::Error> {
     none_if_unknown(d).map(Option::unwrap_or_default)
+}
+
+/// Whether the text is an IP address: IPv4, or IPv6 with or without a zone (`fe80::1%wlan0`).
+pub fn is_ip(text: &str) -> bool {
+    text.parse::<IpAddr>().is_ok()
+        || text
+            .split_once('%')
+            .is_some_and(|(ip, zone)| !zone.is_empty() && ip.parse::<Ipv6Addr>().is_ok())
 }
 
 /// The 12 hexadecimal digits of a MAC address in uppercase. `:` and `-` between them are removed.
@@ -1015,6 +1050,7 @@ mod tests {
             mac: None,
             name: "Living Room".into(),
             address: "192.0.2.10".into(),
+            host: None,
             support_sound_mode: true,
             show_all_inputs: true,
             use_telnet: false,
@@ -1239,6 +1275,100 @@ mod tests {
             !text.contains("hdmi_output_over_http") && !text.contains("listed_queries"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_configuration_without_a_host_name_is_saved_without_it() {
+        let d: DeviceConfig =
+            serde_json::from_str(r#"{"id":"A","name":"C","address":"192.0.2.6"}"#).expect("json");
+        assert_eq!(None, d.host);
+        assert_eq!("192.0.2.6", d.shown_address());
+        let text = serde_json::to_string(&d).expect("json");
+        assert!(!text.contains(r#""host""#), "{text}");
+    }
+
+    #[test]
+    fn a_host_name_is_saved_and_loaded() {
+        let d = DeviceConfig {
+            host: Some("avr.local".into()),
+            ..device()
+        };
+        let text = serde_json::to_string(&d).expect("json");
+        assert!(text.contains(r#""host":"avr.local""#), "{text}");
+        let loaded: DeviceConfig = serde_json::from_str(&text).expect("json");
+        assert_eq!(d, loaded);
+        assert_eq!("avr.local", loaded.shown_address());
+        assert_eq!("192.0.2.10", loaded.address);
+    }
+
+    #[test]
+    fn is_ip_accepts_only_ip_addresses() {
+        for ip in [
+            "192.0.2.6",
+            "fe80::1",
+            "fe80::1%en0",
+            "fe80::1%wlan0",
+            "::1",
+        ] {
+            assert!(is_ip(ip), "{ip}");
+        }
+        for name in [
+            "avr.local",
+            "localhost",
+            "avr",
+            "192.0.2",
+            "foo:bar",
+            "1:2:3",
+            "fe80::1%",
+            "192.0.2.6.example",
+        ] {
+            assert!(!is_ip(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_new_address_keeps_the_host_name() {
+        let with = |address: &str, host: Option<&str>| DeviceConfig {
+            address: address.into(),
+            host: host.map(Into::into),
+            ..device()
+        };
+        let set = |mut cfg: DeviceConfig| {
+            cfg.set_address("192.0.2.20".into());
+            (cfg.address, cfg.host)
+        };
+        let moved = |host: Option<&str>| ("192.0.2.20".to_owned(), host.map(str::to_owned));
+        // A stored host name stays.
+        assert_eq!(moved(Some("avr")), set(with("192.0.2.10", Some("avr"))));
+        assert_eq!(moved(Some("avr")), set(with("old.local", Some("avr"))));
+        // An old address that is a host name becomes the host name.
+        assert_eq!(moved(Some("old.local")), set(with("old.local", None)));
+        // An old IP address is not kept.
+        assert_eq!(moved(None), set(with("192.0.2.10", None)));
+        assert_eq!(moved(None), set(with("fe80::1", None)));
+        // An empty old address is not kept.
+        assert_eq!(moved(None), set(with("", None)));
+        // An IPv6 address in brackets is not kept.
+        assert_eq!(moved(None), set(with("[::1]", None)));
+    }
+
+    #[test]
+    fn the_host_name_of_a_connect_is_taken() {
+        let mut cfg = device();
+        let found = DeviceConfig {
+            address: "192.0.2.20".into(),
+            host: Some("avr.local".into()),
+            ..device()
+        };
+        assert_eq!(Some(false), cfg.take_found(found.clone(), true));
+        assert_eq!(found, cfg);
+        assert_eq!(None, cfg.take_found(found, true));
+        let host_only = DeviceConfig {
+            host: Some("other.local".into()),
+            ..cfg.clone()
+        };
+        assert_eq!(Some(false), cfg.take_found(host_only, true));
+        assert_eq!(Some("other.local"), cfg.host.as_deref());
     }
 
     #[test]
