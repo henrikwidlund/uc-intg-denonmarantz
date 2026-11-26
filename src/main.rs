@@ -20,10 +20,14 @@ mod startup;
 mod test_support;
 mod util;
 
-/// Counts the allocations of the tests that measure them.
-#[cfg(test)]
+/// Counts the allocations of the `dhat_` tests.
+#[cfg(all(test, feature = "dhat-heap"))]
 #[global_allocator]
 static ALLOCATOR: dhat::Alloc = dhat::Alloc;
+// Builds that are not tests do not use dhat. This line keeps the `unused_crate_dependencies` lint
+// quiet.
+#[cfg(all(not(test), feature = "dhat-heap"))]
+use dhat as _;
 
 use crate::configuration::{ENV_DISABLE_MDNS_PUBLISH, Settings};
 use crate::controller::Controller;

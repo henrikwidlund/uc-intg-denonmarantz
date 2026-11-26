@@ -53,7 +53,9 @@ Describe breaking changes in the PR and explain why they are needed.
     ```
     cargo fmt --all --check
     cargo clippy --locked --all-targets -- -D warnings
+    cargo clippy --locked --all-targets --features dhat-heap -- -D warnings
     cargo test --locked
+    cargo test --locked --features dhat-heap dhat_ -- --ignored --test-threads=1
     cargo deny check
     ```
     - All checks must pass.

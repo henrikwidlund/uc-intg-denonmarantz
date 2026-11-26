@@ -2,14 +2,39 @@
 // SPDX-License-Identifier: MPL-2.0
 
 //! Allocations of the entity update path. Every burst of events of the receiver builds the
-//! attributes of all entities. Run it alone, because the counter is global:
-//! `cargo test --locked alloc_tests -- --ignored --nocapture`.
+//! attributes of all entities. dhat counts the allocations of all threads, so run these tests
+//! alone: `cargo test --locked --features dhat-heap dhat_ -- --ignored --test-threads=1`.
+//! Add `--nocapture` to see the measured values.
 
 use super::{EntityKind, SensorKind, View, attributes};
 use crate::config_store::DeviceConfig;
 use denon_marantz::State;
 use denon_marantz::proto::telnet::Message;
 use serde_json::Map;
+use std::sync::{Mutex, PoisonError};
+
+/// Runs of the measured code in each test.
+const RUNS: u64 = 100;
+
+/// Only one dhat profiler can run at a time.
+static LOCK: Mutex<()> = Mutex::new(());
+
+/// Runs `warm_up` once, then `f` [`RUNS`] times. Returns the mean allocations and bytes of one run
+/// of `f`, rounded up.
+fn measure(warm_up: impl FnOnce(), mut f: impl FnMut()) -> (u64, u64) {
+    let _lock = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let _profiler = dhat::Profiler::builder().testing().build();
+    warm_up();
+    let before = dhat::HeapStats::get();
+    for _ in 0..RUNS {
+        f();
+    }
+    let after = dhat::HeapStats::get();
+    (
+        (after.total_blocks - before.total_blocks).div_ceil(RUNS),
+        (after.total_bytes - before.total_bytes).div_ceil(RUNS),
+    )
+}
 
 fn cfg() -> DeviceConfig {
     DeviceConfig {
@@ -68,11 +93,13 @@ fn state() -> State {
     state
 }
 
-/// The attributes of the entities that `keep` takes, as `emit` builds them.
+/// The attributes of all entities. Returns the number of attributes.
 fn build(state: &State, cfg: &DeviceConfig) -> usize {
     build_some(state, cfg, |_| true)
 }
 
+/// The attributes of the entities that `keep` takes, as `emit` builds them. Returns the number of
+/// attributes.
 fn build_some(state: &State, cfg: &DeviceConfig, keep: impl Fn(EntityKind) -> bool) -> usize {
     let view = View {
         state,
@@ -95,52 +122,43 @@ fn build_some(state: &State, cfg: &DeviceConfig, keep: impl Fn(EntityKind) -> bo
 }
 
 #[test]
-#[ignore = "measures allocations: run it alone"]
-fn the_update_path_allocations() {
-    let _profiler = dhat::Profiler::builder().testing().build();
+#[ignore = "counts the allocations of all threads: run it alone"]
+fn dhat_update_path() {
     let (state, cfg) = (state(), cfg());
-    // Warm up the tables that are built once.
-    build(&state, &cfg);
-    let before = dhat::HeapStats::get();
-    let runs = 100;
     let mut keys = 0;
-    for _ in 0..runs {
-        keys += build(&state, &cfg);
-    }
-    let after = dhat::HeapStats::get();
-    let blocks = after.total_blocks - before.total_blocks;
-    let bytes = after.total_bytes - before.total_bytes;
+    // The warm-up builds the tables that are built once.
+    let (blocks, bytes) = measure(
+        || {
+            keys = build(&state, &cfg);
+        },
+        || {
+            std::hint::black_box(build(&state, &cfg));
+        },
+    );
     println!(
-        "entities {}, attributes {}, per update: {} allocations, {} bytes",
+        "entities {}, attributes {keys}, per update: {blocks} allocations, {bytes} bytes",
         EntityKind::all(&cfg).count(),
-        keys / runs,
-        blocks / u64::try_from(runs).unwrap_or(1),
-        bytes / u64::try_from(runs).unwrap_or(1)
     );
+    assert!(blocks <= 750, "{blocks} allocations");
 }
 
 #[test]
-#[ignore = "measures allocations: run it alone"]
-fn the_state_copy_allocations() {
-    let _profiler = dhat::Profiler::builder().testing().build();
+#[ignore = "counts the allocations of all threads: run it alone"]
+fn dhat_state_copy() {
     let state = state();
-    let before = dhat::HeapStats::get();
-    let runs = 100_u64;
-    for _ in 0..runs {
-        std::hint::black_box(state.clone());
-    }
-    let after = dhat::HeapStats::get();
-    println!(
-        "a copy of the state: {} allocations, {} bytes",
-        (after.total_blocks - before.total_blocks) / runs,
-        (after.total_bytes - before.total_bytes) / runs
+    let (blocks, bytes) = measure(
+        || {},
+        || {
+            std::hint::black_box(state.clone());
+        },
     );
+    println!("a copy of the state: {blocks} allocations, {bytes} bytes");
+    assert!(blocks <= 10, "{blocks} allocations");
 }
 
 #[test]
-#[ignore = "measures allocations: run it alone"]
-fn the_volume_update_allocations() {
-    let _profiler = dhat::Profiler::builder().testing().build();
+#[ignore = "counts the allocations of all threads: run it alone"]
+fn dhat_volume_update() {
     let (state, cfg) = (state(), cfg());
     let keep = |kind| {
         matches!(
@@ -149,16 +167,14 @@ fn the_volume_update_allocations() {
                 | EntityKind::Sensor(SensorKind::VolumeDb | SensorKind::VolumeAbsolute)
         )
     };
-    build_some(&state, &cfg, keep);
-    let before = dhat::HeapStats::get();
-    let runs = 100_u64;
-    for _ in 0..runs {
-        build_some(&state, &cfg, keep);
-    }
-    let after = dhat::HeapStats::get();
-    println!(
-        "per volume update: {} allocations, {} bytes",
-        (after.total_blocks - before.total_blocks) / runs,
-        (after.total_bytes - before.total_bytes) / runs
+    let (blocks, bytes) = measure(
+        || {
+            build_some(&state, &cfg, keep);
+        },
+        || {
+            std::hint::black_box(build_some(&state, &cfg, keep));
+        },
     );
+    println!("per volume update: {blocks} allocations, {bytes} bytes");
+    assert!(blocks <= 64, "{blocks} allocations");
 }

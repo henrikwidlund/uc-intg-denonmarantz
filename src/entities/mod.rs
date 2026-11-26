@@ -16,7 +16,7 @@ pub mod sensor;
 pub mod simple_commands;
 pub mod switch;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "dhat-heap"))]
 mod alloc_tests;
 #[cfg(test)]
 mod output_tests;

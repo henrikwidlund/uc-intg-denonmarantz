@@ -278,9 +278,21 @@ example in Docker, takes them from `UC_VERSION` and `UC_RELEASE_DATE` (`YYYY-MM-
 ```shell
 cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --all-targets --features dhat-heap -- -D warnings
 cargo test --locked
 cargo deny check
 ```
+
+The allocation tests use dhat. They count the allocations of all threads, so they run alone:
+
+```shell
+cargo test --locked --features dhat-heap dhat_ -- --ignored --test-threads=1
+```
+
+Each test fails when the mean allocations of one run, rounded up, are above its limit. The limit is the count
+measured with the minimum Rust version (`rust-version` in `Cargo.toml`), which CI uses. Add `--nocapture` to
+see the measured allocations and bytes. A new test is named `dhat_…`, is marked `#[ignore]` and goes in
+`src/entities/alloc_tests.rs`, which builds only with the `dhat-heap` feature.
 
 `tools/manual_test.sh` runs the tests that need a real Remote or a person, one step at a time: the setup pages,
 the entity lists, the buttons, the sleep of the Remote and a real signal. It saves the results to
