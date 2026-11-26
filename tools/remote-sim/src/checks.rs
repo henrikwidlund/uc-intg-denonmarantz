@@ -987,6 +987,171 @@ pub async fn remote_wake(ctx: &mut Ctx) -> Check {
     Ok(format!("state {first} after {took} ms"))
 }
 
+/// The waits in ms in [`quick_wake`]: from a wake-up to the next standby, and from that standby
+/// to the next wake-up. A connect takes about 30 to 60 ms. A short first wait sends the standby
+/// while the connect still runs. A long first wait with a short second wait sends the wake-up
+/// while the old link still closes.
+const QUICK_GAPS_MS: [(u64, u64); 6] =
+    [(0, 0), (20, 20), (100, 0), (100, 5), (100, 20), (400, 400)];
+
+/// The status names of the driver.
+const STATUSES: [&str; 4] = ["Disconnected", "Connecting", "Connected", "Error"];
+
+/// The new status of a status line of the driver log, for example `Connected`.
+fn new_status(line: &str) -> Option<&str> {
+    if !line.contains("] status ") {
+        return None;
+    }
+    let (_, status) = line.rsplit_once(" -> ")?;
+    let status = status.trim();
+    STATUSES.contains(&status).then_some(status)
+}
+
+/// The status of the last status line of the driver log.
+fn last_status(log: &str) -> Option<&str> {
+    log.lines().rev().find_map(new_status)
+}
+
+/// The number of status lines of the driver log that change to `status`.
+fn status_count(log: &str, status: &str) -> usize {
+    log.lines()
+        .filter(|l| new_status(l) == Some(status))
+        .count()
+}
+
+/// Parts of driver log lines for a failed connect of a receiver.
+const FAILED_LINES: [&str; 2] = ["] connect failed: ", "] not found on the network"];
+
+/// Part of a driver log line for a connect that a disconnect stopped.
+const CANCEL_LINE: &str = "] connect canceled";
+
+/// The number of failed receiver connects in the driver log.
+fn failed_connects(log: &str) -> usize {
+    count_lines(log, &FAILED_LINES)
+}
+
+/// The number of canceled receiver connects in the driver log.
+fn canceled_connects(log: &str) -> usize {
+    log.matches(CANCEL_LINE).count()
+}
+
+/// The time of the last full connect in the driver log, in ms.
+fn connect_ms(log: &str) -> Option<u64> {
+    let (_, rest) = log.rsplit_once("] connected in ")?;
+    rest.split_once(" ms")?.0.parse().ok()
+}
+
+/// Driver log line for a telnet link that did not open at the connect. The driver tries again.
+const TELNET_RETRY: &str = "] telnet not open, trying again";
+
+/// Checks the driver log after the last wake-up of [`quick_wake`]: no failed connect since the
+/// step started, then exactly one connect and no drop. The telnet link must not be lost and must be
+/// open again after a telnet retry. With `telnet`, it must open. Returns the number of telnet
+/// retry lines after the last wake-up. The driver logs at most one for each connect.
+fn after_wake(tail: &str, failed: usize, telnet: bool) -> Result<usize, String> {
+    if failed > 0 {
+        return Err(format!("connects failed: {failed}"));
+    }
+    let connects = status_count(tail, "Connected");
+    let drops = status_count(tail, "Disconnected") + status_count(tail, "Error");
+    if connects != 1 || drops != 0 {
+        return Err(format!(
+            "after the last exit_standby: {connects} connects, {drops} drops"
+        ));
+    }
+    if LOSS_LINES.iter().any(|l| tail.contains(&format!("] {l}"))) {
+        return Err("telnet link lost after the last exit_standby".to_owned());
+    }
+    if let Some(at) = tail.rfind(TELNET_RETRY)
+        && !tail[at..].contains("] telnet connected")
+    {
+        return Err("telnet not open after the last exit_standby".to_owned());
+    }
+    if telnet && !tail.contains("] telnet connected") {
+        return Err("telnet not connected after the last exit_standby".to_owned());
+    }
+    Ok(tail.matches(TELNET_RETRY).count())
+}
+
+/// Wait until the last status line of the driver log shows `status`. Returns the length of the
+/// log in which it was seen.
+async fn wait_status(ctx: &mut Ctx, status: &str, secs: u64) -> Result<usize, Fail> {
+    debug_assert!(STATUSES.contains(&status), "{status}");
+    let start = Instant::now();
+    loop {
+        let log = ctx.driver.log_text().await;
+        let last = last_status(&log);
+        if last == Some(status) {
+            return Ok(log.len());
+        }
+        ensure!(
+            start.elapsed() < Duration::from_secs(secs),
+            "status {}, not {status}, after {secs} s",
+            last.unwrap_or("none")
+        );
+        ctx.client.listen_ms(200).await?;
+    }
+}
+
+/// The standby and wake-up events of [`quick_wake`], up to the last standby. Returns the length of
+/// the driver log in which the driver is disconnected.
+async fn standby_burst(ctx: &mut Ctx) -> Result<usize, Fail> {
+    ctx.client.send_event("enter_standby").await?;
+    wait_status(ctx, "Disconnected", 5).await?;
+    for (awake, asleep) in QUICK_GAPS_MS {
+        ctx.client.send_event("exit_standby").await?;
+        ctx.client.listen_ms(awake).await?;
+        ctx.client.send_event("enter_standby").await?;
+        ctx.client.listen_ms(asleep).await?;
+    }
+    wait_status(ctx, "Disconnected", 3).await
+}
+
+/// The Remote wakes up and goes to standby again with short gaps. With the short gaps, a standby
+/// can come while a connect still runs, and a wake-up while the old link still closes. After the
+/// last standby the driver must disconnect from the receiver. No connect may fail during the
+/// step. After the last wake-up the driver must connect once, stay connected and show the values
+/// of the receiver. If the step fails before the last wake-up, the Remote wakes up again. The
+/// result shows the connect time of the driver, how many connects were canceled in the step and
+/// how many telnet retry lines came after the last wake-up.
+pub async fn quick_wake(ctx: &mut Ctx) -> Check {
+    ensure_on(ctx).await?;
+    let log = ctx.driver.log_text().await;
+    ensure!(!log.is_empty(), "the driver log is empty");
+    let config = read_config(ctx).await?;
+    let telnet = config_device(ctx, &config)?["use_telnet"] != false;
+    let failed_before = failed_connects(&log);
+    let canceled_before = canceled_connects(&log);
+    let from = match standby_burst(ctx).await {
+        Ok(from) => from,
+        Err(e) => {
+            // Wake the Remote up again, else the next checks run in standby.
+            let undo = async {
+                ctx.client.send_event("exit_standby").await?;
+                wait_status(ctx, "Connected", 8).await.map(|_| ())
+            }
+            .await;
+            return first_error(Err(e), undo);
+        }
+    };
+    ctx.client.send_event("exit_standby").await?;
+    wait_status(ctx, "Connected", 8).await?;
+    ctx.client.listen(2).await?;
+    let log = ctx.driver.log_text().await;
+    let tail = log.get(from..).unwrap_or_default();
+    let failed = failed_connects(&log).saturating_sub(failed_before);
+    let retries = after_wake(tail, failed, telnet).map_err(Fail::new)?;
+    let ms = connect_ms(tail).map_or_else(|| "?".to_owned(), |ms| ms.to_string());
+    let canceled = canceled_connects(&log).saturating_sub(canceled_before);
+    ctx.client.refresh_states().await?;
+    let state = wait_available(ctx, 5).await?;
+    verify_fresh(ctx).await?;
+    Ok(format!(
+        "driver connect {ms} ms, state {state}, {canceled} canceled connects, \
+         {retries} telnet retry lines after the last exit_standby"
+    ))
+}
+
 /// The longest wait for the driver to connect again after the network restart of the receiver.
 const RESTART_LIMIT: Duration = Duration::from_secs(180);
 
@@ -3927,6 +4092,159 @@ mod tests {
             assert!(!may_send_source(&opt, &tuner, false), "{code}");
             assert!(may_send_source(&opt, &tuner, true), "{code}");
         }
+    }
+
+    #[test]
+    fn quick_gaps_cover_both_races() {
+        assert!(
+            QUICK_GAPS_MS.iter().any(|&(awake, _)| awake < 30),
+            "a standby while a connect runs"
+        );
+        assert!(
+            QUICK_GAPS_MS
+                .iter()
+                .any(|&(awake, asleep)| awake >= 100 && asleep == 0),
+            "a wake-up while the old link closes"
+        );
+    }
+
+    #[test]
+    fn last_status_reads_the_last_status_line() {
+        assert_eq!(None, last_status(""));
+        assert_eq!(None, last_status("[A] connected in 20 ms\n"));
+        let log = "[A] status Disconnected -> Connecting\n\
+                   [A] status Connecting -> Connected\n\
+                   [A] connected in 20 ms\n";
+        assert_eq!(Some("Connected"), last_status(log));
+        let log = format!("{log}[A] status Connected -> Disconnected\r\n");
+        assert_eq!(Some("Disconnected"), last_status(&log));
+        let log = "[2026-11-26T10:00:00.000Z DEBUG uc_intg_denonmarantz::device::actor] \
+                   [A] status Disconnected -> Connecting\n\
+                   [2026-11-26T10:00:00.050Z DEBUG denon_marantz::avr] status page not available\n";
+        assert_eq!(
+            Some("Connecting"),
+            last_status(log),
+            "a line without -> does not count"
+        );
+        let log = format!("{log}[ws1] -> {{\"kind\":\"event\"}}\n");
+        assert_eq!(
+            Some("Connecting"),
+            last_status(&log),
+            "a WebSocket line does not count"
+        );
+        let log = format!("{log}[A] status Connecting -> Error\n");
+        assert_eq!(Some("Error"), last_status(&log));
+        assert_eq!(None, new_status("[A] status Connected -> Foo"));
+        assert_eq!(
+            Some("Connected"),
+            last_status("[A] status Connecting -> Connected\n[A] status Connected -> Disconn"),
+            "a cut last line does not count"
+        );
+    }
+
+    #[test]
+    fn status_count_counts_one_new_status() {
+        let log = "[A] status Disconnected -> Connecting\n\
+                   [A] status Connecting -> Connected\n\
+                   [A] status Connected -> Disconnected\n\
+                   [A] status Disconnected -> Connected\r\n\
+                   [ws1] -> Connected\n";
+        assert_eq!(2, status_count(log, "Connected"));
+        assert_eq!(1, status_count(log, "Disconnected"));
+        assert_eq!(0, status_count(log, "Error"));
+        assert_eq!(0, status_count("", "Connected"));
+        let log = "[A] address changed: 1 -> 2\n\
+                   [A] status page failed: a -> b\n\
+                   [A -> B] status Connecting -> Connected\n";
+        assert_eq!(1, status_count(log, "Connected"));
+        assert_eq!(Some("Connected"), last_status(log));
+        assert_eq!(None, new_status("[A] status page failed: a -> b"));
+    }
+
+    #[test]
+    fn connect_ms_reads_the_last_connect() {
+        assert_eq!(None, connect_ms(""));
+        assert_eq!(None, connect_ms("[A] connected in ? ms\n"));
+        let log = "[A] connected in 20 ms\n\
+                   [A] connected in 45 ms\n";
+        assert_eq!(Some(45), connect_ms(log));
+    }
+
+    #[test]
+    fn after_wake_needs_one_connect_and_no_drop() {
+        let one = "[A] status Disconnected -> Connecting\n\
+                   [A] status Connecting -> Connected\n";
+        assert_eq!(Ok(0), after_wake(one, 0, false));
+        assert_eq!(
+            Err("connects failed: 1".to_owned()),
+            after_wake(one, 1, false)
+        );
+        assert!(after_wake("", 0, false).is_err(), "no connect");
+        let dropped = format!(
+            "{one}[A] status Connected -> Disconnected\n\
+             [A] status Disconnected -> Connecting\n\
+             [A] status Connecting -> Connected\n"
+        );
+        assert_eq!(
+            Err("after the last exit_standby: 2 connects, 1 drops".to_owned()),
+            after_wake(&dropped, 0, false)
+        );
+        let error = format!("{one}[A] status Connected -> Error\n");
+        assert!(after_wake(&error, 0, false).is_err(), "error status");
+        let retry = format!("{one}[A] telnet not open, trying again: refused\n");
+        assert_eq!(
+            Err("telnet not open after the last exit_standby".to_owned()),
+            after_wake(&retry, 0, true)
+        );
+        let open = format!("{retry}[A] telnet connected\n");
+        assert_eq!(Ok(1), after_wake(&open, 0, true));
+        let lib = format!("{retry}[ts DEBUG denon_marantz::telnet] telnet connected host=h\n");
+        assert_eq!(Ok(1), after_wake(&lib, 0, true), "the library line counts");
+        let lost = format!("{open}[A] telnet disconnected\n");
+        assert_eq!(
+            Err("telnet link lost after the last exit_standby".to_owned()),
+            after_wake(&lost, 0, true)
+        );
+        let lib_lost = format!(
+            "{open}[ts DEBUG denon_marantz::telnet] telnet connection lost host=h \
+             reason=closed by the receiver\n"
+        );
+        assert_eq!(
+            Err("telnet link lost after the last exit_standby".to_owned()),
+            after_wake(&lib_lost, 0, true)
+        );
+        let again = format!("{open}[A] telnet not open, trying again: refused\n");
+        assert!(
+            after_wake(&again, 0, true).is_err(),
+            "only a later open counts"
+        );
+        assert_eq!(
+            Err("telnet not connected after the last exit_standby".to_owned()),
+            after_wake(one, 0, true)
+        );
+        let started = format!("{one}[ts DEBUG denon_marantz::telnet] telnet connected host=h\n");
+        assert_eq!(Ok(0), after_wake(&started, 0, true));
+    }
+
+    #[test]
+    fn failed_connects_counts_only_receiver_connects() {
+        let log = "[A] connect failed: timeout\n\
+                   [A] not found on the network\n\
+                   [A] HEOS connect failed: refused\n\
+                   telnet reconnect failed\n\
+                   HEOS reconnect failed\n\
+                   [A] connect with the stored values failed: timeout\n";
+        assert_eq!(2, failed_connects(log));
+        assert_eq!(0, failed_connects(""));
+    }
+
+    #[test]
+    fn canceled_connects_counts_cancel_lines() {
+        let log = "[A] connect canceled\n\
+                   [A] connect canceled\n\
+                   [A] result of an old connect attempt ignored\n";
+        assert_eq!(2, canceled_connects(log));
+        assert_eq!(0, canceled_connects(""));
     }
 
     #[test]

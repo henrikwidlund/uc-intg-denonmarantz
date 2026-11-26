@@ -22,7 +22,7 @@ use std::time::Instant;
 use ws::Client;
 
 /// All steps in the order of [`run`].
-const STEPS: [&str; 30] = [
+const STEPS: [&str; 31] = [
     "metadata",
     "setup",
     "entities",
@@ -32,6 +32,7 @@ const STEPS: [&str; 30] = [
     "remote_ui",
     "standby",
     "remote_wake",
+    "quick_wake",
     "unused_receiver",
     "selects",
     "remote_commands",
@@ -495,6 +496,7 @@ async fn middle_steps(ctx: &mut Ctx) {
     ctx.step("remote_ui", checks::remote_ui).await;
     ctx.step("standby", checks::standby).await;
     ctx.step("remote_wake", checks::remote_wake).await;
+    ctx.step("quick_wake", checks::quick_wake).await;
     ctx.step("unused_receiver", checks::unused_receiver).await;
     ctx.step("selects", checks::selects).await;
     ctx.step("remote_commands", checks::remote_commands).await;
