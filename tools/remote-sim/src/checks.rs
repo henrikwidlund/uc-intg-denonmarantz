@@ -2572,6 +2572,12 @@ async fn restart(ctx: &mut Ctx) -> Result<(), Fail> {
     ctx.reconnect().await
 }
 
+/// Start the driver again without `RUST_LOG` and connect a new Remote.
+async fn restart_plain(ctx: &mut Ctx) -> Result<(), Fail> {
+    ctx.driver.start_with(false).await?;
+    ctx.reconnect().await
+}
+
 /// The power that the media player must show after a start of the driver.
 #[derive(Debug, PartialEq)]
 enum ShownPower {
@@ -2652,6 +2658,187 @@ pub async fn driver_restart(ctx: &mut Ctx) -> Check {
         ids.len(),
         start.elapsed().as_millis()
     ))
+}
+
+/// Settings file of the driver. It holds the debug log option.
+const SETTINGS_FILE: &str = "settings.json";
+
+/// Number of debug lines in `log`. The level is the second word of a log line, so a receiver
+/// text in another line does not count.
+fn debug_lines(log: &str) -> usize {
+    log.lines()
+        .filter(|l| l.starts_with('[') && l.split(' ').nth(1) == Some("DEBUG"))
+        .count()
+}
+
+/// Size of the driver log in bytes. 0 if it cannot be read.
+async fn log_size(ctx: &Ctx) -> usize {
+    tokio::fs::metadata(&ctx.driver.log)
+        .await
+        .map_or(0, |m| usize::try_from(m.len()).unwrap_or(usize::MAX))
+}
+
+/// The log after byte `start`.
+async fn log_after(ctx: &Ctx, start: usize) -> String {
+    let mut text = ctx.driver.log_text().await;
+    if text.is_char_boundary(start) {
+        text.split_off(start)
+    } else {
+        String::new()
+    }
+}
+
+/// Turn the debug log option on or off with "Save settings" in the configuration mode.
+async fn save_debug_log(ctx: &mut Ctx, on: bool) -> Result<(), Fail> {
+    let key = ctx.key.clone();
+    ctx.client.clear_setup();
+    ctx.client
+        .request_ok(
+            "setup_driver",
+            json!({ "reconfigure": true, "setup_data": {} }),
+        )
+        .await?;
+    let page = ctx.client.next_page(10).await?;
+    ensure!(
+        field_ids(&page).iter().any(|f| f == "debug_log"),
+        "configuration mode page without debug_log: {page}"
+    );
+    ctx.client
+        .answer(json!({ "choice": key, "action": "settings", "debug_log": on.to_string() }))
+        .await?;
+    ctx.client.setup_done(20).await
+}
+
+/// Wait up to 2 s until the settings file holds `on` for the debug log. The driver writes the
+/// file in another thread after the setup ends.
+async fn wait_settings(ctx: &Ctx, on: bool) -> Result<(), Fail> {
+    let settings = ctx.driver.dir.join(SETTINGS_FILE);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let saved = tokio::fs::read_to_string(&settings)
+            .await
+            .unwrap_or_default();
+        let value = serde_json::from_str::<Value>(&saved)
+            .ok()
+            .and_then(|v| v["debug_log"].as_bool());
+        if value == Some(on) {
+            return Ok(());
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "{SETTINGS_FILE} after 2 s, debug log {on} expected: {saved}"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Start the driver with the debug log option off, turn it on with the setup, then off, then
+/// start the driver with the option on. The driver starts without `RUST_LOG`, because `RUST_LOG`
+/// overrides the option.
+async fn debug_log_checks(ctx: &mut Ctx) -> Check {
+    let settings = ctx.driver.dir.join(SETTINGS_FILE);
+    ctx.driver.stop().await;
+    tokio::fs::write(&settings, r#"{"debug_log":false}"#).await?;
+    let start = log_size(ctx).await;
+    restart_plain(ctx).await?;
+    entity_ids(ctx).await?;
+    let log = log_after(ctx, start).await;
+    ensure!(
+        debug_lines(&log) == 0,
+        "{} debug lines with the option off",
+        debug_lines(&log)
+    );
+
+    let start = log_size(ctx).await;
+    save_debug_log(ctx, true).await?;
+    entity_ids(ctx).await?;
+    let log = log_after(ctx, start).await;
+    ensure!(
+        !log.contains("RUST_LOG is used instead"),
+        "the driver uses RUST_LOG, but it was started without it"
+    );
+    let on = log
+        .find("debug log on")
+        .ok_or_else(|| Fail::new("no 'debug log on' line after the option was saved"))?;
+    ensure!(
+        debug_lines(&log[on..]) > 0,
+        "no debug lines after the option was turned on"
+    );
+    wait_settings(ctx, true).await?;
+
+    let start = log_size(ctx).await;
+    save_debug_log(ctx, false).await?;
+    entity_ids(ctx).await?;
+    let log = log_after(ctx, start).await;
+    let off = log
+        .find("debug log off")
+        .ok_or_else(|| Fail::new("no 'debug log off' line after the option was saved"))?;
+    let after = debug_lines(&log[off..]);
+    ensure!(
+        after == 0,
+        "{after} debug lines after the option was turned off"
+    );
+
+    wait_settings(ctx, false).await?;
+
+    save_debug_log(ctx, true).await?;
+    wait_settings(ctx, true).await?;
+    ctx.driver.stop().await;
+    let start = log_size(ctx).await;
+    restart_plain(ctx).await?;
+    entity_ids(ctx).await?;
+    let log = log_after(ctx, start).await;
+    ensure!(
+        log.contains("Debug log is on"),
+        "no 'Debug log is on' line after a start with the option on"
+    );
+    ensure!(
+        debug_lines(&log) > 0,
+        "no debug lines after a start with the option on"
+    );
+    Ok("option on, off and on after a start".to_owned())
+}
+
+/// The debug log option of the setup. The driver of the other checks gets `RUST_LOG`, so the
+/// option has no effect there. At the end the settings file is set back and the driver is started
+/// again with `RUST_LOG`.
+pub async fn debug_log(ctx: &mut Ctx) -> Check {
+    let settings = ctx.driver.dir.join(SETTINGS_FILE);
+    let before = match tokio::fs::read(&settings).await {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    let result = debug_log_checks(ctx).await;
+    ctx.driver.stop().await;
+    let file = match &before {
+        Some(bytes) => tokio::fs::write(&settings, bytes).await.map_err(Fail::from),
+        None => match tokio::fs::remove_file(&settings).await {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        },
+    };
+    let started = async {
+        // Start once more, else all later steps fail without a driver. A failed first start is
+        // still a failure.
+        let first = match restart(ctx).await {
+            Err(e) => {
+                restart(ctx)
+                    .await
+                    .map_err(|again| Fail::new(format!("{e}; second start: {again}")))?;
+                Err(e)
+            }
+            Ok(()) => Ok(()),
+        };
+        let ready = async {
+            subscribe_all(ctx).await?;
+            wait_available(ctx, 20).await.map(|_| ())
+        }
+        .await;
+        join_errors(first, ready)
+    }
+    .await;
+    first_error(result, join_errors(file, started))
 }
 
 /// The file of the Python integration: only its fields, and the serial number is the id. The
@@ -4295,6 +4482,16 @@ mod tests {
             assert!(!may_send_source(&opt, &tuner, false), "{code}");
             assert!(may_send_source(&opt, &tuner, true), "{code}");
         }
+    }
+
+    #[test]
+    fn debug_lines_count_only_the_level() {
+        let log = "[2026-11-26T10:00:00.123Z DEBUG uc_intg_denonmarantz] [A] <- {}\n\
+            [2026-11-26T10:00:00.124Z INFO  uc_intg_denonmarantz] title: A DEBUG song\n\
+            DEBUG at the start\n\
+            [2026-11-26T10:00:00.125Z DEBUG denon_marantz] connected\n";
+        assert_eq!(2, debug_lines(log));
+        assert_eq!(0, debug_lines(""));
     }
 
     #[test]

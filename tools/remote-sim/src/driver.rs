@@ -30,7 +30,14 @@ impl Driver {
         }
     }
 
+    /// Start the driver with [`log_filter`] as `RUST_LOG`.
     pub async fn start(&mut self) -> Result<(), Fail> {
+        self.start_with(true).await
+    }
+
+    /// Start the driver. Without `rust_log`, the driver gets no `RUST_LOG`, so the setup option
+    /// sets the debug log.
+    pub async fn start_with(&mut self, rust_log: bool) -> Result<(), Fail> {
         self.stop().await;
         // The child process needs a file of the standard library.
         let log = tokio::fs::OpenOptions::new()
@@ -40,15 +47,21 @@ impl Driver {
             .await?
             .into_std()
             .await;
-        let child = Command::new(&self.bin)
+        let mut command = Command::new(&self.bin);
+        command
             .env("UC_CONFIG_HOME", &self.dir)
             .env("UC_INTEGRATION_INTERFACE", "127.0.0.1")
             .env("UC_INTEGRATION_HTTP_PORT", self.port.to_string())
-            .env("UC_DISABLE_MDNS_PUBLISH", "true")
-            .env(
+            .env("UC_DISABLE_MDNS_PUBLISH", "true");
+        if rust_log {
+            command.env(
                 "RUST_LOG",
                 log_filter(std::env::var("RUST_LOG").ok().as_deref()),
-            )
+            );
+        } else {
+            command.env_remove("RUST_LOG");
+        }
+        let child = command
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log)

@@ -329,10 +329,9 @@ the volume buttons still work while it runs." \
 step "Configure, remove and options" \
 "At least one receiver is configured." \
 "Setup > Configure selected device: change the volume step and 'Show all sources'. Setup > Configuration
-mode: change the debug log option and choose 'Save settings'. Then add and remove a receiver if you have a
-second one." \
+mode: add and remove a receiver if you have a second one." \
 "The changes work without a restart. A new volume step is used at once. With 'Show all sources' the
-input source select has more sources. The debug log option writes more lines and stays on after a restart." \
+input source select has more sources." \
 "$LOG_PROBLEMS"
 
 # ---------------------------------------------------------------- wake and modes

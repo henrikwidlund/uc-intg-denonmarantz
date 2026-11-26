@@ -367,7 +367,9 @@ Options:
 - `RUST_LOG` is added after the default driver log filter. A level in it replaces the default level for the
   same name, for example
   `denon_marantz=trace,denon_marantz_heos=trace`. The checks read debug lines of the driver, so do not set
-  `uc_intg_denonmarantz` or `denon_marantz` below `debug`.
+  `uc_intg_denonmarantz` or `denon_marantz` below `debug`. Only the `debug_log` check starts the driver
+  without `RUST_LOG`, because `RUST_LOG` overrides the debug log option of the setup. It sets
+  `settings.json` back at the end.
   The trace shows the full telnet and HEOS lines only if the driver is built with
   `cargo build --release --features sensitive-logs`. These lines can hold titles and account names: do not
   share such a log.
