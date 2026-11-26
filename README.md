@@ -299,36 +299,119 @@ measured with the minimum Rust version (`rust-version` in `Cargo.toml`), which C
 see the measured allocations and bytes. A new test is named `dhat_…`, is marked `#[ignore]` and goes in
 `src/entities/alloc_tests.rs`, which builds only with the `dhat-heap` feature.
 
-`tools/manual_test.sh` runs the tests that need a real Remote or a person, one step at a time: the setup pages,
-the entity lists, the buttons, the sleep of the Remote and a real signal. It saves the results to
-`test-results/manual-test-results-<time>.md`. Run `tools/remote-sim` (below) for everything else.
+`tools/manual_test.sh` runs the tests that need a real Remote, one step at a time: the Remote finds the driver
+with mDNS, the setup pages, the entities on the Remote, the pages and buttons of the remote entity (also a held
+button), adding and removing a second receiver, and the sleep and wake of the Remote. It saves the results to
+`test-results/manual-test-results-<time>.md`. Run `tools/remote-sim` (below) first: it tests everything else.
 
-`tools/remote-sim` is a program that acts as the Remote and runs most of these tests by itself with a real
-receiver. It opens a second connection to the receiver and checks that every select and sensor shows what the
-receiver has, after each change. It also sends the simple commands of the remote entity, but not the triggers,
-the remote lock and the LFE level of the 7.1 input. It starts the driver without mDNS, so it needs no root
-rights. The checks switch the receiver on and off and change source, sound mode and some settings, and restore
-them, also when a check fails. The `mute` check runs only if the mute state is known, the receiver is not
-muted, its volume is at or below -40 dB and the driver shows the same volume as the receiver. An unmute comes
-only after the volume is at or below the volume before the change and at or below -40 dB (the volume of the
-receiver, or of the driver without the second connection). At the end, `restore_power` sets the power and the
-mute state back to the start and, with the second connection, lowers the volume to the start volume (not above
--40 dB) if it is higher. While the simple commands are sent, the sound can stop for some seconds, for example
-when HDMI audio goes to the TV. The settings that they change and the source are saved in
-`remote-sim-restore.txt` in the repository folder first. A source that may not be selected is saved only as a
-line that is never sent. If the source is not read, the check is skipped. If a run stops before they are set
-back, the next run sets them back at its start. It sets the source back only if the main zone is on, exactly one
-source was saved, and both the saved source and the current source may be selected (see `--avoid-sources`). Some
-settings are kept for each source, so if the source cannot be set back and is not the saved source already,
-nothing is set back and the file stays. This is also true at the end of a check, and when the source must be set
-back while the main zone is off. While the file is still there, the checks that change these settings are
-skipped. A source change stops HEOS and AirPlay, and they do not start again. The checks never set the volume
-above -40 dB. A power on can start with a higher volume of the receiver: if it is above -40 dB, it is lowered to
--40 dB at once. The `heos` check compares the media player with a second HEOS connection, pauses and plays once.
-Start HEOS Music on the main zone before the run, else the check is skipped. `ws_keepalive` and `ws_close` use
-another WebSocket connection to the driver: `ws_keepalive` sends a ping every second for 5 s and needs each pong
-within 1 s. `ws_close` closes with code 4001 and reason `bye`, needs the same code and reason back, and the
-driver log must show within 3 s that the session ended.
+`tools/remote-sim` is a program that acts as the Remote and runs all other tests with a real receiver. Some checks
+ask you to do something (see below). It opens a second connection to the receiver and checks that every select and
+sensor shows what the receiver has, after each change. It also sends the simple commands that the driver offers on
+the remote entity, but not the commands only for Marantz receivers, commands with `VOLUME` in the name (also
+Dynamic Volume), commands with `RESET` as a whole part of the name, the tuner presets, Quick Select, Smart
+Select, zone favorites, memory commands, the network restart, the triggers, the remote lock and the LFE level of
+the 7.1 input. The speaker and Auro-Matic 3D presets are sent and set back. It starts the
+driver without mDNS, so it needs no root rights. The checks switch the receiver on and off and change source, sound
+mode and some settings, and restore them, also when a check fails, unless you choose at a question to leave the
+source as it is. The `mute` check runs only if the mute state is known, the receiver is not muted, its volume is at
+or below -40 dB and the driver shows the same volume as the receiver. An unmute comes only after the volume is at
+or below the volume before the change and at or below -40 dB (the volume of the receiver, or of the driver without
+the second connection). At the end, `restore_power` sets the power and the mute state back to the start and, with
+the second connection, lowers the volume to the start volume (not above -40 dB) if it is higher. While the simple
+commands are sent, the sound can stop for some seconds, for example when HDMI audio goes to the TV. The settings
+that they change and the source are saved in `remote-sim-restore.txt` in the repository folder first. A source that
+may not be selected is saved only as a line that is never sent. If the source is not read, the check is skipped. If
+a run stops before they are set back, the next run sets them back at its start. It sets the source back only if the
+main zone is on, exactly one source was saved, and both the saved source and the current source may be selected
+(see `--avoid-sources`). Some settings are kept for each source, so if the source cannot be set back and is not the
+saved source already, nothing is set back and the file stays. This is also true at the end of a check, and when the
+source must be set back while the main zone is off. While the file is still there, the checks that change these
+settings are skipped. A source change stops HEOS and AirPlay, and they do not start again. The checks never set the
+volume above -40 dB. A power on can start with a higher volume of the receiver: if it is above -40 dB, it is
+lowered to -40 dB at once. If the second connection cannot read the volume, a check that makes sound or changes the
+source fails. If a source must be set back then, it asks you to do it. `ws_keepalive` and `ws_close` use another
+WebSocket connection to the driver: `ws_keepalive` sends a ping every second for 5 s and needs each pong within
+1 s. `ws_close` closes with code 4001 and reason `bye`, needs the same code and reason back, and the driver log
+must show within 3 s that the session ended.
+
+More checks:
+
+- `values` compares the selects, sensors, switches and numbers with the second connection, also the HDR input
+  and output sensors.
+- `signal` (after `values`) asks you to play an HDR10 or Dolby Vision source, then an SDR source. Each question
+  lists the sources in `--avoid-sources`: do not use them. With `--avoid-sources`, the check is skipped if the
+  input levels are above 0 dB or not known.
+  - Signal: it waits up to 20 s until the second connection has the signal, else it asks again. HDR means
+    BT.2020 or an HDR format on the input or the output. SDR means a known color space without BT.2020 and
+    without an HDR format. Then it compares the color space, HDR and pixel depth sensors with the second
+    connection.
+  - Time: the driver must show the change within the signal check time + 5 s. In HTTP mode this time is
+    rounded up to a multiple of 10 s. Without a signal check (a time of 0, or telnet mode on a receiver
+    without HEOS), a late change does not fail.
+  - Skip: the check is skipped without a terminal, the second connection, signal sensors or a source shown by
+    the driver, if the volume is above -40 dB, and if you skip both the HDR and the SDR question.
+  - Volume: after each question, and once more at the end, a volume above -40 dB is lowered to -40 dB and the
+    check fails. At the end a receiver volume above the volume at the start is set back, and the check fails.
+  - Set back: at the end the start source is set back (see the source set back below).
+- `heos` compares the media player with a second HEOS connection, and pauses and plays once if the item can
+  pause. If HEOS plays nothing on the main zone, it asks you to start HEOS Music. The question is not asked,
+  and the check is skipped, if one of these is true: no terminal, no `--avoid-sources`, no second connection,
+  the HEOS source (`NET`) may not be selected (see `--avoid-sources`), the start source cannot be set back, or
+  the volume is above -40 dB. Once HEOS plays, a volume above -40 dB is lowered to -40 dB and the check fails.
+  After this question the check always ends like this, also after a failure: it pauses HEOS if it plays (or
+  stops it if the item cannot pause), and sets the start source back (see the source set back below).
+- `media_info` (after `heos`) is skipped without `--avoid-sources` or the second connection. It is also skipped if
+  the driver shows no tuner entities and there is no terminal. It fails if a part fails and is skipped only if both
+  parts are skipped. The parts:
+  - Tuner: it selects a tuner source and checks the title (the title from the receiver, else the frequency
+    text) and the artist (the artist from the receiver, else the band). Then it sets the start source back.
+    The part runs only if the driver shows the tuner entities and the frequency sensor (the driver shows it
+    only in telnet mode), a tuner source and the start source may be selected and are in the source list, and
+    the volume is at or below -40 dB. If the tuner is the start source, no source is selected.
+  - Bluetooth: it asks you to play music from a phone over Bluetooth, then shows the media info and asks if it is
+    right. The part runs only with a terminal, a `BT` source that may be selected and a volume of the receiver and
+    the driver at or below -40 dB. If the volume is above -40 dB when Bluetooth starts, it is lowered to -40 dB and
+    the part fails. Before the question and at the end, a receiver volume above the volume at the start is set
+    back, and the part fails. At the end this comes first.
+    Then the start source is set back (see the source set back below), and it asks you to stop the music on the
+    phone.
+- `media_keys` (after `remote_commands`) sends the navigation and playback keys of the media player, never a
+  volume or source command:
+  - Menu: with the second connection and a receiver that has the menu query, it opens the setup menu, sends
+    the cursor keys, enter and back while the menu is open, and closes it. The menu is always closed at the end.
+    It is skipped if the menu is open at the start.
+  - Info and option: with the same needs, it sends info, option and back while the setup menu is closed.
+  - Channel: only on the analog tuner on a preset, at or below -40 dB: channel up, then down, and the preset and
+    frequency must come back.
+  - Next and previous: only while HEOS plays a queue item on `NET` with at least 30 s left, shuffle off and a next
+    item, at or below -40 dB: next, then previous, and the item must come back.
+- `source` selects another source (see `--avoid-sources`), checks that a source without media shows its name as
+  the title, and sets the start source back. It is skipped if the volume is above -40 dB.
+- `http_mode` switches the driver to HTTP mode and back to telnet. In HTTP mode it sets the signal check time to
+  0 and checks that the HDR, pixel depth, FRL and color space sensors are removed, then sets it to 5 and checks
+  that they are back. It lowers the bass by one step and sets it back, only if tone control is on and the Dirac
+  filter is off. The report shows the MultEQ and Dynamic EQ values. It changes the dimmer (if the driver offers
+  it over HTTP) and the sound mode (if the driver showed one with telnet). It selects another source (see
+  `--avoid-sources`), but not if the volume is above -40 dB. It sets the signal check time, the source, the
+  dimmer and the sound mode back. If the switch back to telnet fails, the signal check time and the sound mode
+  are not set back, and the check fails.
+- `configure_options` (after `http_mode`) changes "Show all sources", sets it back and checks the source list
+  without a restart of the driver.
+- `log` fails on a panic or an ERROR line in the driver log (except the line of the broken file check). It shows
+  the WARN lines and asks once if all of them are expected: n + Enter fails the check.
+
+Source set back after a question (`signal`, `heos`, Bluetooth part of `media_info`): if the source changed, the
+check selects the start source again only if the volume is known, at or below -40 dB and not above the volume at
+the start, and the start source and the current source may be selected (see `--avoid-sources`). Else it asks you
+to set it back and waits up to 15 s for the driver to show it. If you leave the source as it is, the check (or the
+part) is skipped when nothing failed.
+
+The questions are asked on the terminal. Each question says what each key does. What s + Enter does is
+different for each question: for example it skips the check, skips a part of it, leaves the source as it is or
+only adds a note. The questions and the answers go to the report line of the check. Without a terminal, no
+question is asked: the check or the part of it that needs the answer is skipped, and `log` does not check the
+WARN lines. A run in the background (for example with `&`) whose input is the terminal is paused at once, until
+you bring it back with `fg`. Start such a run with `< /dev/null`: then no question is asked.
 
 ```shell
 cargo build --release
@@ -342,19 +425,21 @@ Options:
   `--skip` refuses them. `restore_power` and `log` always run at the end, also with `--only` and `--skip`.
   If `metadata`, `setup`, `entities` or `states` fails, only `restore_power` and `log` run after it.
 - `--kinds a,b` limits the select sweep to these selects, for example `dirac_filter`.
-- `--avoid-sources a,b`: the checks never select a source whose telnet code (for example `BD`) or name contains
-  one of these, without case. The names are the user name, the default name and the name that the device on the
-  input reports, from the second connection and the web interface. A source without a name from the receiver, a
-  source that is not on the source names page, a source that the receiver does not report as in use, and a tuner
-  source without a tuner are not selected either. Without the second connection or the source names page of the
-  web interface, no source is selected. No source is selected either while the receiver adds a level above 0 dB
-  to the analog or the digital inputs, or when these levels are not known: another source could then be louder
-  at the same volume. Without this option and without names in `tools/remote-sim/avoid-sources.txt`, the checks
-  select no source: the `source` check is skipped, `http_mode` does not change the source, and the simple
-  command check sends no source or tuner command. If the source at the start may not be selected, no source is
-  changed either, because the checks select the start source again after the change. A tuner command of the
-  simple command check also needs a tuner source on the receiver, and every tuner source to be one that may be
-  selected. The simple command check sends the source and tuner commands after the other commands.
+- `--avoid-sources a,b`: the checks never select a source whose telnet code (for example `BD`) or name contains one
+  of these, without case. The names are the user name, the default name and the name that the device on the input
+  reports, from the second connection and the web interface. A source without a name from the receiver, a source
+  that is not on the source names page, a source that the receiver does not report as in use, and a tuner source
+  without a tuner are not selected either. Without the second connection or the source names page of the web
+  interface, no source is selected. No source is selected either while the receiver adds a level above 0 dB to the
+  analog or the digital inputs, or when these levels are not known: another source could then be louder at the same
+  volume. Without this option and without names in `tools/remote-sim/avoid-sources.txt`, the checks select no
+  source: the `source` and `media_info` checks are skipped, `heos` does not ask you to start HEOS Music, `signal`
+  asks you to set the start source back if it changed, `http_mode` does not change the source, and the simple
+  command check sends no source or tuner command. If the source at the start may not be selected, the checks select
+  no source either, because they select the start source again after the change. `signal` and the Bluetooth part
+  of `media_info` then ask you to set it back, and `heos` is skipped. A tuner command of the simple command check
+  also needs a tuner source on the receiver, and every tuner source to be one that may be selected. The simple
+  command check sends the source and tuner commands after the other commands.
 - The names in `tools/remote-sim/avoid-sources.txt` are always added to `--avoid-sources`, separated by commas
   or new lines. Git ignores this file, so it can hold the real names of your sources. Write one short name per
   entry, for example `Oppo`, and no comments: the whole entry must be part of a name or code of the source.
@@ -370,8 +455,9 @@ Options:
 - `--no-oracle` does not open the second connection. The values are then not compared with the receiver.
   Without the second connection the volume cannot be read from the receiver, so the checks do not switch the
   receiver on: a check that needs a power on is skipped. The `power`, `volume`, `select_sweep`,
-  `settings_restore` and `simple_commands` checks are also skipped, and no source is selected. The `mute`
-  check then uses the volume of the driver.
+  `settings_restore`, `simple_commands`, `signal`, `media_info` and `media_keys` checks are also skipped,
+  `heos` does not ask you to start HEOS Music, and no source is selected. The `mute` check then uses the volume
+  of the driver.
 - `--driver <path>`, `--port <port>` and `--commands <path>` change the driver binary, the port and the
   command table. The default driver binary is `target/release/uc-intg-denonmarantz` and the default command
   table is `resources/commands.tsv`, both in the repository folder, so the tool works from any folder.

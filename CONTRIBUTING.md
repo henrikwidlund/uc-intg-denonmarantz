@@ -68,7 +68,7 @@ Describe breaking changes in the PR and explain why they are needed.
 
 ## Testing with real devices
 
-Some changes need a real receiver and Remote. `tools/manual_test.sh` runs the manual tests step by step. In your PR, say which devices and software versions you tested with.
+Some changes need a real receiver. `tools/remote-sim` acts as the Remote and runs most tests with a real receiver. `tools/manual_test.sh` runs the tests that need a real Remote, step by step. In your PR, say which devices and software versions you tested with.
 
 ## Commit Messages
 

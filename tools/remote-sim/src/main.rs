@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
 //! Test program that acts as the Remote. It starts the driver, sets it up with a real receiver
-//! and runs the checks of the guided manual test over the WebSocket. The volume is never set
-//! above the limit in `checks::MAX_VOLUME`. The names in [`AVOID_FILE`] are always added to
-//! `--avoid-sources`.
+//! and runs the checks over the WebSocket. Some checks ask the owner on the terminal. The volume
+//! is never set above the limit in `checks::MAX_VOLUME`. The names in [`AVOID_FILE`] are always
+//! added to `--avoid-sources`.
 //!
 //! Usage: `remote-sim <receiver address> [--driver <path>] [--only a,b] [--skip a,b]
 //! [--kinds a,b] [--avoid-sources a,b] [--no-power] [--no-oracle] [--port <port>] [--commands <path>]`
@@ -22,13 +22,15 @@ use std::time::Instant;
 use ws::Client;
 
 /// All steps in the order of [`run`].
-const STEPS: [&str; 37] = [
+const STEPS: [&str; 41] = [
     "metadata",
     "setup",
     "entities",
     "states",
     "values",
+    "signal",
     "heos",
+    "media_info",
     "remote_ui",
     "standby",
     "remote_wake",
@@ -36,6 +38,7 @@ const STEPS: [&str; 37] = [
     "unused_receiver",
     "selects",
     "remote_commands",
+    "media_keys",
     "mute",
     "source",
     "sound_mode",
@@ -43,6 +46,7 @@ const STEPS: [&str; 37] = [
     "power",
     "abort_setup",
     "http_mode",
+    "configure_options",
     "backup_restore",
     "ws_keepalive",
     "ws_idle",
@@ -210,6 +214,10 @@ pub struct Ctx {
     pub start: Option<Start>,
     /// The driver shows the tuner entities: the setup option, else what `Deviceinfo.xml` says.
     pub tuner: bool,
+    /// Questions to the owner in the current step and the answers, for the report.
+    pub answers: Vec<String>,
+    /// Lines of the terminal, from [`checks::stdin_lines`].
+    pub stdin: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
     report: Vec<String>,
     failed: usize,
     skipped: usize,
@@ -272,11 +280,17 @@ impl Ctx {
                 ("FAIL", f.msg)
             }
         };
-        let line = if note.is_empty() {
+        let mut line = if note.is_empty() {
             format!("{tag}  {name} ({ms} ms)")
         } else {
             format!("{tag}  {name} ({ms} ms): {note}")
         };
+        if !self.answers.is_empty() {
+            line.push_str(" [owner: ");
+            line.push_str(&self.answers.join("; "));
+            line.push(']');
+            self.answers.clear();
+        }
         println!("{line}");
         self.report.push(line);
         tag != "FAIL"
@@ -456,6 +470,10 @@ async fn main() {
         was_on: true,
         start: None,
         tuner: true,
+        answers: Vec::new(),
+        // Started at once on a terminal, so lines typed before a prompt are dropped. A run in the
+        // background with a terminal stdin stops; use `< /dev/null` there.
+        stdin: checks::terminal().then(checks::stdin_lines),
         report: Vec::new(),
         failed: 0,
         skipped: 0,
@@ -498,7 +516,9 @@ async fn run(ctx: &mut Ctx) {
 /// The checks between the base steps and the end steps.
 async fn middle_steps(ctx: &mut Ctx) {
     ctx.step("values", checks::values).await;
+    ctx.step("signal", checks::signal).await;
     ctx.step("heos", checks::heos).await;
+    ctx.step("media_info", checks::media_info).await;
     ctx.step("remote_ui", checks::remote_ui).await;
     ctx.step("standby", checks::standby).await;
     ctx.step("remote_wake", checks::remote_wake).await;
@@ -506,6 +526,7 @@ async fn middle_steps(ctx: &mut Ctx) {
     ctx.step("unused_receiver", checks::unused_receiver).await;
     ctx.step("selects", checks::selects).await;
     ctx.step("remote_commands", checks::remote_commands).await;
+    ctx.step("media_keys", checks::media_keys).await;
     ctx.step("mute", checks::mute).await;
     ctx.step("source", checks::source).await;
     ctx.step("sound_mode", checks::sound_mode).await;
@@ -513,6 +534,8 @@ async fn middle_steps(ctx: &mut Ctx) {
     ctx.step("power", checks::power).await;
     ctx.step("abort_setup", checks::abort_setup).await;
     ctx.step("http_mode", checks::http_mode).await;
+    ctx.step("configure_options", checks::configure_options)
+        .await;
     ctx.step("backup_restore", checks::backup_restore).await;
     // WebSocket behavior, each with another WebSocket connection.
     ctx.step("ws_keepalive", checks::ws_keepalive).await;

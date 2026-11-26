@@ -63,6 +63,7 @@ pub const QUERIES: &[&str] = &[
     "PSIMAXSWO ?",
     "PSAUROST ?",
     "PSAUROMODE ?",
+    "PSAUROPR ?",
     "PSDIC ?",
     "PSDELAY ?",
     "PSDEL ?",
@@ -562,6 +563,7 @@ mod tests {
         assert_eq!(Some("CVTTR ?"), query("CVTTR 50"));
         assert!(position("CVTTR ON").unwrap() < position("SSTTR OFF").unwrap());
         assert_eq!(Some("SPPR ?"), query("SPPR 2"));
+        assert_eq!(Some("PSAUROPR ?"), query("PSAUROPR SMA"));
         assert!(position("SPPR 2").unwrap() < position("PSDIRAC 1").unwrap());
         assert_eq!(Some("SI?"), query("SISAT/CBL"));
         assert!(position("SIMPLAY").unwrap() < position("MSSTEREO").unwrap());

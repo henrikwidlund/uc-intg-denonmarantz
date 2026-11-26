@@ -4,12 +4,11 @@
 #
 # Guided manual test with a real Remote and receiver.
 #
-# The program tools/remote-sim tests most of the driver without a Remote: power, sources, sound
-# modes, selects, switches, numbers, volume, the simple commands, the configuration file, the
-# takeover of a Python configuration, a broken configuration, backup and restore, a receiver that
-# cannot be reached and the values in HTTP mode. Run it first. This script covers only what the
-# Remote shows or what needs a person: the setup pages, the entity lists, the buttons, the sleep of
-# the Remote and a real signal.
+# This script covers only what needs a real Remote: the driver is found with mDNS, the setup
+# pages, the entities on the Remote, the pages and buttons of the remote entity (also a held
+# button), adding and removing a second receiver, and the sleep and wake of the Remote. The
+# program tools/remote-sim tests everything else, also the checks that ask the owner a question.
+# Run it first.
 #
 # The script shows one numbered step at a time: what to prepare, what to do and what to watch
 # for. Enter runs the step command (if the step has one). You then type what happened. All
@@ -21,8 +20,8 @@
 #
 # Usage: tools/manual_test.sh [steps]
 #   No steps: run all steps.
-#   Steps: numbers and ranges, for example: 12 14-16 20
-#   A number with + runs that step and all steps after it, for example: 30+
+#   Steps: numbers and ranges, for example: 2 4-6 8
+#   A number with + runs that step and all steps after it, for example: 5+
 
 set -u
 
@@ -217,7 +216,7 @@ echo "Driver configuration: $CONFIG_DIR"
 echo "Driver log: ${LOG:-RustRover console}"
 echo
 echo "Rules for this test:"
-echo "  - Steps that can make sound or change the volume say so. Say no if you do not want it."
+echo "  - Steps that can make sound or change the volume say so. Press s + Enter to skip a step you do not want."
 echo
 # The answers are kept for the next run. Enter keeps the last answer.
 SETUP_FILE="$PWD/.manual-test-setup"
@@ -277,13 +276,16 @@ step "Setup: discovery and options" \
 "The receiver is on or in network standby." \
 "Start the setup. On the page 'Restore': leave 'Restore from backup' unticked.
 On the page 'Setup mode': leave the address empty. Press Next.
-Pick the receiver. Keep the defaults. Press Next." \
+Pick the receiver. Keep the defaults. Press Next.
+Then start the setup again: 'Configuration mode' > 'Configure selected device' > Next. Press Next on the
+next page without a change." \
 "The page 'Setup mode' says that the address is optional and that the search finds receivers only on the
 same network as the Remote. A page 'Please choose your Denon or Marantz AVR' has the receiver and these
-fields: show all sources, manufacturer, connection mode, volume step, Dirac, signal check time (5 s; not
-on receivers from before about 2016).
+fields: show all sources, manufacturer, connection mode, Dirac, AM/FM tuner, signal check time (5 s; not
+on receivers from before about 2016) and a note.
 'Device supports Dirac' shows the real value of the receiver.
-The setup ends with success in about a second." \
+The setup ends with success in about a second.
+The page 'Configure your AVR' shows the address and the same fields with the saved values." \
 "recent_log 'discovering|adding|not found|WARN|ERROR'"
 
 step "Setup: entities" \
@@ -295,65 +297,48 @@ numbers, besides the media player and the remote. A tuner adds 2 selects and 1 s
 is 1 select and 1 sensor less." \
 "recent_log 'connected|WARN|ERROR'"
 
-# ---------------------------------------------------------------- control
-
-step "Media info and navigation" \
-"Play something from a network source, for example HEOS or internet radio. This makes sound." \
-"Look at the media player: title, artist, album, cover and, with HEOS, the position bar. Then use play and
-pause, next and previous, the cursor keys, menu, back, info, channel up and down. If you can, play from a
-phone over Bluetooth. Then select a source that has no media, and the tuner." \
-"Title, artist, album and cover show for network audio. With HEOS the position bar moves and pause shows
-PAUSED. Note what Bluetooth shows. A source without media shows its name as the title.
-The tuner shows the frequency as the title and the band as the artist. The keys work on the receiver." \
-"$LOG_PROBLEMS"
-
-step "Signal sensors and the signal check option" \
-"A source with a video and audio signal is playing." \
-"Look at the sensors for audio and video signal, channels, resolution, HDR, pixel depth, FRL and color space.
-Play an HDR10 or Dolby Vision source, then an SDR source." \
-"The sensors show the signal of the receiver. With HDR the color space shows the BT.2020 part, for example
-4:2:2/BT.2020; with SDR it does not. They follow a change of source within about 10 seconds, also when the
-receiver does not report it (newer receivers with telnet: the set time, 5 seconds by default; HTTP mode: the
-set time rounded up to a multiple of 10 seconds; older receivers with telnet: only when the receiver reports
-it, and they have no option)." \
-"recent_log 'signal|WARN|ERROR'"
+# ---------------------------------------------------------------- remote entity and setup
 
 step "Simple commands and pages" \
-"$RECEIVER_ON" \
-"Open the pages of the remote entity (15 pages). Press a few buttons on each page, also a repeated
-command and a sequence of two commands with a pause." \
+"$RECEIVER_ON
+Select a source that plays nothing, or pause the playback: some page buttons (for example Pure
+Direct, MultiEQ Off or ECO Off) can make the sound louder.
+Buttons on these pages can make sound and change the volume. Press volume up only while the
+receiver shows -45 dB or lower. Do not press the 'Up' buttons on the page 'Channel Levels'. Do not
+press buttons on the pages 'Quick Select', 'Smart Select' and 'Zone Favorites': they can select a
+source and a volume, or overwrite a saved favorite. Do not press buttons on the pages 'Inputs' and
+'Tuner': they can change the source, and remote-sim checks the source changes. Do not press buttons
+on the page 'Triggers': they can switch other devices. Buttons on the pages 'Main', 'Sound Modes',
+'Channel Levels', 'Sound Tweaks', 'Standby', 'Dirac', 'Audyssey', 'ECO', 'Picture Mode' and 'Sleep
+Timer' change settings: set them back by hand, and set the sleep timer back to Off. The repeated
+command and the sequence must not use volume up or a source button." \
+"Open the pages of the remote entity (15 pages). Press a few buttons on each page that the text
+above allows, also a repeated command and a sequence of two commands with a pause of 5 seconds (the
+longest pause that the driver allows). Press volume down while the sequence runs. Hold a button that
+does not change the volume or the source (for example cursor down) for about 2 seconds." \
 "The buttons work. A held button sends one command, not four. A long sequence is answered at once and
 the volume buttons still work while it runs." \
 "$LOG_PROBLEMS"
 
-step "Configure, remove and options" \
-"At least one receiver is configured." \
-"Setup > Configure selected device: change the volume step and 'Show all sources'. Setup > Configuration
-mode: add and remove a receiver if you have a second one." \
-"The changes work without a restart. A new volume step is used at once. With 'Show all sources' the
-input source select has more sources." \
+step "Add and remove a second receiver" \
+"At least one receiver is configured. A second receiver is on the network. Skip this step if you
+do not have one." \
+"Start the setup. On 'Configuration mode' choose the action 'Add a new device' and add the second
+receiver. Add its entities. Then start the setup again, choose the second receiver in 'Configured
+devices' and the action 'Delete selected device'." \
+"The second receiver and its entities are added without a restart. After the delete, the first
+receiver still works. Note what the Remote shows for the entities of the second receiver." \
 "$LOG_PROBLEMS"
 
-# ---------------------------------------------------------------- wake and modes
+# ---------------------------------------------------------------- wake
 
 step "Sleep and wake of the Remote" \
 "$RECEIVER_ON" \
-"Let the Remote go to sleep for a minute. Wake it and press a button at once." \
+"Let the Remote go to sleep for a minute. Wake it and at once press a button that does not change
+the volume or the source, for example cursor down." \
 "The command works at once, or in less than 3 seconds.
 The log shows 'connected in' and the time." \
 "recent_log 'connected in|network not ready|WARN|ERROR'"
-
-step "HTTP connection mode" \
-"The receiver is on. remote-sim checked the entity counts and the commands in HTTP mode." \
-"Configure the receiver with 'Use HTTP connection'. Look at the entities on the Remote. Change the bass (with
-the Dirac filter off). Then configure it again with 'Check the signal info every N seconds' set to 0 and look
-at the sensors. Then set it back to 5 and switch back to telnet." \
-"On the AVC-A10H the Remote shows 22 sensors, 8 selects (with the monitor output), 2 switches (tone control,
-Dynamic EQ) and 2 numbers (bass, treble). MultEQ and Dynamic EQ show '--' (the receiver answers them
-blank). A new bass value shows within about a second. The sound mode select lists groups such as MOVIE and
-STEREO. With 0 the HDR, pixel depth, FRL and color space sensors are gone (14 sensors); with 5 they are
-back." \
-"$LOG_PROBLEMS"
 
 step "Check the log for errors again" \
 "The steps above are done." \

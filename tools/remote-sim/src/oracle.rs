@@ -277,6 +277,9 @@ pub fn expected(state: &State) -> Vec<Expected> {
             "sensor.colorspace_output",
             color.output.map(|c| c.to_string()),
         ),
+        // The HDR format as the receiver reports it, for example `HDR10`. `---` is no value.
+        ("sensor.hdr_input", signal.hdr.input.clone()),
+        ("sensor.hdr_output", signal.hdr.output.clone()),
         (
             "sensor.pixel_depth_input",
             depth.input.map(|d| d.label().to_owned()),
@@ -391,6 +394,27 @@ mod tests {
             source(&["SIMPLAY"]).as_deref(),
             "not in the list"
         );
+    }
+
+    fn value(lines: &[&str], name: &str) -> Option<String> {
+        expected(&state(lines))
+            .into_iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("no entry {name}"))
+            .1
+    }
+
+    #[test]
+    fn the_hdr_format_is_shown_as_the_receiver_reports_it() {
+        let hdr = ["SSINFSIGHDR IHDR10", "SSINFSIGHDR ODolby Vision"];
+        assert_eq!(Some("HDR10"), value(&hdr, "sensor.hdr_input").as_deref());
+        assert_eq!(
+            Some("Dolby Vision"),
+            value(&hdr, "sensor.hdr_output").as_deref()
+        );
+        let none = ["SSINFSIGHDR IHDR10", "SSINFSIGHDR I---"];
+        assert_eq!(None, value(&none, "sensor.hdr_input"), "--- is no value");
+        assert_eq!(None, value(&[], "sensor.hdr_output"));
     }
 
     #[test]
