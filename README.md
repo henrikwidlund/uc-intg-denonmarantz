@@ -309,13 +309,18 @@ only after the volume is at or below the volume before the change and at or belo
 receiver, or of the driver without the second connection). At the end, `restore_power` sets the power and the
 mute state back to the start and, with the second connection, lowers the volume to the start volume (not above
 -40 dB) if it is higher. While the simple commands are sent, the sound can stop for some seconds, for example
-when HDMI audio goes to the TV. The settings that they change are saved in `remote-sim-restore.txt` in the
-repository folder first. If a run stops before they are set back, the next run sets them back at its start.
-While the file is still there, the checks that change these settings are skipped. A source change stops HEOS
-and AirPlay, and they do not start again. The checks never set the volume above -40 dB. A power on can start
-with a higher volume of the receiver: if it is above -40 dB, it is lowered to -40 dB at once. The `heos` check
-compares the media player with a second HEOS connection, pauses and plays once. Start HEOS Music on the main
-zone before the run, else the check is skipped.
+when HDMI audio goes to the TV. The settings that they change and the source are saved in
+`remote-sim-restore.txt` in the repository folder first. A source that may not be selected is saved only as a
+line that is never sent. If the source is not read, the check is skipped. If a run stops before they are set
+back, the next run sets them back at its start. It sets the source back only if the main zone is on, exactly one
+source was saved, and both the saved source and the current source may be selected (see `--avoid-sources`). Some
+settings are kept for each source, so if the source cannot be set back and is not the saved source already,
+nothing is set back and the file stays. This is also true at the end of a check, and when the source must be set
+back while the main zone is off. While the file is still there, the checks that change these settings are
+skipped. A source change stops HEOS and AirPlay, and they do not start again. The checks never set the volume
+above -40 dB. A power on can start with a higher volume of the receiver: if it is above -40 dB, it is lowered to
+-40 dB at once. The `heos` check compares the media player with a second HEOS connection, pauses and plays once.
+Start HEOS Music on the main zone before the run, else the check is skipped.
 
 ```shell
 cargo build --release
@@ -329,19 +334,33 @@ Options:
   `--skip` refuses them. `restore_power` and `log` always run at the end, also with `--only` and `--skip`.
   If `metadata`, `setup`, `entities` or `states` fails, only `restore_power` and `log` run after it.
 - `--kinds a,b` limits the select sweep to these selects, for example `dirac_filter`.
-- `--avoid-sources a,b`: the checks never select a source whose name contains one of these, without case.
-  Without this option the checks select no source: the `source` check is skipped and `http_mode` does not
-  change the source. If the source at the start is one of these, no source is changed either, because the
-  checks select the start source again after the change. The simple command check never sends source commands.
+- `--avoid-sources a,b`: the checks never select a source whose telnet code (for example `BD`) or name contains
+  one of these, without case. The names are the user name, the default name and the name that the device on the
+  input reports, from the second connection and the web interface. A source without a name from the receiver, a
+  source that is not on the source names page, a source that the receiver does not report as in use, and a tuner
+  source without a tuner are not selected either. Without the second connection or the source names page of the
+  web interface, no source is selected. No source is selected either while the receiver adds a level above 0 dB
+  to the analog or the digital inputs, or when these levels are not known: another source could then be louder
+  at the same volume. Without this option and without names in `tools/remote-sim/avoid-sources.txt`, the checks
+  select no source: the `source` check is skipped, `http_mode` does not change the source, and the simple
+  command check sends no source or tuner command. If the source at the start may not be selected, no source is
+  changed either, because the checks select the start source again after the change. A tuner command of the
+  simple command check also needs a tuner source on the receiver, and every tuner source to be one that may be
+  selected. The simple command check sends the source and tuner commands after the other commands.
+- The names in `tools/remote-sim/avoid-sources.txt` are always added to `--avoid-sources`, separated by commas
+  or new lines. Git ignores this file, so it can hold the real names of your sources. Write one short name per
+  entry, for example `Oppo`, and no comments: the whole entry must be part of a name or code of the source.
 - `--kinds` and `--avoid-sources` can be given more than once; the lists are joined. A missing value, a value
   without names and a value that starts with `-` are refused. Spaces around names are removed.
 - Only one receiver address is allowed.
+- `receiver_restart` runs only with `--only receiver_restart`. It sends `NETWORK_RESTART` to the receiver and
+  checks that the driver connects again (at most 3 minutes) and shows the values of the receiver.
 - `--no-power` skips the power check. The other checks still switch the receiver on if it is off.
 - `--no-oracle` does not open the second connection. The values are then not compared with the receiver.
   Without the second connection the volume cannot be read from the receiver, so the checks do not switch the
   receiver on: a check that needs a power on is skipped. The `power`, `volume`, `select_sweep`,
-  `settings_restore` and `simple_commands` checks are also skipped. The `mute` check then uses the volume of
-  the driver.
+  `settings_restore` and `simple_commands` checks are also skipped, and no source is selected. The `mute`
+  check then uses the volume of the driver.
 - `--driver <path>`, `--port <port>` and `--commands <path>` change the driver binary, the port and the
   command table. The default driver binary is `target/release/uc-intg-denonmarantz` and the default command
   table is `resources/commands.tsv`, both in the repository folder, so the tool works from any folder.

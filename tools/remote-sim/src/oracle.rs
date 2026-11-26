@@ -119,6 +119,26 @@ impl Oracle {
         &self.avr
     }
 
+    /// Read the default and automatic names of the sources and the input levels from the web
+    /// interface. Telnet gives only the names that the user gave. Error if the names page or the
+    /// levels page was not read now, so that no older value is used.
+    pub async fn read_source_names(&self) -> Result<(), Fail> {
+        let details = self.avr.update_source_details().await?;
+        if !details.names.is_read() {
+            return Err(Fail::new(format!(
+                "source names page not read: {:?}",
+                details.names
+            )));
+        }
+        if !details.levels.is_read() {
+            return Err(Fail::new(format!(
+                "input levels page not read: {:?}",
+                details.levels
+            )));
+        }
+        Ok(())
+    }
+
     pub fn state(&self) -> State {
         self.avr.snapshot()
     }
@@ -187,13 +207,14 @@ pub fn expected(state: &State) -> Vec<Expected> {
     };
     let zone = state.zone(Zone::Main);
     let device = state.device();
+    // The telnet name, else the code, as the driver shows it: the driver does not read the default
+    // names of the web interface. A source that is not in the list gets its display name.
     let source = zone.source.as_deref().map(|code| {
-        device
-            .sources
-            .get(code)
-            .and_then(|s| s.name.as_deref().or(s.default_name.as_deref()))
-            .unwrap_or_else(|| telnet_to_display_source(code))
-            .to_owned()
+        match device.sources.get(code) {
+            Some(s) => s.name.as_deref().unwrap_or(&s.code),
+            None => telnet_to_display_source(code),
+        }
+        .to_owned()
     });
     let dimmer = label(device.dimmer, DimmerMode::label);
     let eco = label(device.eco_mode, EcoMode::label);
@@ -344,6 +365,32 @@ mod tests {
             event: message.event,
             parameter: message.parameter.into(),
         }
+    }
+
+    fn source(lines: &[&str]) -> Option<String> {
+        let state = state(lines);
+        expected(&state)
+            .into_iter()
+            .find(|(name, _)| *name == "select.input_source")
+            .and_then(|(_, value)| value)
+    }
+
+    #[test]
+    fn the_source_label_is_the_one_of_the_driver() {
+        assert_eq!(
+            Some("Blu-ray"),
+            source(&["SSFUNBD Blu-ray", "SIBD"]).as_deref()
+        );
+        assert_eq!(
+            Some("BD"),
+            source(&["SSSODBD USE", "SIBD"]).as_deref(),
+            "no name"
+        );
+        assert_eq!(
+            Some(telnet_to_display_source("MPLAY")),
+            source(&["SIMPLAY"]).as_deref(),
+            "not in the list"
+        );
     }
 
     #[test]

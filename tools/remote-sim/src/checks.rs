@@ -7,7 +7,7 @@ use crate::oracle::{self, Oracle};
 use crate::restore;
 use crate::ws::{field_ids, field_value};
 use crate::{Check, Ctx, Fail};
-use denon_marantz::proto::DiracFilter;
+use denon_marantz::proto::{DiracFilter, SourceInfo, SourceLevels};
 use denon_marantz::{Command, Query, Zone};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -987,6 +987,109 @@ pub async fn remote_wake(ctx: &mut Ctx) -> Check {
     Ok(format!("state {first} after {took} ms"))
 }
 
+/// The longest wait for the driver to connect again after the network restart of the receiver.
+const RESTART_LIMIT: Duration = Duration::from_secs(180);
+
+/// Parts of driver log lines for a lost telnet link: from the driver and from the library.
+const LOSS_LINES: [&str; 2] = ["telnet disconnected", "telnet connection lost"];
+
+/// Parts of driver log lines for a connect: full connects of the driver, and telnet connects of
+/// the driver and the library.
+const CONNECT_LINES: [&str; 2] = ["] connected in", "telnet connected"];
+
+fn count_lines(log: &str, parts: &[&str]) -> usize {
+    parts.iter().map(|p| log.matches(p).count()).sum()
+}
+
+/// Where the last loss line of `log` starts, if the log has more loss lines than `lost_before`.
+fn last_loss(log: &str, lost_before: usize) -> Option<usize> {
+    if count_lines(log, &LOSS_LINES) <= lost_before {
+        return None;
+    }
+    LOSS_LINES.iter().filter_map(|p| log.rfind(p)).max()
+}
+
+/// A connect line comes after byte `from` of `log`.
+fn connected_after(log: &str, from: usize) -> bool {
+    log.get(from..)
+        .is_some_and(|rest| CONNECT_LINES.iter().any(|p| rest.contains(p)))
+}
+
+/// Restart the network of the receiver with the `NETWORK_RESTART` command, like a receiver that
+/// restarts. The driver must connect again and show the values of the receiver. The second
+/// connection is opened again. Only with `--only receiver_restart`.
+pub async fn receiver_restart(ctx: &mut Ctx) -> Check {
+    ensure_on(ctx).await?;
+    let lost_before = count_lines(&ctx.driver.log_text().await, &LOSS_LINES);
+    let remote = ctx.remote();
+    ctx.client
+        .command_ok(
+            "remote",
+            &remote,
+            "send_cmd",
+            json!({ "command": "NETWORK_RESTART" }),
+        )
+        .await?;
+    let start = Instant::now();
+    let mp = ctx.mp();
+    // Only a connect line after the last loss line counts: the link must go down first.
+    let mut from: Option<usize> = None;
+    let mut lost = 0;
+    loop {
+        let log = ctx.driver.log_text().await;
+        if let Some(at) = last_loss(&log, lost_before) {
+            from = Some(at);
+        } else if from.is_none() && ctx.client.text(&mp, "state") == "UNAVAILABLE" {
+            from = Some(log.len());
+        }
+        if from.is_some() && lost == 0 {
+            lost = start.elapsed().as_secs().max(1);
+        }
+        if from.is_some_and(|at| connected_after(&log, at)) {
+            break;
+        }
+        ensure!(
+            start.elapsed() < RESTART_LIMIT,
+            "{} {} s after the network restart",
+            if from.is_none() {
+                "the connection was not lost".to_owned()
+            } else {
+                format!("lost after {lost} s, no new connection")
+            },
+            RESTART_LIMIT.as_secs()
+        );
+        ctx.client.listen(1).await?;
+    }
+    let took = start.elapsed().as_secs();
+    // The new second connection replaces the old one only when it works: the old one connects
+    // again by itself, and restore_power needs one to lower the volume.
+    if ctx.oracle.is_some() {
+        let address = ctx.opt.address.clone();
+        let mut tries = 0;
+        let new = loop {
+            tries += 1;
+            match Oracle::connect(&address).await {
+                Ok(oracle) => break oracle,
+                Err(e) if tries >= 10 => {
+                    return Err(Fail::new(format!(
+                        "the driver connected again after {took} s, a new second connection failed: {e}. The old one is kept"
+                    )));
+                }
+                Err(_) => sleep(Duration::from_secs(3)).await,
+            }
+        };
+        if let Some(old) = ctx.oracle.replace(new) {
+            old.close().await;
+        }
+    }
+    wait_available(ctx, 20).await?;
+    ctx.client.listen(3).await?;
+    verify_fresh(ctx).await?;
+    Ok(format!(
+        "lost after {lost} s, connected again {took} s after the network restart"
+    ))
+}
+
 // ---------------------------------------------------------------- control
 
 pub async fn selects(ctx: &mut Ctx) -> Check {
@@ -1131,7 +1234,8 @@ pub async fn source(ctx: &mut Ctx) -> Check {
     let mp = ctx.mp();
     let old = ctx.client.text(&mp, "source");
     let list = strings(ctx.client.attr(&mp, "source_list").unwrap_or(&Value::Null));
-    let new = other_source(&ctx.opt, &old, &list).map_err(Fail::skip)?;
+    let sources = read_sources(ctx).await.map_err(Fail::skip)?;
+    let new = other_source(&source_rule(ctx, &sources), &old, &list).map_err(Fail::skip)?;
     let result = async {
         let start = Instant::now();
         ctx.client
@@ -1167,11 +1271,11 @@ pub async fn source(ctx: &mut Ctx) -> Check {
     ))
 }
 
-/// A source to select for a check, or why there is none. The start source `old` must be one that
-/// a check may select, because the set back selects it again. The receiver lists a `Source`
-/// entry that cannot be selected: it is not used.
-fn other_source(opt: &crate::Options, old: &str, list: &[String]) -> Result<String, String> {
-    if opt.avoid_sources.is_empty() {
+/// A source of the driver list `list` to select for a check, or why there is none. The start
+/// source `old` must be one that a check may select, because the set back selects it again. The
+/// receiver lists a `Source` entry that cannot be selected: it is not used.
+fn other_source(rule: &SourceRule<'_>, old: &str, list: &[String]) -> Result<String, String> {
+    if rule.opt.avoid_sources.is_empty() {
         return Err("no --avoid-sources: no source is selected".to_owned());
     }
     if old.is_empty() || old == "Source" || !list.iter().any(|s| s == old) {
@@ -1179,15 +1283,142 @@ fn other_source(opt: &crate::Options, old: &str, list: &[String]) -> Result<Stri
             "the source {old:?} is not in the list, it could not be set back"
         ));
     }
-    if !opt.may_select(old) {
+    if !rule.label_ok(old) {
         return Err(format!(
-            "the source {old} is in --avoid-sources, the set back would select it"
+            "the source {old} may not be selected, the set back would select it"
         ));
     }
     list.iter()
-        .find(|s| **s != old && *s != "Source" && opt.may_select(s))
+        .find(|s| **s != old && *s != "Source" && rule.label_ok(s))
         .cloned()
         .ok_or_else(|| "only one source".to_owned())
+}
+
+/// The sources of the receiver from the second connection, with the default and automatic names
+/// of the web interface. Error: why no source may be selected.
+async fn read_sources(ctx: &Ctx) -> Result<Vec<SourceInfo>, String> {
+    if ctx.opt.avoid_sources.is_empty() {
+        return Err("no --avoid-sources: no source is selected".to_owned());
+    }
+    let oracle = ctx
+        .oracle
+        .as_ref()
+        .ok_or("no second connection: no source is selected")?;
+    oracle
+        .read_source_names()
+        .await
+        .map_err(|e| format!("{e}: no source is selected"))?;
+    let state = oracle.state();
+    levels_ok(&state.device().source_levels).map_err(|e| format!("{e}: no source is selected"))?;
+    Ok(state.device().sources.as_slice().to_vec())
+}
+
+/// Sources may be selected only while the receiver adds no level to the analog and the digital
+/// inputs: another source can then not be louder at the same volume. Error if a level is above
+/// 0 dB or not known.
+fn levels_ok(levels: &SourceLevels) -> Result<(), String> {
+    match (levels.analog_db, levels.digital_db) {
+        (Some(analog), Some(digital)) if analog <= 0 && digital <= 0 => Ok(()),
+        (Some(analog), Some(digital)) => Err(format!(
+            "the input levels are above 0 dB (analog {analog} dB, digital {digital} dB)"
+        )),
+        _ => Err("the input levels are not known".to_owned()),
+    }
+}
+
+/// Why the saved source `code` of an earlier run may not be set back, or `None` if it may: it and
+/// the current source must both pass the source rule of this run. The receiver may have a tuner:
+/// the setup has not run yet.
+pub async fn source_set_back(oracle: &Oracle, opt: &crate::Options, code: &str) -> Option<String> {
+    if opt.avoid_sources.is_empty() {
+        return Some("no --avoid-sources".to_owned());
+    }
+    if opt.no_oracle {
+        return Some("--no-oracle".to_owned());
+    }
+    if let Err(e) = oracle.read_source_names().await {
+        return Some(e.msg);
+    }
+    let state = oracle.state();
+    if let Err(e) = levels_ok(&state.device().source_levels) {
+        return Some(e);
+    }
+    let rule = SourceRule {
+        opt,
+        sources: state.device().sources.as_slice(),
+        tuner: true,
+    };
+    let current = state.zone(Zone::Main).source.clone();
+    if !rule.code_ok(code) {
+        Some(format!("the saved source {code} may not be selected"))
+    } else if !current.as_deref().is_some_and(|c| rule.code_ok(c)) {
+        Some(format!(
+            "the source {} may not be changed",
+            current.as_deref().unwrap_or("(unknown)")
+        ))
+    } else {
+        None
+    }
+}
+
+/// The source rule of the run for these sources.
+fn source_rule<'a>(ctx: &'a Ctx, sources: &'a [SourceInfo]) -> SourceRule<'a> {
+    SourceRule {
+        opt: &ctx.opt,
+        sources,
+        tuner: ctx.tuner,
+    }
+}
+
+/// Which sources the checks may select.
+struct SourceRule<'a> {
+    opt: &'a crate::Options,
+    /// The sources of the receiver, from [`read_sources`].
+    sources: &'a [SourceInfo],
+    /// The receiver has a tuner.
+    tuner: bool,
+}
+
+impl SourceRule<'_> {
+    fn info(&self, code: &str) -> Option<&SourceInfo> {
+        self.sources.iter().find(|s| s.code == code)
+    }
+
+    /// The source with this telnet code may be selected.
+    fn code_ok(&self, code: &str) -> bool {
+        self.info(code)
+            .is_some_and(|info| may_send_source(self.opt, info, self.tuner))
+    }
+
+    /// The source with this name in the driver list may be selected. The driver has only the
+    /// telnet names, so it shows the user name, else the code, and adds the code in parentheses
+    /// when two sources have the same name. The default name also counts here: it can only make a
+    /// name fit more than one source. A name that fits more than one source is not selected.
+    fn label_ok(&self, label: &str) -> bool {
+        let mut found = self.sources.iter().filter(|s| label_fits(s, label));
+        match (found.next(), found.next()) {
+            (Some(info), None) => may_send_source(self.opt, info, self.tuner),
+            _ => false,
+        }
+    }
+}
+
+/// The driver can show the source with this name.
+fn label_fits(info: &SourceInfo, label: &str) -> bool {
+    let names = [
+        info.name.as_deref(),
+        info.default_name.as_deref(),
+        Some(info.code.as_str()),
+    ];
+    let with_code = label
+        .strip_suffix(')')
+        .and_then(|rest| rest.rsplit_once(" ("))
+        .filter(|(_, code)| *code == info.code)
+        .map(|(name, _)| name);
+    names
+        .into_iter()
+        .flatten()
+        .any(|name| name == label || with_code == Some(name))
 }
 
 /// Select the old source again. It is always sent: after an error the driver can show a source
@@ -1683,7 +1914,10 @@ async fn http_checks(ctx: &mut Ctx, old_sound: &str, start_source: &mut Option<S
     let old = ctx.client.text(&mp, "source");
     let list = strings(ctx.client.attr(&mp, "source_list").unwrap_or(&Value::Null));
     ensure!(!list.is_empty(), "no source list over HTTP");
-    match other_source(&ctx.opt, &old, &list) {
+    let picked = read_sources(ctx)
+        .await
+        .and_then(|sources| other_source(&source_rule(ctx, &sources), &old, &list));
+    match picked {
         Ok(new) => {
             *start_source = Some(old.clone());
             let start = Instant::now();
@@ -2791,7 +3025,11 @@ pub async fn settings_restore(ctx: &mut Ctx) -> Check {
     };
     restore::ensure_nothing_left()?;
     let avr = oracle.avr();
-    let saved = restore::read(avr, restore::QUERIES).await?;
+    let mut saved = restore::read(avr, restore::QUERIES).await?;
+    restore::ensure_source(&saved)?;
+    // The check does not change the source. A marked line is never sent, so a file left by a stop
+    // never selects a source.
+    restore::mark_source(&mut saved);
     let sleep = saved
         .iter()
         .find(|l| l.starts_with("SLP"))
@@ -2829,8 +3067,8 @@ pub async fn settings_restore(ctx: &mut Ctx) -> Check {
 }
 
 /// Send every simple command of the remote entity, and check the entities against the receiver.
-/// The settings that the commands change are saved first and set back at the end, also when the
-/// check fails.
+/// The settings that the commands change and the source are saved first and set back at the end,
+/// also when the check fails. The source is set back only if it may be selected.
 pub async fn simple_commands(ctx: &mut Ctx) -> Check {
     ensure_on(ctx).await?;
     let Some(oracle) = &ctx.oracle else {
@@ -2839,9 +3077,19 @@ pub async fn simple_commands(ctx: &mut Ctx) -> Check {
         ));
     };
     restore::ensure_nothing_left()?;
-    let saved = restore::read(oracle.avr(), restore::QUERIES).await?;
+    let mut saved = restore::read(oracle.avr(), restore::QUERIES).await?;
+    restore::ensure_source(&saved)?;
+    let start = restore::saved_source(&saved);
+    let plan = match read_sources(ctx).await {
+        Ok(sources) => SourcePlan::new(&source_rule(ctx, &sources), start),
+        Err(why) => SourcePlan::none(why),
+    };
+    // The file never holds a source that may not be selected: the next run would select it.
+    if !plan.start_ok {
+        restore::mark_source(&mut saved);
+    }
     restore::save(&saved).await?;
-    let result = send_simple_commands(ctx).await;
+    let result = send_simple_commands(ctx, &plan).await;
     let oracle = ctx
         .oracle
         .as_ref()
@@ -2891,7 +3139,7 @@ fn command_fields(line: &str) -> Option<(&str, &str, &str)> {
     Some((name, brand, parts.next().unwrap_or_default()))
 }
 
-async fn send_simple_commands(ctx: &mut Ctx) -> Check {
+async fn send_simple_commands(ctx: &mut Ctx, plan: &SourcePlan) -> Check {
     let remote = ctx.remote();
     let list = entity_list(ctx).await?;
     let offered = strings(
@@ -2903,22 +3151,43 @@ async fn send_simple_commands(ctx: &mut Ctx) -> Check {
     let table = tokio::fs::read_to_string(&ctx.opt.commands)
         .await
         .map_err(|e| Fail::new(format!("{}: {e}", ctx.opt.commands.display())))?;
-    // No source (`SI`) command is sent: the names do not tell which source a code is. The table
-    // built into the driver counts too, in case `--commands` is another file.
-    let sources: BTreeSet<&str> = COMMANDS
+    // The sources of the source (`SI`) commands. The table built into the driver counts too, in
+    // case `--commands` is another file.
+    let source_codes: Vec<(&str, &str)> = COMMANDS
         .lines()
         .chain(table.lines())
         .filter_map(command_fields)
-        .filter(|(_, _, text)| text.starts_with("SI"))
-        .map(|(name, _, _)| name)
+        .filter_map(|(name, _, text)| Some((name, text.strip_prefix("SI")?)))
         .collect();
-    let names: Vec<&str> = table
+    let mut source_count = 0;
+    let mut names: Vec<&str> = table
         .lines()
         .filter_map(command_fields)
-        .filter(|(name, brand, _)| *brand != "marantz" && !sources.contains(name))
+        .filter(|(_, brand, _)| *brand != "marantz")
         .map(|(name, _, _)| name)
         .filter(|n| offered.iter().any(|o| o == n) && !skipped(n))
+        .filter(|n| {
+            let codes: Vec<&str> = source_codes
+                .iter()
+                .filter(|(name, _)| name == n)
+                .map(|(_, code)| *code)
+                .collect();
+            let ok = plan.command_ok(n, &codes);
+            source_count += usize::from(ok && !codes.is_empty());
+            ok
+        })
         .collect();
+    // Source and tuner commands go last: some settings are kept for each source, so the other
+    // commands change the settings of the start source, which the set back compares.
+    names.sort_by_key(|n| changes_source(n, &source_codes));
+    let tuner_offered = offered.iter().any(|o| o.starts_with("TUNER_"));
+    let source_note = if plan.start_ok && (plan.tuner_ok || !tuner_offered) {
+        format!(", {source_count} source commands")
+    } else if plan.start_ok {
+        format!(", {source_count} source commands, no tuner command")
+    } else {
+        format!(", no source or tuner command: {}", plan.why)
+    };
     ensure!(names.len() > 250, "only {} commands to send", names.len());
     let mut problems = Vec::new();
     let mut refused: Vec<String> = Vec::new();
@@ -2940,7 +3209,25 @@ async fn send_simple_commands(ctx: &mut Ctx) -> Check {
     let limit = unmute_limit(baseline);
     // A speaker preset command was sent since the last compare.
     let mut preset_sent = false;
+    let mut sent = names.len();
     for (i, name) in names.iter().enumerate() {
+        // A source or tuner command can switch the zone on, at a volume that is lowered only
+        // afterwards. These commands are sent last, so the stop skips only them.
+        if changes_source(name, &source_codes)
+            && ctx.oracle.as_ref().is_none_or(|o| {
+                o.state().zone(Zone::Main).power != Some(denon_marantz::proto::Power::On)
+            })
+        {
+            // First, so that the list stays short and still shows it.
+            problems.insert(
+                0,
+                format!(
+                    "{name} and the source and tuner commands after it not sent: the main zone is not on"
+                ),
+            );
+            sent = i;
+            break;
+        }
         let (response, took) = ctx
             .client
             .command("remote", &remote, "send_cmd", json!({ "command": name }))
@@ -2993,17 +3280,114 @@ async fn send_simple_commands(ctx: &mut Ctx) -> Check {
         // The effect of one command is not checked: only that the entities showed the values of
         // the receiver after each group of 10 commands.
         Ok(format!(
-            "{} commands accepted ({} refused with a reason: {refused:?}), the effect of each is not verified, entities matched the receiver after every 10 commands{start_note}",
+            "{} commands accepted ({} refused with a reason: {refused:?}){source_note}, the effect of each is not verified, entities matched the receiver after every 10 commands{start_note}",
             names.len() - refused.len(),
             refused.len()
         ))
     } else {
         problems.truncate(12);
         Err(Fail::new(format!(
-            "{} commands sent. Problems: {}{start_note}",
-            names.len(),
+            "{sent} commands sent{source_note}. Problems: {}{start_note}",
             problems.join(" | ")
         )))
+    }
+}
+
+/// A source may be selected: the receiver gives its name, the source names page gives its default
+/// name, the receiver reports it as in use, and neither its code nor any of its names contains a
+/// name of `--avoid-sources`, without case. Tuner sources only with a tuner. Without
+/// `--avoid-sources`, no source.
+///
+/// A source without a default name is not on the names page, so the name of the device on its
+/// input is not known either. Without a name, the receiver may not have sent it yet.
+fn may_send_source(opt: &crate::Options, info: &SourceInfo, tuner: bool) -> bool {
+    if !tuner && TUNER_CODES.contains(&info.code.as_str()) {
+        return false;
+    }
+    if info.in_use != Some(true) || info.name.is_none() || info.default_name.is_none() {
+        return false;
+    }
+    [
+        Some(info.code.as_str()),
+        info.name.as_deref(),
+        info.default_name.as_deref(),
+        info.auto_name.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .all(|name| opt.may_select(name))
+}
+
+/// The simple command `name` can change the source: a source command or a tuner command.
+fn changes_source(name: &str, source_codes: &[(&str, &str)]) -> bool {
+    name.starts_with("TUNER_") || source_codes.iter().any(|(n, _)| *n == name)
+}
+
+/// Telnet codes of the tuner sources.
+const TUNER_CODES: [&str; 2] = ["TUNER", "HDRADIO"];
+
+/// Which source and tuner commands the simple command check sends.
+struct SourcePlan {
+    /// The start source may be selected. The set back at the end selects it again, so no source
+    /// or tuner command is sent without it.
+    start_ok: bool,
+    /// The start source may be selected, a tuner source exists and each tuner source may be
+    /// selected: a tuner command can select the tuner.
+    tuner_ok: bool,
+    /// Codes of the sources that may be selected.
+    allowed: Vec<String>,
+    /// Why no source command is sent, when `start_ok` is false.
+    why: String,
+}
+
+impl SourcePlan {
+    /// The plan for the start source with telnet code `start`.
+    fn new(rule: &SourceRule<'_>, start: Option<&str>) -> Self {
+        let start_ok = start.is_some_and(|code| rule.code_ok(code));
+        let mut tuners = TUNER_CODES
+            .into_iter()
+            .filter(|code| rule.info(code).is_some())
+            .peekable();
+        let tuner_ok = start_ok && tuners.peek().is_some() && tuners.all(|c| rule.code_ok(c));
+        let allowed = rule
+            .sources
+            .iter()
+            .filter(|s| may_send_source(rule.opt, s, rule.tuner))
+            .map(|s| s.code.clone())
+            .collect();
+        let why = if start_ok {
+            String::new()
+        } else {
+            format!(
+                "the start source {} may not be selected",
+                start.unwrap_or("(unknown)")
+            )
+        };
+        Self {
+            start_ok,
+            tuner_ok,
+            allowed,
+            why,
+        }
+    }
+
+    /// No source or tuner command, for this reason.
+    fn none(why: String) -> Self {
+        Self {
+            start_ok: false,
+            tuner_ok: false,
+            allowed: Vec::new(),
+            why,
+        }
+    }
+
+    /// The simple command `name` may be sent. `codes` are the sources that it selects: empty if it
+    /// is not a source command.
+    fn command_ok(&self, name: &str, codes: &[&str]) -> bool {
+        if !codes.is_empty() {
+            return self.start_ok && codes.iter().all(|c| self.allowed.iter().any(|a| a == c));
+        }
+        self.tuner_ok || !name.starts_with("TUNER_")
     }
 }
 
@@ -3482,40 +3866,252 @@ mod tests {
         names.iter().map(|n| (*n).to_owned()).collect()
     }
 
+    fn source(code: &str, name: Option<&str>, auto_name: Option<&str>) -> SourceInfo {
+        SourceInfo {
+            code: code.to_owned(),
+            name: name.map(str::to_owned),
+            in_use: Some(true),
+            default_name: Some(code.to_owned()),
+            auto_name: auto_name.map(str::to_owned),
+            hdmi_input: None,
+            digital_input: None,
+            analog_input: None,
+            video_input: None,
+        }
+    }
+
+    #[test]
+    fn a_source_may_be_selected_only_with_a_name_that_is_not_avoided() {
+        let opt = options(&["oppo"]);
+        let tv = source("MPLAY", Some("Apple TV"), None);
+        assert!(may_send_source(&opt, &tv, false));
+        assert!(
+            !may_send_source(&options(&[]), &tv, false),
+            "no --avoid-sources"
+        );
+        let renamed = source("BD", Some("OPPO"), None);
+        assert!(!may_send_source(&opt, &renamed, false));
+        let auto = source("BD", Some("Blu-ray"), Some("Oppo UDP-203"));
+        assert!(!may_send_source(&opt, &auto, false), "auto name");
+        let default = SourceInfo {
+            default_name: Some("Oppo".to_owned()),
+            ..source("BD", Some("Blu-ray"), None)
+        };
+        assert!(!may_send_source(&opt, &default, false), "default name");
+        assert!(
+            !may_send_source(&options(&["bd"]), &auto, false),
+            "telnet code"
+        );
+        let no_name = source("CD", None, None);
+        assert!(!may_send_source(&opt, &no_name, false), "name not known");
+        let not_on_page = SourceInfo {
+            default_name: None,
+            ..source("DVD", Some("DVD"), None)
+        };
+        assert!(
+            !may_send_source(&opt, &not_on_page, false),
+            "not on the names page"
+        );
+        let hidden = SourceInfo {
+            in_use: Some(false),
+            ..source("CD", Some("CD"), None)
+        };
+        assert!(!may_send_source(&opt, &hidden, false));
+        let unknown = SourceInfo {
+            in_use: None,
+            ..source("CD", Some("CD"), None)
+        };
+        assert!(!may_send_source(&opt, &unknown, false), "in use not known");
+        for code in TUNER_CODES {
+            let tuner = source(code, Some("Radio"), None);
+            assert!(!may_send_source(&opt, &tuner, false), "{code}");
+            assert!(may_send_source(&opt, &tuner, true), "{code}");
+        }
+    }
+
+    #[test]
+    fn only_a_connect_after_the_last_loss_counts() {
+        let old = "[A] connected in 20 ms\n";
+        assert_eq!(None, last_loss(old, 0));
+        let lost = format!("{old}telnet connection lost\n");
+        let at = last_loss(&lost, 0).expect("lost");
+        assert!(
+            !connected_after(&lost, at),
+            "the old connect is before the loss"
+        );
+        assert_eq!(None, last_loss(&lost, 1), "a loss from before the restart");
+        let again = format!("{lost}[A] telnet disconnected\ntelnet connected\n");
+        let at = last_loss(&again, 1).expect("lost");
+        assert!(connected_after(&again, at));
+        assert!(
+            !connected_after("[A] telnet disconnected\n", 0),
+            "not a connect line"
+        );
+        assert!(!connected_after(old, old.len() + 1), "past the end");
+    }
+
+    #[test]
+    fn a_driver_label_fits_one_source() {
+        let bd = source("BD", Some("Blu-ray"), None);
+        assert!(label_fits(&bd, "Blu-ray"));
+        assert!(label_fits(&bd, "Blu-ray (BD)"));
+        assert!(label_fits(&bd, "BD"));
+        assert!(!label_fits(&bd, "Blu-ray (DVD)"));
+        assert!(!label_fits(&bd, "Blu"));
+        let opt = options(&["oppo"]);
+        let sources = [bd, source("DVD", Some("Blu-ray"), None)];
+        let rule = SourceRule {
+            opt: &opt,
+            sources: &sources,
+            tuner: false,
+        };
+        assert!(!rule.label_ok("Blu-ray"), "two sources have the name");
+        assert!(rule.label_ok("Blu-ray (DVD)"));
+        assert!(!rule.label_ok("Apple TV"), "not a source of the receiver");
+    }
+
+    fn receiver_sources() -> Vec<SourceInfo> {
+        vec![
+            source("BD", Some("OPPO"), None),
+            source("TV", Some("TV Audio"), None),
+            source("MPLAY", Some("Apple TV"), None),
+        ]
+    }
+
     #[test]
     fn other_source_is_one_that_may_be_selected() {
         let opt = options(&["oppo"]);
-        let sources = list(&["Source", "OPPO", "TV Audio", "Apple TV"]);
+        let sources = receiver_sources();
+        let rule = SourceRule {
+            opt: &opt,
+            sources: &sources,
+            tuner: false,
+        };
+        let shown = list(&["Source", "OPPO", "TV Audio", "Apple TV"]);
         assert_eq!(
-            other_source(&opt, "TV Audio", &sources),
+            other_source(&rule, "TV Audio", &shown),
             Ok("Apple TV".to_owned())
         );
         assert_eq!(
-            other_source(&opt, "Apple TV", &sources),
+            other_source(&rule, "Apple TV", &shown),
             Ok("TV Audio".to_owned())
         );
         let two = list(&["Source", "OPPO", "Apple TV"]);
         assert!(
-            other_source(&opt, "Apple TV", &two).is_err(),
+            other_source(&rule, "Apple TV", &two).is_err(),
             "only one source"
         );
+        // The code counts too: `BD` avoids the source shown as `OPPO`.
+        let by_code = options(&["bd", "tv audio"]);
+        let rule = SourceRule {
+            opt: &by_code,
+            ..rule
+        };
+        let shown = list(&["OPPO", "Apple TV", "TV Audio"]);
+        assert!(other_source(&rule, "Apple TV", &shown).is_err());
     }
 
     #[test]
     fn other_source_needs_a_start_source_that_can_be_set_back() {
-        let sources = list(&["Source", "OPPO", "TV Audio", "Apple TV"]);
+        let shown = list(&["Source", "OPPO", "TV Audio", "Apple TV"]);
+        let sources = receiver_sources();
         let opt = options(&["oppo"]);
-        assert!(other_source(&options(&[]), "TV Audio", &sources).is_err());
-        assert!(other_source(&opt, "", &sources).is_err(), "no start source");
-        assert!(other_source(&opt, "Source", &sources).is_err());
+        let rule = SourceRule {
+            opt: &opt,
+            sources: &sources,
+            tuner: false,
+        };
+        let none = options(&[]);
+        let no_avoid = SourceRule { opt: &none, ..rule };
+        assert!(other_source(&no_avoid, "TV Audio", &shown).is_err());
+        assert!(other_source(&rule, "", &shown).is_err(), "no start source");
+        assert!(other_source(&rule, "Source", &shown).is_err());
         assert!(
-            other_source(&opt, "CD", &sources).is_err(),
+            other_source(&rule, "CD", &shown).is_err(),
             "not in the list"
         );
         assert!(
-            other_source(&opt, "OPPO", &sources).is_err(),
+            other_source(&rule, "OPPO", &shown).is_err(),
             "the set back would select an avoided source"
         );
+    }
+
+    #[test]
+    fn sources_are_selected_only_without_added_input_levels() {
+        let levels = |analog_db, digital_db| SourceLevels {
+            analog_db,
+            digital_db,
+        };
+        assert!(levels_ok(&levels(Some(0), Some(0))).is_ok());
+        assert!(levels_ok(&levels(Some(-12), Some(-3))).is_ok());
+        assert!(levels_ok(&levels(Some(1), Some(0))).is_err());
+        assert!(levels_ok(&levels(Some(0), Some(12))).is_err());
+        assert!(levels_ok(&levels(None, Some(0))).is_err(), "not known");
+        assert!(levels_ok(&levels(Some(0), None)).is_err(), "not known");
+    }
+
+    #[test]
+    fn source_and_tuner_commands_are_sent_last() {
+        let codes = [("INPUT_TV", "TV")];
+        let mut names = vec!["INPUT_TV", "MUTE_ON", "TUNER_BAND_FM", "SLEEP_OFF"];
+        names.sort_by_key(|n| changes_source(n, &codes));
+        assert_eq!(
+            vec!["MUTE_ON", "SLEEP_OFF", "INPUT_TV", "TUNER_BAND_FM"],
+            names
+        );
+    }
+
+    #[test]
+    fn source_and_tuner_commands_follow_the_start_source() {
+        let opt = options(&["oppo"]);
+        let mut sources = receiver_sources();
+        sources.push(source("TUNER", Some("Radio"), None));
+        let rule = SourceRule {
+            opt: &opt,
+            sources: &sources,
+            tuner: true,
+        };
+        let plan = SourcePlan::new(&rule, Some("MPLAY"));
+        assert!(plan.command_ok("INPUT_TV", &["TV"]));
+        assert!(!plan.command_ok("INPUT_BD", &["BD"]), "avoided");
+        assert!(!plan.command_ok("INPUT_CD", &["CD"]), "not a source");
+        assert!(
+            !plan.command_ok("INPUT_X", &["TV", "BD"]),
+            "one code avoided"
+        );
+        assert!(plan.command_ok("TUNER_BAND_FM", &[]));
+        assert!(plan.command_ok("SLEEP_OFF", &[]));
+
+        let avoided_start = SourcePlan::new(&rule, Some("BD"));
+        assert!(!avoided_start.start_ok);
+        assert!(avoided_start.why.contains("BD"), "{}", avoided_start.why);
+        assert!(!avoided_start.command_ok("INPUT_TV", &["TV"]));
+        assert!(!avoided_start.command_ok("TUNER_BAND_FM", &[]));
+        assert!(avoided_start.command_ok("SLEEP_OFF", &[]));
+        assert!(!SourcePlan::new(&rule, None).start_ok, "unknown start");
+        assert!(!SourcePlan::new(&rule, Some("CD")).start_ok, "not known");
+
+        let radio = options(&["oppo", "radio"]);
+        let rule = SourceRule {
+            opt: &radio,
+            ..rule
+        };
+        let plan = SourcePlan::new(&rule, Some("MPLAY"));
+        assert!(plan.start_ok);
+        assert!(!plan.command_ok("TUNER_BAND_FM", &[]), "tuner avoided");
+        let no_tuner = &sources[..3];
+        let rule = SourceRule {
+            opt: &opt,
+            sources: no_tuner,
+            tuner: false,
+        };
+        let plan = SourcePlan::new(&rule, Some("MPLAY"));
+        assert!(!plan.command_ok("TUNER_BAND_FM", &[]), "no tuner source");
+
+        let none = SourcePlan::none("no --avoid-sources".to_owned());
+        assert!(!none.command_ok("INPUT_TV", &["TV"]));
+        assert!(!none.command_ok("TUNER_BAND_FM", &[]));
+        assert!(none.command_ok("SLEEP_OFF", &[]));
     }
 
     #[test]

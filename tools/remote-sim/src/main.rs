@@ -3,7 +3,8 @@
 
 //! Test program that acts as the Remote. It starts the driver, sets it up with a real receiver
 //! and runs the checks of the guided manual test over the WebSocket. The volume is never set
-//! above the limit in `checks::MAX_VOLUME`.
+//! above the limit in `checks::MAX_VOLUME`. The names in [`AVOID_FILE`] are always added to
+//! `--avoid-sources`.
 //!
 //! Usage: `remote-sim <receiver address> [--driver <path>] [--only a,b] [--skip a,b]
 //! [--kinds a,b] [--avoid-sources a,b] [--no-power] [--no-oracle] [--port <port>] [--commands <path>]`
@@ -21,7 +22,7 @@ use std::time::Instant;
 use ws::Client;
 
 /// All steps in the order of [`run`].
-const STEPS: [&str; 29] = [
+const STEPS: [&str; 30] = [
     "metadata",
     "setup",
     "entities",
@@ -49,6 +50,7 @@ const STEPS: [&str; 29] = [
     "extra_entities",
     "settings_restore",
     "simple_commands",
+    "receiver_restart",
     "restore_power",
     "log",
 ];
@@ -59,7 +61,7 @@ const BASE_STEPS: [&str; 3] = ["setup", "entities", "states"];
 /// the driver log. They always run.
 const END_STEPS: [&str; 2] = ["restore_power", "log"];
 /// Steps that run only if `--only` names them.
-const OPT_IN_STEPS: [&str; 0] = [];
+const OPT_IN_STEPS: [&str; 1] = ["receiver_restart"];
 
 /// A step in [`END_STEPS`] always runs. Else `--skip` wins. Without `--only`, all steps except
 /// [`OPT_IN_STEPS`] run. With `--only`, the named steps and [`BASE_STEPS`] run.
@@ -83,6 +85,31 @@ pub fn repo_root() -> &'static Path {
         .ancestors()
         .nth(2)
         .expect("tools/remote-sim is in the repository")
+}
+
+/// Local file with sources that the checks never select, in the folder of this tool. Git ignores
+/// it, so it can hold real source names. Names are separated by commas or new lines. Each whole
+/// entry must be part of a name or code of the source, so the file has no comments.
+pub const AVOID_FILE: &str = "avoid-sources.txt";
+
+/// The names in [`AVOID_FILE`]. A missing file gives no names.
+fn read_avoid_file(path: &Path) -> Result<Vec<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(avoid_names(&text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// Names separated by commas or new lines. A byte order mark and spaces around a name are removed,
+/// and empty names are left out.
+fn avoid_names(text: &str) -> Vec<String> {
+    text.trim_start_matches('\u{feff}')
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// A failed or skipped check.
@@ -134,8 +161,9 @@ pub struct Options {
     pub commands: PathBuf,
     /// Selects for the sweep. Empty: all.
     pub kinds: Vec<String>,
-    /// Sources that the checks never select: a source whose name contains one of these, without
-    /// case. Empty: the checks select no source at all.
+    /// Sources that the checks never select: a source whose telnet code or any name contains one
+    /// of these, without case. Also filled from [`AVOID_FILE`]. Empty: the checks select no source
+    /// at all.
     pub avoid_sources: Vec<String>,
 }
 
@@ -358,7 +386,7 @@ fn step_list(flag: &str, value: Option<String>) -> Result<Vec<String>, String> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let opt = match parse() {
+    let mut opt = match parse() {
         Ok(o) => o,
         Err(e) => {
             eprintln!(
@@ -367,6 +395,24 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    let avoid_file = Path::new(env!("CARGO_MANIFEST_DIR")).join(AVOID_FILE);
+    match read_avoid_file(&avoid_file) {
+        Ok(names) if names.is_empty() => {
+            println!("No sources to avoid in {}", avoid_file.display());
+        }
+        Ok(names) => {
+            println!(
+                "Sources to avoid from {}: {}",
+                avoid_file.display(),
+                names.len()
+            );
+            opt.avoid_sources.extend(names);
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    }
     if let Some(note) = skip_note(&opt.skip) {
         println!("{note}");
     }
@@ -378,7 +424,7 @@ async fn main() {
         eprintln!("cannot create {}: {e}", dir.display());
         std::process::exit(2);
     }
-    if let Some(note) = restore::after_early_stop(&opt.address).await {
+    if let Some(note) = restore::after_early_stop(&opt).await {
         println!("{note}");
     }
     let mut driver = Driver::new(&opt.bin, &dir, opt.port);
@@ -467,6 +513,8 @@ async fn middle_steps(ctx: &mut Ctx) {
     ctx.step("extra_entities", checks::extra_entities).await;
     ctx.step("settings_restore", checks::settings_restore).await;
     ctx.step("simple_commands", checks::simple_commands).await;
+    // Takes long, so only with `--only receiver_restart`.
+    ctx.step("receiver_restart", checks::receiver_restart).await;
 }
 
 #[cfg(test)]
@@ -496,7 +544,11 @@ pub mod tests {
     #[test]
     fn step_selection() {
         for name in STEPS {
-            assert!(selected(&[], &[], name), "no --only runs {name}");
+            assert_eq!(
+                !OPT_IN_STEPS.contains(&name),
+                selected(&[], &[], name),
+                "no --only runs {name}"
+            );
         }
         let only = names(&["volume"]);
         for name in [
@@ -512,6 +564,9 @@ pub mod tests {
         assert!(!selected(&only, &[], "metadata"));
         assert!(!selected(&only, &[], "mute"));
         assert!(!selected(&only, &only, "volume"), "--skip wins");
+        for name in OPT_IN_STEPS {
+            assert!(selected(&names(&[name]), &[], name), "--only runs {name}");
+        }
         assert!(!selected(&[], &names(&["mute"]), "mute"));
         let end = names(&["restore_power", "log"]);
         for name in END_STEPS {
@@ -697,6 +752,29 @@ pub mod tests {
         assert!(opt.bin.starts_with(repo_root()));
         assert!(opt.commands.starts_with(repo_root()));
         assert!(repo_root().join("resources/commands.tsv").is_file());
+    }
+
+    #[test]
+    fn avoid_file_names_are_split_by_commas_and_lines() {
+        assert_eq!(
+            names(&["Oppo", "Blu-ray", "Game"]),
+            avoid_names(" Oppo ,\n\nBlu-ray\r\nGame,")
+        );
+        assert_eq!(names(&["Oppo"]), avoid_names("\u{feff}Oppo\n"));
+        assert!(avoid_names("\n , \n").is_empty());
+        let missing = std::env::temp_dir().join("remote-sim-no-such-avoid-file.txt");
+        assert_eq!(Ok(Vec::new()), read_avoid_file(&missing));
+        assert!(read_avoid_file(&std::env::temp_dir()).is_err(), "a folder");
+    }
+
+    #[test]
+    fn the_avoid_file_is_ignored_by_git() {
+        let ignore = include_str!("../../../.gitignore");
+        let path = format!("/tools/remote-sim/{AVOID_FILE}");
+        assert!(
+            ignore.lines().any(|l| l == path),
+            "{path} not in .gitignore"
+        );
     }
 
     #[test]

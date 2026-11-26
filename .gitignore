@@ -10,3 +10,4 @@
 /tools/remote-sim/target
 /settings.json
 remote-sim-restore.txt
+/tools/remote-sim/avoid-sources.txt
