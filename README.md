@@ -37,7 +37,8 @@ Bluetooth or with zone 2. Please report problems as
 - **Remote**: the simple commands of the Python integration (about 370), `BT_LEVEL_UP`/`DOWN`,
   `TACTILE_CHANNEL_*` (the channel of the tactile transducer, `CVTTR`), commands of older receivers (see
   [Older receivers](#older-receivers)), up to 15 UI pages, button mapping, repeat and button sequences. Text
-  of up to 28 characters is sent to the receiver as it is.
+  of up to 28 characters is sent to the receiver as it is. `volume`, `select_source` and `select_sound_mode`
+  are not simple commands: they need a parameter.
 - **Selects**: sound mode, input source, reference level, dynamic volume, dimmer, eco mode. With telnet also
   monitor output, speaker preset, picture mode, digital codec and, if the receiver has Dirac, the Dirac filter
   (only the slots that have a filter).
@@ -234,7 +235,7 @@ cargo run --release
 | `UC_INTEGRATION_HTTP_PORT` | `9090`            | WebSocket port.                                                 |
 | `UC_DISABLE_MDNS_PUBLISH`  | `false`           | Do not announce the driver with mDNS.                           |
 | `UC_SETUP_TIMEOUT`         | `3600`            | Setup timeout in seconds. `0` disables it.                      |
-| `UC_API_MSG_TRACING`       | off               | Log WebSocket messages: `all`, `in` or `out`.                   |
+| `UC_API_MSG_TRACING`       | off               | Log WebSocket messages: `all`, `in` or `out`. No backup data.   |
 | `RUST_LOG`                 | `info`            | Log level, for example `info,denon_marantz=debug`.              |
 
 ## Run with Docker

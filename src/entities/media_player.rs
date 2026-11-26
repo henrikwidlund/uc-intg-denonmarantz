@@ -50,20 +50,19 @@ const FEATURES: &[F] = &[
     F::Info,
 ];
 
-/// Commands that every receiver has, in the names of the Python integration.
+/// Commands that every receiver has, in the names of the Python integration, for the simple
+/// commands of the remote entity. Commands that need a parameter are left out: a simple command has
+/// none.
 pub const BASE_COMMANDS: &[&str] = &[
     "play_pause",
     "stop",
     "next",
     "previous",
-    "volume",
     "volume_up",
     "volume_down",
     "mute_toggle",
     "mute",
     "unmute",
-    "select_source",
-    "select_sound_mode",
     "cursor_up",
     "cursor_down",
     "cursor_left",

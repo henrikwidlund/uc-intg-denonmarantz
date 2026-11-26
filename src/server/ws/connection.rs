@@ -8,7 +8,8 @@ use crate::controller::{NewR2Session, R2SessionDisconnect, SendWsMessage};
 use crate::errors::ServiceError;
 use crate::server::ws::WsConn;
 use actix::{Actor, ActorFutureExt, Addr, AsyncContext, Handler, WrapFuture};
-use actix_ws::{AggregatedMessage, CloseCode, CloseReason, Session};
+use actix_ws::{AggregatedMessage, CloseCode, CloseReason, ProtocolError, Session};
+use futures::{Stream, StreamExt};
 use log::{debug, error, info, warn};
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -26,6 +27,8 @@ const MAILBOX_CAPACITY: usize = 1024;
 const INVALID_LIMIT: u8 = 5;
 /// Starts at the first message that is not a JSON object.
 const INVALID_WINDOW: Duration = Duration::from_secs(60);
+/// Longest wait for a close frame after a read error.
+const BUFFERED_CLOSE_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Sends messages from the controller to the WebSocket connection.
 ///
@@ -71,7 +74,11 @@ impl Handler<SendWsMessage> for WsSender {
                         }
                         SendWsMessage::Text(text) => {
                             if msg_tracing_out {
-                                debug!("[{id}] <- {text}");
+                                if is_backup_message(&text) {
+                                    debug!("[{id}] <- <backup data hidden>");
+                                } else {
+                                    debug!("[{id}] <- {text}");
+                                }
                             }
                             session.text(text).await.map_err(|_| None)
                         }
@@ -127,6 +134,21 @@ impl InvalidMessages {
     }
 }
 
+/// Returns [`WsSender::closed`].
+#[cfg(test)]
+#[derive(actix::Message)]
+#[rtype(result = "bool")]
+struct IsClosed;
+
+#[cfg(test)]
+impl Handler<IsClosed> for WsSender {
+    type Result = bool;
+
+    fn handle(&mut self, _: IsClosed, _: &mut Self::Context) -> bool {
+        self.closed
+    }
+}
+
 impl WsConn {
     /// Runs the message processing of the WebSocket connection until it is closed.
     ///
@@ -139,7 +161,6 @@ impl WsConn {
         mut stream: actix_ws::AggregatedMessageStream,
     ) {
         use actix_web::rt::time;
-        use futures::StreamExt;
 
         // Only header-based authentication is used, so the authentication message is sent right away.
         // It has the driver version, so the Remote does not need to ask for it.
@@ -161,13 +182,17 @@ impl WsConn {
             })
             .await
         {
-            error!("Error registering new WebSocket connection: {e}");
+            error!(
+                "[{}] Error registering new WebSocket connection: {e}",
+                self.id
+            );
             let _ = session
                 .close(Some(CloseReason {
                     code: CloseCode::Error,
                     description: Some("internal error".into()),
                 }))
                 .await;
+            debug!("[{}] stopped", self.id);
             return;
         }
 
@@ -203,8 +228,19 @@ impl WsConn {
                             }
                         }
                         Some(Err(e)) => {
-                            info!("[{}] Closing WebSocket: {e:?}", self.id);
-                            close(session, None).await;
+                            let reply = if let Some(reason) = buffered_close(&mut stream).await {
+                                debug!("[{}] Read error before the close frame: {e:?}", self.id);
+                                info!(
+                                    "[{}] Remote closed connection. Reason: {reason:?}",
+                                    self.id
+                                );
+                                // Answered like a close in `handle_stream_message`.
+                                Some(reason.unwrap_or_else(|| CloseCode::Normal.into()))
+                            } else {
+                                info!("[{}] Closing WebSocket: {e:?}", self.id);
+                                None
+                            };
+                            close(session, reply).await;
                             break;
                         }
                         None => {
@@ -444,6 +480,30 @@ fn is_backup_message(text: &str) -> bool {
     text.contains("\"backup_data\"") || text.contains("\"restore_data\"")
 }
 
+/// The close frame that the Remote sent just before the connection ended, if any.
+///
+/// When a close frame and the end of the connection arrive together, actix-ws returns the read
+/// error first and the close frame on the next read. A Remote with an older WebSocket client closes
+/// its socket right after its close frame, so this is the normal case for a close by such a Remote.
+///
+/// Other messages are skipped. Stops at an error, at the end of the stream, or after
+/// [`BUFFERED_CLOSE_TIMEOUT`]. `Some(None)` is a close frame without a reason. After an error that
+/// does not end the connection, it can wait for the full time.
+async fn buffered_close<S>(stream: &mut S) -> Option<Option<CloseReason>>
+where
+    S: Stream<Item = Result<AggregatedMessage, ProtocolError>> + Unpin,
+{
+    let find = async {
+        while let Some(Ok(msg)) = stream.next().await {
+            if let AggregatedMessage::Close(reason) = msg {
+                return Some(reason);
+            }
+        }
+        None
+    };
+    timeout(BUFFERED_CLOSE_TIMEOUT, find).await.ok().flatten()
+}
+
 /// Close the session. Does not wait long if the Remote does not read.
 async fn close(session: Session, reason: Option<CloseReason>) {
     let _ = timeout(SEND_TIMEOUT, session.close(reason)).await;
@@ -598,19 +658,29 @@ mod tests {
     /// A WebSocket client over a plain TCP stream.
     mod raw {
         use std::io::{Read, Write};
-        use std::net::{SocketAddr, TcpStream};
+        use std::net::{Shutdown, SocketAddr, TcpStream};
         use std::time::Duration;
 
+        const UPGRADE: &[u8] = b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n\
+            Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+            Sec-WebSocket-Version: 13\r\n\r\n";
+
         pub fn connect(addr: SocketAddr) -> TcpStream {
+            connect_with(addr, None)
+        }
+
+        /// Connect. With `Some(frames)`, send the frames in the same write as the upgrade
+        /// request, then end the write side before the response is read.
+        pub fn connect_with(addr: SocketAddr, frames: Option<&[u8]>) -> TcpStream {
             let mut s = TcpStream::connect(addr).expect("connect");
             s.set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("timeout");
-            s.write_all(
-                b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n\
-                  Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
-                  Sec-WebSocket-Version: 13\r\n\r\n",
-            )
-            .expect("write");
+            if let Some(frames) = frames {
+                s.write_all(&[UPGRADE, frames].concat()).expect("write");
+                s.shutdown(Shutdown::Write).expect("shutdown");
+            } else {
+                s.write_all(UPGRADE).expect("write");
+            }
             let mut head = Vec::new();
             let mut b = [0u8];
             while !head.ends_with(b"\r\n\r\n") {
@@ -639,29 +709,51 @@ mod tests {
             (h[0] & 0x0f, payload)
         }
 
-        /// Send a masked text frame, as the protocol requires for a client.
-        pub fn send_text(s: &mut TcpStream, text: &str) {
+        /// The payload of the next close frame from the server. Other frames are skipped.
+        pub fn read_close(s: &mut TcpStream) -> Vec<u8> {
+            loop {
+                let (opcode, payload) = read(s);
+                if opcode == 0x8 {
+                    return payload;
+                }
+            }
+        }
+
+        /// A masked frame, as the protocol requires for a client.
+        pub fn frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
             let mask = [1u8, 2, 3, 4];
-            let len = u8::try_from(text.len()).expect("short");
+            let len = u8::try_from(payload.len()).expect("short");
             assert!(len < 126);
-            let mut frame = vec![0x81, 0x80 | len];
+            let mut frame = vec![0x80 | opcode, 0x80 | len];
             frame.extend_from_slice(&mask);
-            frame.extend(text.bytes().zip(mask.iter().cycle()).map(|(b, m)| b ^ m));
-            s.write_all(&frame).expect("write");
+            frame.extend(payload.iter().zip(mask.iter().cycle()).map(|(b, m)| b ^ m));
+            frame
+        }
+
+        /// Send a masked frame.
+        pub fn send(s: &mut TcpStream, opcode: u8, payload: &[u8]) {
+            s.write_all(&frame(opcode, payload)).expect("write");
+        }
+
+        /// Send a masked text frame.
+        pub fn send_text(s: &mut TcpStream, text: &str) {
+            send(s, 0x1, text.as_bytes());
+        }
+
+        /// The payload of a close frame with `code` and `reason`.
+        pub fn close_payload(code: u16, reason: &[u8]) -> Vec<u8> {
+            [&code.to_be_bytes()[..], reason].concat()
         }
     }
 
-    /// Responses that the server sends until it closes, and the close code.
-    type Answers = (Vec<serde_json::Value>, Option<u16>);
-
-    #[actix::test]
-    async fn errors_go_only_to_requests_with_an_id_and_non_objects_close() {
+    /// Start a WebSocket server on a free local port, with a test controller.
+    fn server(name: &str) -> (std::net::SocketAddr, actix_web::dev::ServerHandle) {
         use crate::configuration::HeartbeatSettings;
         use crate::controller::test_util::controller;
         use crate::server::{Authentication, ws_index};
         use actix_web::{App, HttpServer, web};
 
-        let controller = web::Data::new(controller("ws-invalid", None));
+        let controller = web::Data::new(controller(name, None));
         let heartbeat = web::Data::new(HeartbeatSettings::default());
         let metadata = serde_json::from_value(serde_json::json!({})).expect("metadata");
         let auth = web::Data::new(Authentication::new(&metadata));
@@ -680,6 +772,15 @@ mod tests {
         let server = server.run();
         let handle = server.handle();
         actix_web::rt::spawn(server);
+        (addr, handle)
+    }
+
+    /// Responses that the server sends until it closes, and the close code.
+    type Answers = (Vec<serde_json::Value>, Option<u16>);
+
+    #[actix::test]
+    async fn errors_go_only_to_requests_with_an_id_and_non_objects_close() {
+        let (addr, handle) = server("ws-invalid");
 
         let (answers, close): Answers = tokio::task::spawn_blocking(move || {
             let mut s = raw::connect(addr);
@@ -752,5 +853,108 @@ mod tests {
         let error = answers.iter().find(|a| a["req_id"] == 8).expect("error");
         assert_eq!(400, error["code"]);
         assert_eq!("Unknown message", error["msg_data"]["message"]);
+    }
+
+    #[actix::test]
+    async fn buffered_close_finds_close_or_stops() {
+        use super::buffered_close;
+        use actix_ws::{AggregatedMessage, CloseCode, ProtocolError};
+        use futures::stream;
+
+        let close = AggregatedMessage::Close(Some(CloseCode::Normal.into()));
+        let ping = AggregatedMessage::Ping(actix_web::web::Bytes::new());
+        let mut s = stream::iter([Ok(ping), Ok(close)]);
+        assert_eq!(
+            Some(Some(CloseCode::Normal.into())),
+            buffered_close(&mut s).await
+        );
+        let mut s = stream::iter([Ok(AggregatedMessage::Close(None))]);
+        assert_eq!(Some(None), buffered_close(&mut s).await);
+        let mut s = stream::iter(Vec::<Result<AggregatedMessage, ProtocolError>>::new());
+        assert_eq!(None, buffered_close(&mut s).await);
+        let mut s = stream::iter([
+            Err(ProtocolError::Overflow),
+            Ok(AggregatedMessage::Close(None)),
+        ]);
+        assert_eq!(None, buffered_close(&mut s).await);
+        // `buffered_close` stops at the time limit for a stream that does not end.
+        let mut s = stream::pending::<Result<AggregatedMessage, ProtocolError>>();
+        assert_eq!(None, buffered_close(&mut s).await);
+    }
+
+    #[actix::test]
+    async fn close_is_answered_with_the_same_code_and_reason() {
+        let (addr, handle) = server("ws-close");
+
+        let answer = tokio::task::spawn_blocking(move || {
+            let mut s = raw::connect(addr);
+            raw::send(&mut s, 0x8, &raw::close_payload(4000, b"bye"));
+            raw::read_close(&mut s)
+        })
+        .await
+        .expect("client");
+        handle.stop(false).await;
+
+        assert_eq!(raw::close_payload(4000, b"bye"), answer);
+    }
+
+    /// A Remote that ends its side of the connection right after its close frame: the driver
+    /// reads the close frame and answers with the same code and reason. If it misses the close
+    /// frame, the answer is an empty close frame. The close frame and the end of the connection
+    /// are sent before the server reads, so it almost always reads them together. Otherwise the
+    /// normal close path gives the same answer.
+    #[actix::test]
+    async fn close_frame_before_end_of_connection_is_read() {
+        let (addr, handle) = server("ws-close-end");
+
+        let answer = tokio::task::spawn_blocking(move || {
+            let close = raw::frame(0x8, &raw::close_payload(4001, b"bye"));
+            // The read side stays open for the answer.
+            let mut s = raw::connect_with(addr, Some(&close));
+            raw::read_close(&mut s)
+        })
+        .await
+        .expect("client");
+        handle.stop(false).await;
+
+        assert_eq!(raw::close_payload(4001, b"bye"), answer);
+    }
+
+    /// After a failed send, the sender is marked closed.
+    #[actix::test]
+    async fn sender_stops_after_a_failed_send() {
+        use super::{IsClosed, WsSender};
+        use crate::controller::SendWsMessage;
+        use actix::Actor;
+        use actix_web::{FromRequest, test::TestRequest, web};
+
+        let (req, mut payload) = TestRequest::default()
+            .insert_header(("upgrade", "websocket"))
+            .insert_header(("connection", "upgrade"))
+            .insert_header(("sec-websocket-version", "13"))
+            .insert_header(("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="))
+            .to_http_parts();
+        let body = web::Payload::from_request(&req, &mut payload)
+            .await
+            .expect("payload");
+        let (response, session, _stream) = actix_ws::handle(&req, body).expect("upgrade");
+        // The response holds the receiving end: without it each send fails.
+        drop(response);
+        let sender = WsSender {
+            id: "test".into(),
+            session,
+            msg_tracing_out: false,
+            closed: false,
+        }
+        .start();
+        assert!(!sender.send(IsClosed).await.expect("send"));
+        sender
+            .send(SendWsMessage::Text("{}".into()))
+            .await
+            .expect("send");
+        assert!(
+            sender.send(IsClosed).await.expect("send"),
+            "closed after the error"
+        );
     }
 }

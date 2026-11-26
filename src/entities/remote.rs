@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 //! Remote entity: buttons, UI pages and commands. The commands, the pages and the button mapping
-//! are the ones of the Python integration. Commands use the media player mapping.
+//! are the ones of the Python integration, without the commands that need a parameter. Commands use
+//! the media player mapping.
 
 use crate::config_store::DeviceConfig;
 use crate::entities::View;
@@ -315,6 +316,48 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Every UI page item, button and advertised simple command maps to an action in `send_cmd`.
+    /// An unknown name is not an error: it goes to the receiver as text (`Action::Raw`).
+    #[test]
+    fn all_commands_are_known() {
+        let known = |cmd: &str| map_command(cmd).is_ok_and(|a| !matches!(a, Action::Raw(_)));
+        assert!(!known("OUTPUT_1X"), "a typo is not known");
+        let items = UI
+            .denon
+            .as_array()
+            .into_iter()
+            .chain(UI.marantz.as_array())
+            .flatten()
+            .flat_map(|page| page["items"].as_array().into_iter().flatten());
+        for item in items {
+            let cmd = item["command"]["cmd_id"].as_str().expect("cmd_id");
+            assert!(known(cmd), "page item {cmd}");
+        }
+        for button in UI.buttons.as_array().expect("buttons") {
+            let cmd = button["short_press"]["cmd_id"].as_str().expect("cmd_id");
+            assert!(known(cmd), "button {cmd}");
+        }
+        for is_denon in [true, false] {
+            let mut cfg = crate::entities::tests::cfg(true, true);
+            cfg.is_denon = is_denon;
+            let entity = crate::entities::definition(&cfg, crate::entities::EntityKind::Remote);
+            let options = entity.options.expect("options");
+            let mut names: Vec<&str> = options["simple_commands"]
+                .as_array()
+                .expect("simple_commands")
+                .iter()
+                .map(|c| c.as_str().expect("name"))
+                .collect();
+            for cmd in &names {
+                assert!(known(cmd), "simple command {cmd}");
+            }
+            names.sort_unstable();
+            let count = names.len();
+            names.dedup();
+            assert_eq!(count, names.len(), "repeated simple command");
         }
     }
 
