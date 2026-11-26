@@ -22,7 +22,7 @@ use std::time::Instant;
 use ws::Client;
 
 /// All steps in the order of [`run`].
-const STEPS: [&str; 31] = [
+const STEPS: [&str; 33] = [
     "metadata",
     "setup",
     "entities",
@@ -41,10 +41,12 @@ const STEPS: [&str; 31] = [
     "sound_mode",
     "volume",
     "power",
+    "abort_setup",
     "http_mode",
     "backup_restore",
     "unreachable",
     "config_file",
+    "driver_restart",
     "python_config",
     "broken_config",
     "select_sweep",
@@ -505,10 +507,12 @@ async fn middle_steps(ctx: &mut Ctx) {
     ctx.step("sound_mode", checks::sound_mode).await;
     ctx.step("volume", checks::volume).await;
     ctx.step("power", checks::power).await;
+    ctx.step("abort_setup", checks::abort_setup).await;
     ctx.step("http_mode", checks::http_mode).await;
     ctx.step("backup_restore", checks::backup_restore).await;
     ctx.step("unreachable", checks::unreachable).await;
     ctx.step("config_file", checks::config_file).await;
+    ctx.step("driver_restart", checks::driver_restart).await;
     ctx.step("python_config", checks::python_config).await;
     ctx.step("broken_config", checks::broken_config).await;
     ctx.step("select_sweep", checks::select_sweep).await;

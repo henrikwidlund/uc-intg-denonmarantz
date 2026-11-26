@@ -7,7 +7,7 @@ use crate::oracle::{self, Oracle};
 use crate::restore;
 use crate::ws::{field_ids, field_value};
 use crate::{Check, Ctx, Fail};
-use denon_marantz::proto::{DiracFilter, SourceInfo, SourceLevels};
+use denon_marantz::proto::{DiracFilter, Power, SourceInfo, SourceLevels};
 use denon_marantz::{Command, Query, Zone};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -178,10 +178,7 @@ fn mismatches(ctx: &Ctx, offered: &BTreeSet<String>) -> Vec<String> {
         return Vec::new();
     };
     let state = oracle.state();
-    let on = matches!(
-        state.zone(denon_marantz::Zone::Main).power,
-        Some(denon_marantz::proto::Power::On)
-    );
+    let on = matches!(state.zone(Zone::Main).power, Some(Power::On));
     if !on || !is_on(&ctx.client.text(&ctx.mp(), "state")) {
         return Vec::new();
     }
@@ -434,8 +431,9 @@ async fn set_option(ctx: &mut Ctx, kind: &str, option: &str, secs: u64) -> Resul
         .await
 }
 
-/// Join the result of a check with the result of the step that sets the receiver back. The error
-/// of the check comes first. A failed set back is always a failure, also after a skip.
+/// Join the result of a check with the result of the step that sets the receiver or the driver
+/// back. The error of the check comes first. A failed set back is always a failure, also after a
+/// skip.
 fn first_error<T>(body: Result<T, Fail>, undo: Result<(), Fail>) -> Result<T, Fail> {
     match (body, undo) {
         (body, Ok(())) => body,
@@ -529,7 +527,7 @@ fn above_baseline(v: f64, baseline: Option<f64>) -> bool {
     v > baseline.map_or(MAX_VOLUME, |b| b.min(MAX_VOLUME))
 }
 
-/// Join two results of set back steps. All errors are kept.
+/// Join two results, for example of set back steps. All errors are kept, the first one first.
 fn join_errors(a: Result<(), Fail>, b: Result<(), Fail>) -> Result<(), Fail> {
     match (a, b) {
         (Ok(()), b) => b,
@@ -700,6 +698,30 @@ pub async fn setup_first(ctx: &mut Ctx) -> Check {
     Ok(format!("Dirac in the setup: {dirac}"))
 }
 
+/// An entity id has only ASCII letters, digits and `-`, `_` and `.`, and is not empty.
+fn valid_entity_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+}
+
+/// The entity ids that are not valid. A missing id is shown as `?`.
+fn invalid_ids(list: &[Value]) -> Vec<&str> {
+    list.iter()
+        .map(|e| e["entity_id"].as_str().unwrap_or("?"))
+        .filter(|id| !valid_entity_id(id))
+        .collect()
+}
+
+/// The ids of the entities without an English name.
+fn unnamed(list: &[Value]) -> Vec<&str> {
+    list.iter()
+        .filter(|e| e["name"]["en"].as_str().is_none_or(str::is_empty))
+        .map(|e| e["entity_id"].as_str().unwrap_or("?"))
+        .collect()
+}
+
 pub async fn entities(ctx: &mut Ctx) -> Check {
     let list = entity_list(ctx).await?;
     let mp = list
@@ -730,6 +752,13 @@ pub async fn entities(ctx: &mut Ctx) -> Check {
     ensure!(
         sensors > 7 && selects > 6,
         "{selects} selects, {sensors} sensors"
+    );
+    let bad = invalid_ids(&list);
+    ensure!(bad.is_empty(), "invalid entity ids: {bad:?}");
+    let unnamed = unnamed(&list);
+    ensure!(
+        unnamed.is_empty(),
+        "entities without an English name: {unnamed:?}"
     );
     Ok(format!(
         "key {}, {selects} selects, {sensors} sensors",
@@ -1878,9 +1907,9 @@ async fn power_back(
 
 /// The second connection says that the main zone is not on. False without that connection.
 fn receiver_off(ctx: &Ctx) -> bool {
-    ctx.oracle.as_ref().is_some_and(|oracle| {
-        oracle.state().zone(Zone::Main).power != Some(denon_marantz::proto::Power::On)
-    })
+    ctx.oracle
+        .as_ref()
+        .is_some_and(|oracle| oracle.state().zone(Zone::Main).power != Some(Power::On))
 }
 
 /// Switch the receiver on with [`power_on`], then lower the volume with [`lower_volume`]. The
@@ -1927,6 +1956,81 @@ async fn refresh_remote(ctx: &mut Ctx) -> Result<usize, Fail> {
     ctx.reconnect().await?;
     ctx.client.forget_states();
     subscribe_all(ctx).await
+}
+
+/// Fails if `after` has other entity ids than `before`. Lists the missing and the new ids.
+fn same_ids(before: &BTreeSet<String>, after: &BTreeSet<String>, when: &str) -> Result<(), Fail> {
+    let missing: Vec<_> = before.difference(after).collect();
+    let extra: Vec<_> = after.difference(before).collect();
+    ensure!(
+        missing.is_empty() && extra.is_empty(),
+        "entities {when}: missing {missing:?}, new {extra:?}"
+    );
+    Ok(())
+}
+
+/// Driver log line for a setup flow that is aborted while it waits for user input.
+const ABORT_LINE: &str = "State machine transition: WaitSetupUserData -> RequireSetup";
+
+/// Abort the setup flow like a user on the Remote. Fails if a setup event is waiting or comes in
+/// the next 500 ms.
+async fn abort_driver_setup(ctx: &mut Ctx) -> Result<(), Fail> {
+    ctx.client
+        .send(json!({
+            "kind": "event",
+            "msg": "abort_driver_setup",
+            "cat": "DEVICE",
+            "msg_data": { "error": "ABORTED" },
+        }))
+        .await?;
+    ctx.client.listen_ms(500).await?;
+    let events = ctx.client.clear_setup();
+    ensure!(events == 0, "{events} setup events after the abort");
+    Ok(())
+}
+
+/// The user aborts a setup flow. The configuration and the entities must stay, the media player
+/// must be available after it, and a new setup flow must start.
+pub async fn abort_setup(ctx: &mut Ctx) -> Check {
+    let config = tokio::fs::read_to_string(ctx.driver.config_file()).await?;
+    let ids = entity_ids(ctx).await?;
+    let aborts_before = ctx.driver.log_text().await.matches(ABORT_LINE).count();
+    for round in 1..=2 {
+        ctx.client.clear_setup();
+        ctx.client
+            .request_ok(
+                "setup_driver",
+                json!({ "reconfigure": true, "setup_data": {} }),
+            )
+            .await?;
+        // The setup flow is open now: abort it also when the page is wrong.
+        let page = match ctx.client.next_page(10).await {
+            Ok(page) if field_ids(&page).iter().any(|f| f == "choice") => Ok(()),
+            Ok(page) => Err(Fail::new(format!("first page of setup {round}: {page}"))),
+            Err(e) => Err(e),
+        };
+        let abort = abort_driver_setup(ctx)
+            .await
+            .map_err(|e| Fail::new(format!("abort: {e}")));
+        join_errors(page, abort)?;
+    }
+    let aborts = ctx
+        .driver
+        .log_text()
+        .await
+        .matches(ABORT_LINE)
+        .count()
+        .saturating_sub(aborts_before);
+    ensure!(
+        aborts == 2,
+        "the driver logged {aborts} of 2 aborted setup flows (the info log of the driver is needed)"
+    );
+    ctx.client.refresh_states().await?;
+    let state = wait_available(ctx, 10).await?;
+    let after = tokio::fs::read_to_string(ctx.driver.config_file()).await?;
+    ensure!(after == config, "config.json changed after the abort");
+    same_ids(&ids, &entity_ids(ctx).await?, "after the abort")?;
+    Ok(format!("state {state} after two aborted setups"))
 }
 
 pub async fn http_mode(ctx: &mut Ctx) -> Check {
@@ -2462,10 +2566,92 @@ async fn bad_configs(ctx: &Ctx) -> Result<Vec<std::path::PathBuf>, Fail> {
     Ok(found)
 }
 
-/// Start the driver again with a changed configuration file.
+/// Start the driver again and connect a new Remote.
 async fn restart(ctx: &mut Ctx) -> Result<(), Fail> {
     ctx.driver.start().await?;
     ctx.reconnect().await
+}
+
+/// The power that the media player must show after a start of the driver.
+#[derive(Debug, PartialEq)]
+enum ShownPower {
+    /// An on state: `ON`, `PLAYING` or `PAUSED`.
+    On,
+    /// `OFF`.
+    Off,
+    /// Not known: no wait.
+    Unknown,
+}
+
+/// What the media player must show for the power of the main zone from the second connection.
+fn restart_wait(power: Option<Power>) -> ShownPower {
+    match power {
+        Some(Power::On) => ShownPower::On,
+        Some(Power::Standby | Power::Off) => ShownPower::Off,
+        _ => ShownPower::Unknown,
+    }
+}
+
+/// Start the driver again with the same configuration file. Right after the start the driver must
+/// offer the same entities, because the Remote reads them when it connects. If the second
+/// connection knows the power of the main zone, the media player must show it, and with the main
+/// zone on, the entities must then show the values of the receiver. If the start fails, the driver
+/// is started once more for the later steps.
+pub async fn driver_restart(ctx: &mut Ctx) -> Check {
+    let ids = entity_ids(ctx).await?;
+    ctx.driver.stop().await;
+    let start = Instant::now();
+    if let Err(e) = restart(ctx).await {
+        // Start once more, else all later steps fail without a driver.
+        let again = restart(ctx)
+            .await
+            .map_err(|e| Fail::new(format!("second start: {e}")));
+        return first_error(Err(e), again);
+    }
+    same_ids(&ids, &entity_ids(ctx).await?, "after the restart")?;
+    subscribe_all(ctx).await?;
+    // `verify_all` compares nothing while the driver does not show the receiver as on: wait for
+    // on first. If the second connection says that the main zone is in standby or off, the media
+    // player must show OFF.
+    let power = ctx
+        .oracle
+        .as_ref()
+        .and_then(|oracle| oracle.state().zone(Zone::Main).power);
+    let mp = ctx.mp();
+    match restart_wait(power) {
+        ShownPower::On => {
+            ctx.client
+                .wait_attr(&mp, "state", 20, |v| v.as_str().is_some_and(is_on))
+                .await
+                .map_err(|e| {
+                    Fail::new(format!(
+                        "the receiver is on, the driver does not show it: {e}"
+                    ))
+                })?;
+        }
+        ShownPower::Off => {
+            ctx.client
+                .wait_text(&mp, "state", 20, "OFF")
+                .await
+                .map_err(|e| {
+                    Fail::new(format!(
+                        "the receiver is off, the driver does not show it: {e}"
+                    ))
+                })?;
+        }
+        ShownPower::Unknown => {}
+    }
+    settle(ctx).await?;
+    let compared = if ctx.oracle.is_none() || receiver_off(ctx) {
+        ", values not compared"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "{} entities, settled {} ms after the start{compared}",
+        ids.len(),
+        start.elapsed().as_millis()
+    ))
 }
 
 /// The file of the Python integration: only its fields, and the serial number is the id. The
@@ -2738,6 +2924,16 @@ pub async fn restore_power(ctx: &mut Ctx) -> Check {
     errors.map(|()| notes.join(", "))
 }
 
+/// The panic line of the driver log and the line after it, which holds the panic message.
+fn panic_line(log: &str) -> Option<String> {
+    let mut lines = log.lines();
+    let line = lines.find(|l| l.starts_with("thread '") && l.contains(" panicked at "))?;
+    Some(match lines.next() {
+        Some(message) => format!("{line} {message}"),
+        None => line.to_owned(),
+    })
+}
+
 pub async fn log(ctx: &mut Ctx) -> Check {
     let text = ctx.driver.log_text().await;
     let lines = |tag: &str| -> Vec<&str> { text.lines().filter(|l| l.contains(tag)).collect() };
@@ -2749,6 +2945,12 @@ pub async fn log(ctx: &mut Ctx) -> Check {
     let warnings = lines(" WARN ");
     for line in errors.iter().chain(&warnings) {
         println!("      {line}");
+    }
+    if let Some(line) = panic_line(&text) {
+        return Err(Fail::new(format!(
+            "the driver panicked: {line}; {} ERROR lines in the log",
+            errors.len()
+        )));
     }
     // The unreachable and broken file checks cause some warnings.
     ensure!(errors.is_empty(), "{} ERROR lines in the log", errors.len());
@@ -3379,9 +3581,10 @@ async fn send_simple_commands(ctx: &mut Ctx, plan: &SourcePlan) -> Check {
         // A source or tuner command can switch the zone on, at a volume that is lowered only
         // afterwards. These commands are sent last, so the stop skips only them.
         if changes_source(name, &source_codes)
-            && ctx.oracle.as_ref().is_none_or(|o| {
-                o.state().zone(Zone::Main).power != Some(denon_marantz::proto::Power::On)
-            })
+            && ctx
+                .oracle
+                .as_ref()
+                .is_none_or(|o| o.state().zone(Zone::Main).power != Some(Power::On))
         {
             // First, so that the list stays short and still shows it.
             problems.insert(
@@ -4092,6 +4295,129 @@ mod tests {
             assert!(!may_send_source(&opt, &tuner, false), "{code}");
             assert!(may_send_source(&opt, &tuner, true), "{code}");
         }
+    }
+
+    #[test]
+    fn panic_line_finds_the_panic() {
+        assert_eq!(None, panic_line(""));
+        assert_eq!(None, panic_line("[ts INFO x] [A] connected in 20 ms\n"));
+        assert_eq!(
+            None,
+            panic_line("[ts DEBUG x] [A] title: Everybody panicked at once\n"),
+            "receiver text"
+        );
+        assert_eq!(
+            None,
+            panic_line("[ts DEBUG x] [A] title: 'Tom' panicked at noon\n"),
+            "receiver text with a quote"
+        );
+        assert_eq!(
+            None,
+            panic_line("[ts DEBUG x] [A] title: thread 'a' panicked at b\n"),
+            "receiver text with the whole panic text"
+        );
+        assert_eq!(
+            Some("thread '<unnamed>' (7) panicked at src/x.rs:1:2: boom".to_owned()),
+            panic_line("thread '<unnamed>' (7) panicked at src/x.rs:1:2:\nboom\n"),
+            "thread without a name"
+        );
+        assert_eq!(
+            Some("thread 'main' panicked at src/x.rs:1:2:".to_owned()),
+            panic_line("thread 'main' panicked at src/x.rs:1:2:"),
+            "format without a thread id, no message line"
+        );
+        let log = "[ts INFO x] start\n\
+                   \n\
+                   thread 'actix-rt|system:0|arbiter:0' (15243207) panicked at src/x.rs:1:2:\n\
+                   boom\n\
+                   note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n";
+        assert_eq!(
+            Some(
+                "thread 'actix-rt|system:0|arbiter:0' (15243207) panicked at src/x.rs:1:2: boom"
+                    .to_owned()
+            ),
+            panic_line(log)
+        );
+    }
+
+    #[test]
+    fn abort_line_matches_the_driver_log() {
+        let src = include_str!("../../../src/controller/mod.rs");
+        assert!(src.contains(r#"info!("State machine transition: {old_state:?} -> {state:?}")"#));
+        let (from, to) = ABORT_LINE
+            .strip_prefix("State machine transition: ")
+            .and_then(|states| states.split_once(" -> "))
+            .expect("two states");
+        let block = src
+            .split_once(&format!("    {from} => {{"))
+            .and_then(|(_, rest)| rest.split_once('}'))
+            .map(|(block, _)| block)
+            .expect("state of ABORT_LINE");
+        assert!(block.contains(&format!("AbortSetup => {to}")));
+        let setup = include_str!("../../../src/controller/handler/setup.rs");
+        assert!(
+            setup.contains("operation_mode::Input::AbortSetup"),
+            "a user abort uses the AbortSetup input"
+        );
+        let event = include_str!("../../../src/controller/handler/r2_event.rs");
+        let abort = event
+            .split_once("R2Event::AbortDriverSetup =>")
+            .map(|(_, rest)| rest.split_once("R2Event::").map_or(rest, |(arm, _)| arm))
+            .expect("abort event arm");
+        assert!(
+            abort.contains("timeout: false"),
+            "the abort event is not a timeout"
+        );
+    }
+
+    #[test]
+    fn same_ids_lists_missing_and_new_ids() {
+        let set =
+            |ids: &[&str]| -> BTreeSet<String> { ids.iter().map(|&i| i.to_owned()).collect() };
+        assert!(same_ids(&set(&["a", "b"]), &set(&["a", "b"]), "now").is_ok());
+        let e = same_ids(&set(&["a", "b"]), &set(&["a", "c"]), "now").expect_err("differs");
+        assert_eq!(e.msg, r#"entities now: missing ["b"], new ["c"]"#);
+    }
+
+    #[test]
+    fn unnamed_finds_entities_without_an_english_name() {
+        let list = [
+            json!({ "entity_id": "a", "name": { "en": "A" } }),
+            json!({ "entity_id": "b", "name": { "en": "" } }),
+            json!({ "entity_id": "c", "name": { "de": "C" } }),
+            json!({ "entity_id": "d" }),
+            json!({ "name": {} }),
+        ];
+        assert_eq!(vec!["b", "c", "d", "?"], unnamed(&list));
+    }
+
+    #[test]
+    fn restart_wait_follows_the_main_zone_power() {
+        assert_eq!(ShownPower::On, restart_wait(Some(Power::On)));
+        assert_eq!(ShownPower::Off, restart_wait(Some(Power::Standby)));
+        assert_eq!(ShownPower::Off, restart_wait(Some(Power::Off)));
+        assert_eq!(ShownPower::Unknown, restart_wait(None));
+    }
+
+    #[test]
+    fn invalid_ids_lists_bad_and_missing_ids() {
+        let list = [
+            json!({ "entity_id": "media_player.A1" }),
+            json!({ "entity_id": "sensor.a b" }),
+            json!({ "name": { "en": "X" } }),
+        ];
+        assert_eq!(vec!["sensor.a b", "?"], invalid_ids(&list));
+    }
+
+    #[test]
+    fn valid_entity_id_allows_only_safe_characters() {
+        assert!(valid_entity_id("media_player.0123ABC"));
+        assert!(valid_entity_id("select.input_source.AB-12_c"));
+        assert!(valid_entity_id(&format!("sensor.{}", "a".repeat(60))));
+        assert!(!valid_entity_id(""));
+        assert!(!valid_entity_id("media player.1"));
+        assert!(!valid_entity_id("sensor.vol/1"));
+        assert!(!valid_entity_id("sensor.völ"));
     }
 
     #[test]

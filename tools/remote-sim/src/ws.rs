@@ -308,6 +308,13 @@ impl Client {
         }
     }
 
+    /// Forget the setup events that are not read yet. Returns how many there were.
+    pub fn clear_setup(&mut self) -> usize {
+        let count = self.setup.len();
+        self.setup.clear();
+        count
+    }
+
     /// Answer the current setup page.
     pub async fn answer(&mut self, values: Value) -> Result<(), Fail> {
         self.request_ok("set_driver_user_data", json!({ "input_values": values }))
