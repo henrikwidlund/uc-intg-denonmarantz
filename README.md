@@ -361,6 +361,15 @@ cargo run --release --manifest-path tools/remote-sim/Cargo.toml -- <receiver add
   --only selects,select_sweep,extra_entities --no-power
 ```
 
+CI checks the format of the tool, runs clippy and runs its unit tests, but not the checks against a receiver.
+Run the same checks after you change the tool:
+
+```shell
+cargo fmt --all --check --manifest-path tools/remote-sim/Cargo.toml
+cargo clippy --locked --all-targets --manifest-path tools/remote-sim/Cargo.toml -- -D warnings
+cargo test --locked --manifest-path tools/remote-sim/Cargo.toml
+```
+
 ## License
 
 [MPL-2.0](LICENSE). Parts of the code come from the

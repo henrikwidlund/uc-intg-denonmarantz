@@ -98,6 +98,8 @@ redundant_closure_for_method_calls = "allow"
 # Actix handlers take messages by value.
 needless_pass_by_value = "allow"
 
+# Full LTO and one codegen unit give the smallest binary for the Remote. The native and Docker
+# builds use thin LTO, see .github/workflows/build.yml and Dockerfile.
 [profile.release]
 lto = true
 codegen-units = 1
