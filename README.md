@@ -238,6 +238,9 @@ cargo run --release
 | `UC_API_MSG_TRACING`       | off               | Log WebSocket messages: `all`, `in` or `out`. No backup data.   |
 | `RUST_LOG`                 | `info`            | Log level, for example `info,denon_marantz=debug`.              |
 
+The lines of `UC_API_MSG_TRACING` are debug lines. They show only with the debug log: the setup option or a
+`RUST_LOG` with `uc_intg_denonmarantz=debug`.
+
 ## Run with Docker
 
 Tags publish the image `henrikwidlund/uc-intg-denonmarantz` on Docker Hub. The configuration is in `/data`.
@@ -269,7 +272,8 @@ cargo build --release
 ```
 
 The release build for the Remote uses the [UCR2 toolchain](https://github.com/unfoldedcircle/ucr2-toolchain).
-See `.github/workflows/build.yml`. A `v*` tag creates a GitHub release with the archive.
+See `.github/workflows/build.yml`. A `v*` tag creates a GitHub release with the archive. A tag with `-`, for
+example `v1.2.0-beta.1`, creates a pre-release.
 
 The version comes from the git tag, and the release date is the build date. A build without git data, for
 example in Docker, takes them from `UC_VERSION` and `UC_RELEASE_DATE` (`YYYY-MM-DD`).
@@ -321,7 +325,10 @@ back while the main zone is off. While the file is still there, the checks that 
 skipped. A source change stops HEOS and AirPlay, and they do not start again. The checks never set the volume
 above -40 dB. A power on can start with a higher volume of the receiver: if it is above -40 dB, it is lowered to
 -40 dB at once. The `heos` check compares the media player with a second HEOS connection, pauses and plays once.
-Start HEOS Music on the main zone before the run, else the check is skipped.
+Start HEOS Music on the main zone before the run, else the check is skipped. `ws_keepalive` and `ws_close` use
+another WebSocket connection to the driver: `ws_keepalive` sends a ping every second for 5 s and needs each pong
+within 1 s. `ws_close` closes with code 4001 and reason `bye`, needs the same code and reason back, and the
+driver log must show within 3 s that the session ended.
 
 ```shell
 cargo build --release
@@ -356,6 +363,9 @@ Options:
 - Only one receiver address is allowed.
 - `receiver_restart` runs only with `--only receiver_restart`. It sends `NETWORK_RESTART` to the receiver and
   checks that the driver connects again (at most 3 minutes) and shows the values of the receiver.
+- `ws_idle` runs only with `--only ws_idle`. Another WebSocket connection to the driver sends nothing for 45 s
+  and must then still get an answer to a request. The driver closes a connection after 40 s without a message,
+  so only the answers to the pings of the driver keep it open.
 - `--no-power` skips the power check. The other checks still switch the receiver on if it is off.
 - `--no-oracle` does not open the second connection. The values are then not compared with the receiver.
   Without the second connection the volume cannot be read from the receiver, so the checks do not switch the

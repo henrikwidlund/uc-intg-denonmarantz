@@ -5,7 +5,7 @@
 
 use crate::oracle::{self, Oracle};
 use crate::restore;
-use crate::ws::{field_ids, field_value};
+use crate::ws::{Client, close_echo, field_ids, field_value};
 use crate::{Check, Ctx, Fail};
 use denon_marantz::proto::{DiracFilter, Power, SourceInfo, SourceLevels};
 use denon_marantz::{Command, Query, Zone};
@@ -2290,6 +2290,93 @@ pub async fn backup_restore(ctx: &mut Ctx) -> Check {
     Ok(format!("backup of {} characters restored", backup.len()))
 }
 
+/// Pings that [`ws_keepalive`] sends, one per second.
+const KEEPALIVE_PINGS: u8 = 5;
+/// Close code that [`ws_close`] sends.
+const CLOSE_CODE: u16 = 4001;
+/// Close reason that [`ws_close`] sends.
+const CLOSE_REASON: &str = "bye";
+/// Time without messages in [`ws_idle`]. The driver closes after 40 s without a message.
+const IDLE_SECS: u64 = 45;
+
+/// The driver answers the pings of a Remote. Another WebSocket connection pings every second for 5 s, and
+/// each pong must come within 1 s.
+pub async fn ws_keepalive(ctx: &mut Ctx) -> Check {
+    const SECOND: Duration = Duration::from_secs(1);
+    let mut client = Client::connect(ctx.driver.port).await?;
+    let mut slowest = Duration::ZERO;
+    for i in 0..KEEPALIVE_PINGS {
+        let start = Instant::now();
+        let took = client
+            .ping(&[i], SECOND)
+            .await
+            .map_err(|e| Fail::new(format!("ping {}: {e}", i + 1)))?;
+        slowest = slowest.max(took);
+        client.listen_until(start + SECOND).await?;
+    }
+    Ok(format!(
+        "{KEEPALIVE_PINGS} pings, slowest pong {} ms",
+        slowest.as_millis()
+    ))
+}
+
+/// A Remote that sends nothing stays connected: the driver pings every 20 s and closes after 40 s
+/// without a message. Another WebSocket connection only reads for 45 s, so only its pongs (sent by the
+/// library) keep the connection open. Then it must still get an answer to a request.
+pub async fn ws_idle(ctx: &mut Ctx) -> Check {
+    let mut client = Client::connect(ctx.driver.port).await?;
+    // The main connection is read too, so it answers the pings of the driver and stays open.
+    let (idle, main) = tokio::join!(client.listen(IDLE_SECS), ctx.client.listen(IDLE_SECS));
+    idle.map_err(|e| Fail::new(format!("idle connection: {e}")))?;
+    main.map_err(|e| Fail::new(format!("main connection: {e}")))?;
+    client
+        .request_ok("get_driver_version", Value::Null)
+        .await
+        .map_err(|e| Fail::new(format!("after {IDLE_SECS} s: {e}")))?;
+    Ok(format!("open after {IDLE_SECS} s without messages"))
+}
+
+/// A Remote that closes the connection. Another WebSocket connection sends a close frame. The driver must
+/// answer with the same code and reason, log the close and end the session.
+pub async fn ws_close(ctx: &mut Ctx) -> Check {
+    let client = Client::connect(ctx.driver.port).await?;
+    // The driver logs lines of a session with the peer address as `[id]`.
+    let id = format!("[{}]", client.local_addr());
+    let mark = log_size(ctx).await;
+    let frame = client
+        .close(CLOSE_CODE, CLOSE_REASON, Duration::from_secs(3))
+        .await?;
+    close_echo(frame.as_ref(), CLOSE_CODE, CLOSE_REASON).map_err(Fail::new)?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let (closed, stopped) = session_end(&log_after(ctx, mark).await, &id);
+        if closed && stopped {
+            return Ok(format!(
+                "close {CLOSE_CODE} {CLOSE_REASON:?} answered, session {id} stopped"
+            ));
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "in 3 s the driver log has: close line {closed}, {id} stopped {stopped}"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Whether `log` has the close line and the stop line of the session `id` (`[ip:port]`). The
+/// message of a line must start with `id`, after the `[time level target] ` part.
+fn session_end(log: &str, id: &str) -> (bool, bool) {
+    let (mut closed, mut stopped) = (false, false);
+    let rests = log
+        .lines()
+        .filter_map(|l| l.split_once("] ")?.1.strip_prefix(id));
+    for rest in rests {
+        closed |= rest.starts_with(" Remote closed connection");
+        stopped |= rest == " stopped";
+    }
+    (closed, stopped)
+}
+
 pub async fn unreachable(ctx: &mut Ctx) -> Check {
     ensure_on(ctx).await?;
     let mp = ctx.mp();
@@ -4565,6 +4652,49 @@ mod tests {
             abort.contains("timeout: false"),
             "the abort event is not a timeout"
         );
+    }
+
+    #[test]
+    fn session_end_finds_the_lines_of_one_session() {
+        let id = "[127.0.0.1:5000]";
+        assert_eq!((false, false), session_end("", id));
+        let log = "[ts INFO uc_intg_denonmarantz::server::ws::connection] [127.0.0.1:5000] \
+                   Remote closed connection. Reason: Some(CloseReason { code: Other(4001), \
+                   description: Some(\"bye\") })\n\
+                   [ts DEBUG uc_intg_denonmarantz::server::ws::connection] [127.0.0.1:5000] stopped\n";
+        assert_eq!((true, true), session_end(log, id));
+        assert_eq!(
+            (false, false),
+            session_end(log, "[127.0.0.1:500]"),
+            "another port"
+        );
+        let other = "[ts DEBUG x] [127.0.0.1:50001] stopped\n\
+                     [ts DEBUG x] [127.0.0.1:5000] stopped later\n\
+                     [ts DEBUG x] [A] title: [127.0.0.1:5000] Remote closed connection\n";
+        assert_eq!((false, false), session_end(other, id));
+        assert_eq!(
+            (false, true),
+            session_end("[ts DEBUG x] [127.0.0.1:5000] stopped\n", id)
+        );
+    }
+
+    #[test]
+    fn session_end_lines_match_the_driver_log() {
+        let src = include_str!("../../../src/server/ws/connection.rs");
+        assert!(src.contains(r#"debug!("[{}] stopped", self.id);"#));
+        assert!(
+            src.contains(r#"info!("[{}] Remote closed connection. Reason: {reason:?}", self.id);"#)
+        );
+        let index = include_str!("../../../src/server/ws/mod.rs");
+        assert!(index.contains("|addr| addr.to_string()"), "id is ip:port");
+    }
+
+    #[test]
+    fn idle_time_is_longer_than_the_driver_timeout() {
+        let src = include_str!("../../../src/configuration.rs");
+        assert!(src.contains("interval: Duration::from_secs(20),"));
+        assert!(src.contains("timeout: Duration::from_secs(40),"));
+        const { assert!(IDLE_SECS > 40) };
     }
 
     #[test]

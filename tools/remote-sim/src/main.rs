@@ -22,7 +22,7 @@ use std::time::Instant;
 use ws::Client;
 
 /// All steps in the order of [`run`].
-const STEPS: [&str; 34] = [
+const STEPS: [&str; 37] = [
     "metadata",
     "setup",
     "entities",
@@ -44,6 +44,9 @@ const STEPS: [&str; 34] = [
     "abort_setup",
     "http_mode",
     "backup_restore",
+    "ws_keepalive",
+    "ws_idle",
+    "ws_close",
     "unreachable",
     "config_file",
     "driver_restart",
@@ -65,7 +68,7 @@ const BASE_STEPS: [&str; 3] = ["setup", "entities", "states"];
 /// the driver log. They always run.
 const END_STEPS: [&str; 2] = ["restore_power", "log"];
 /// Steps that run only if `--only` names them.
-const OPT_IN_STEPS: [&str; 1] = ["receiver_restart"];
+const OPT_IN_STEPS: [&str; 2] = ["ws_idle", "receiver_restart"];
 
 /// A step in [`END_STEPS`] always runs. Else `--skip` wins. Without `--only`, all steps except
 /// [`OPT_IN_STEPS`] run. With `--only`, the named steps and [`BASE_STEPS`] run.
@@ -511,6 +514,11 @@ async fn middle_steps(ctx: &mut Ctx) {
     ctx.step("abort_setup", checks::abort_setup).await;
     ctx.step("http_mode", checks::http_mode).await;
     ctx.step("backup_restore", checks::backup_restore).await;
+    // WebSocket behavior, each with another WebSocket connection.
+    ctx.step("ws_keepalive", checks::ws_keepalive).await;
+    // Takes 45 s, so only with `--only ws_idle`.
+    ctx.step("ws_idle", checks::ws_idle).await;
+    ctx.step("ws_close", checks::ws_close).await;
     ctx.step("unreachable", checks::unreachable).await;
     ctx.step("config_file", checks::config_file).await;
     ctx.step("driver_restart", checks::driver_restart).await;
