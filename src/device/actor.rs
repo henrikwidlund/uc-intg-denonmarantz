@@ -173,6 +173,13 @@ pub struct CurrentAvr;
 #[rtype(result = "bool")]
 pub struct Refreshing;
 
+/// Holds the command lock for this time, like a command that runs, for the tests. The lock must
+/// be free.
+#[cfg(test)]
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct HoldCommandLock(pub Duration);
+
 /// Asks for [`WantState`], for the tests.
 #[cfg(test)]
 #[derive(Message)]
@@ -262,7 +269,8 @@ pub struct DenonActor {
     /// The receiver of a running connect, before its start ends. Commands that do not read the
     /// state use it and wait on it.
     early_tx: watch::Sender<Option<Arc<Avr>>>,
-    /// The controller wants a connection.
+    /// The controller or a command wants a connection. While connected, it is false only in the
+    /// wait of a [`Disconnect`].
     want: bool,
     /// The receiver answers: telnet is connected, or the last HTTP read worked.
     telnet_up: bool,
@@ -298,6 +306,9 @@ pub struct DenonActor {
     /// Incremented on each [`Disconnect`] and on each reconnect after a setup change. A command is
     /// not sent again after one, see also [`stale`].
     disconnects: u64,
+    /// Set when a setup change needs a new connection during the wait of a [`Disconnect`]. A
+    /// connect or command in the wait then connects again with the new values.
+    stale_config: bool,
     /// How long the last connects took. They set the time limit of the connect tries, see
     /// [`discovery::Stall`].
     connect_times: discovery::ConnectTimes,
@@ -393,6 +404,7 @@ impl DenonActor {
             attempt: watch::Sender::new(0),
             me: None,
             disconnects: 0,
+            stale_config: false,
             connect_times: discovery::ConnectTimes::default(),
             generation: 0,
             connected_at: None,
@@ -1256,6 +1268,7 @@ impl DenonActor {
         }
         self.generation += 1;
         self.attempt.send_modify(|a| *a += 1);
+        self.stale_config = false;
         // A connection that drops at once keeps the reconnect delay growing.
         if self
             .connected_at
@@ -1477,8 +1490,13 @@ impl DenonActor {
         }
     }
 
-    /// Start a connect if none runs.
+    /// Start a connect if none runs. During the wait of a [`Disconnect`], see
+    /// [`Self::want_again`].
     fn start_connect(&mut self, ctx: &mut Context<Self>) {
+        if !self.want && self.avr.is_some() {
+            self.want_again(ctx);
+            return;
+        }
         self.want = true;
         if self.status == DeviceStatus::Error {
             self.set_status(DeviceStatus::Disconnected);
@@ -1490,6 +1508,43 @@ impl DenonActor {
             self.attempts = 0;
             self.connect(ctx);
         }
+    }
+
+    /// Start a connect for a command if there is no connection. While a [`Disconnect`] waits for
+    /// a running command, the connection is kept.
+    fn connect_for_command(&mut self, ctx: &mut Context<Self>) {
+        // The core can send a command before `exit_standby`. While a retry after a failed connect
+        // is pending, the receiver is not reachable: the command fails at once.
+        let backoff = self.want && self.timers.reconnect.is_some();
+        if self.avr.is_none() && self.status == DeviceStatus::Disconnected && !backoff {
+            debug!("[{}] command while disconnected, connecting", self.cfg.name);
+            self.start_connect(ctx);
+        } else if !self.want && self.avr.is_some() {
+            debug!(
+                "[{}] command during disconnect, connection kept",
+                self.cfg.name
+            );
+            self.want_again(ctx);
+        }
+    }
+
+    /// Keep the connection during the wait of a [`Disconnect`]. After a setup change in the wait,
+    /// connects again with the new values.
+    fn want_again(&mut self, ctx: &mut Context<Self>) {
+        self.want = true;
+        if self.stale_config {
+            self.reconnect_for_config(ctx);
+        }
+    }
+
+    /// Connect again after a setup change.
+    fn reconnect_for_config(&mut self, ctx: &mut Context<Self>) {
+        info!("[{}] configuration changed, reconnecting", self.cfg.name);
+        // A command from before the change is not sent again on the new connection.
+        self.disconnects += 1;
+        self.lost_connection(ctx);
+        self.attempts = 0;
+        self.connect(ctx);
     }
 }
 
@@ -2166,19 +2221,21 @@ impl Handler<Disconnect> for DenonActor {
         }
         // A command that is running, for example power off before standby, is sent first.
         let lock = self.cmd_lock.clone();
+        let disconnects = self.disconnects;
         ctx.spawn(
             async move { timeout(DISCONNECT_WAIT, lock.lock_owned()).await.ok() }
                 .into_actor(self)
-                .map(|guard, act, ctx| {
+                .map(move |guard, act, ctx| {
                     drop(guard);
-                    // A connect that was asked for meanwhile keeps the connection.
+                    // A connect or command that came meanwhile keeps the connection. A later
+                    // `Disconnect` closes the connection itself.
                     if act.want {
                         // Like after a connect: a lost link makes the entities unavailable.
                         act.keep_state = false;
                         if !act.linked() {
                             act.schedule_emit(ctx);
                         }
-                    } else {
+                    } else if act.disconnects == disconnects {
                         act.close(ctx);
                         act.set_status(DeviceStatus::Disconnected);
                     }
@@ -2193,6 +2250,23 @@ impl Handler<CurrentAvr> for DenonActor {
 
     fn handle(&mut self, _: CurrentAvr, _: &mut Self::Context) -> Self::Result {
         self.avr.as_ref().map(Arc::downgrade)
+    }
+}
+
+#[cfg(test)]
+impl Handler<HoldCommandLock> for DenonActor {
+    type Result = ();
+
+    fn handle(&mut self, msg: HoldCommandLock, _: &mut Self::Context) {
+        let guard = self
+            .cmd_lock
+            .clone()
+            .try_lock_owned()
+            .expect("free command lock");
+        actix::spawn(async move {
+            tokio::time::sleep(msg.0).await;
+            drop(guard);
+        });
     }
 }
 
@@ -2257,12 +2331,11 @@ impl Handler<UpdateConfig> for DenonActor {
         self.set_config(cfg);
         self.cfg_version += 1;
         if reconnect && self.want {
-            info!("[{}] configuration changed, reconnecting", self.cfg.name);
-            // A command from before the change is not sent again on the new connection.
-            self.disconnects += 1;
-            self.lost_connection(ctx);
-            self.attempts = 0;
-            self.connect(ctx);
+            self.reconnect_for_config(ctx);
+        } else if reconnect && self.avr.is_some() {
+            // During the wait of a `Disconnect`. The running command is sent first, unless a
+            // connect or command comes in the wait.
+            self.stale_config = true;
         }
     }
 }
@@ -2520,13 +2593,7 @@ impl Handler<Command> for DenonActor {
         if let Some(answer) = self.answer_at_once(&msg) {
             return Box::pin(fut::ready(answer));
         }
-        // The core can send a command before `exit_standby`. While a retry after a failed connect
-        // is pending, the receiver is not reachable: the command fails at once.
-        let backoff = self.want && self.timers.reconnect.is_some();
-        if self.avr.is_none() && self.status == DeviceStatus::Disconnected && !backoff {
-            debug!("[{}] command while disconnected, connecting", self.cfg.name);
-            self.start_connect(ctx);
-        }
+        self.connect_for_command(ctx);
         // A command can come right after the Remote wakes up, while the connect still runs.
         let mut connecting = self.running_connect();
         if self.avr.is_none() && connecting.is_none() {

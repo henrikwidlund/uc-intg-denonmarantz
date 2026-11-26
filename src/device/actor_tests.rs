@@ -5,7 +5,9 @@
 //! The tests check what the actor asks for and shows when the receiver answers, does not answer,
 //! sends events or closes the connection.
 
-use super::actor::{CurrentAvr, Refreshing, Resend, read_differently, send_again, send_command};
+use super::actor::{
+    CurrentAvr, HoldCommandLock, Refreshing, Resend, read_differently, send_again, send_command,
+};
 use super::commands;
 use super::discovery::{
     self, Known, TEST_BUILDER, TEST_DISCOVERY, TEST_SIGNAL_CHECKS, TestBuilder,
@@ -1237,6 +1239,137 @@ async fn a_connect_during_the_disconnect_wait_keeps_the_connection_like_a_new_on
         status_count(&events, DeviceStatus::Disconnected) == disconnects,
         "the entities were not unavailable before the search"
     );
+}
+
+/// A disconnect, a connect and a disconnect while a command runs: only the wait of the last
+/// disconnect closes the connection.
+#[actix::test]
+async fn the_wait_of_an_earlier_disconnect_does_not_close_the_connection() {
+    let rig = rig(answers_all, QUICK).await;
+    until("the first read", 5, || rig.telnet.count("SLP?") >= 1).await;
+    let disconnected = status_count(&rig.events, DeviceStatus::Disconnected);
+    rig.actor
+        .send(HoldCommandLock(Duration::from_secs(4)))
+        .await
+        .expect("hold");
+    rig.actor.send(Disconnect).await.expect("disconnect");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    rig.actor.send(Connect).await.expect("connect");
+    rig.actor.send(Disconnect).await.expect("disconnect");
+    // The first wait ends after 2 s, the second one after 3 s.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        disconnected,
+        status_count(&rig.events, DeviceStatus::Disconnected),
+        "closed by the first wait"
+    );
+    until("the close", 5, || {
+        status_count(&rig.events, DeviceStatus::Disconnected) > disconnected
+    })
+    .await;
+}
+
+/// A command in the wait of a disconnect, behind a command that runs, keeps the connection.
+#[actix::test]
+async fn a_command_during_the_disconnect_wait_keeps_the_connection() {
+    let rig = rig(answers_all, QUICK).await;
+    until("the first read", 5, || rig.telnet.count("SLP?") >= 1).await;
+    let disconnected = status_count(&rig.events, DeviceStatus::Disconnected);
+    rig.actor
+        .send(HoldCommandLock(Duration::from_millis(500)))
+        .await
+        .expect("hold");
+    rig.actor.send(Disconnect).await.expect("disconnect");
+    let result = rig.actor.send(media_command("volume_up")).await;
+    assert_eq!(Ok(()), result.expect("send"));
+    until("the command", 5, || rig.telnet.count("MVUP") == 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        disconnected,
+        status_count(&rig.events, DeviceStatus::Disconnected)
+    );
+}
+
+/// A setup change that needs a new connection, in the wait of a disconnect. A command holds the
+/// lock for 1.5 s.
+async fn setup_change_during_the_disconnect_wait() -> (Rig, usize) {
+    let rig = rig(answers_all, QUICK).await;
+    until("the first read", 5, || rig.telnet.count("SLP?") >= 1).await;
+    let connected = status_count(&rig.events, DeviceStatus::Connected);
+    rig.actor
+        .send(HoldCommandLock(Duration::from_millis(1500)))
+        .await
+        .expect("hold");
+    rig.actor.send(Disconnect).await.expect("disconnect");
+    let setup = DeviceConfig {
+        signal_poll_secs: Some(60),
+        ..cfg()
+    };
+    rig.actor.send(UpdateConfig(setup)).await.expect("update");
+    (rig, connected)
+}
+
+#[actix::test]
+async fn a_connect_after_a_setup_change_in_the_disconnect_wait_connects_again() {
+    let (rig, connected) = setup_change_during_the_disconnect_wait().await;
+    rig.actor.send(Connect).await.expect("connect");
+    until("connected again", 5, || {
+        status_count(&rig.events, DeviceStatus::Connected) > connected
+    })
+    .await;
+    // The end of the wait keeps the new connection.
+    let disconnected = status_count(&rig.events, DeviceStatus::Disconnected);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        disconnected,
+        status_count(&rig.events, DeviceStatus::Disconnected)
+    );
+}
+
+/// The close at the end of the wait drops the setup change: a connect in a later wait keeps the
+/// connection.
+#[actix::test]
+async fn a_setup_change_in_a_disconnect_wait_that_closes_does_not_reconnect_later() {
+    let (rig, connected) = setup_change_during_the_disconnect_wait().await;
+    let disconnected = status_count(&rig.events, DeviceStatus::Disconnected);
+    until("the close", 5, || {
+        status_count(&rig.events, DeviceStatus::Disconnected) > disconnected
+    })
+    .await;
+    rig.actor.send(Connect).await.expect("connect");
+    until("connected again", 5, || {
+        status_count(&rig.events, DeviceStatus::Connected) > connected
+    })
+    .await;
+    let connected = status_count(&rig.events, DeviceStatus::Connected);
+    let disconnected = status_count(&rig.events, DeviceStatus::Disconnected);
+    rig.actor
+        .send(HoldCommandLock(Duration::from_millis(500)))
+        .await
+        .expect("hold");
+    rig.actor.send(Disconnect).await.expect("disconnect");
+    rig.actor.send(Connect).await.expect("connect");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(
+        disconnected,
+        status_count(&rig.events, DeviceStatus::Disconnected)
+    );
+    assert_eq!(
+        connected,
+        status_count(&rig.events, DeviceStatus::Connected)
+    );
+}
+
+#[actix::test]
+async fn a_command_after_a_setup_change_in_the_disconnect_wait_connects_again() {
+    let (rig, connected) = setup_change_during_the_disconnect_wait().await;
+    let result = rig.actor.send(media_command("volume_up")).await;
+    assert_eq!(Ok(()), result.expect("send"));
+    until("connected again", 5, || {
+        status_count(&rig.events, DeviceStatus::Connected) > connected
+    })
+    .await;
+    until("the command", 5, || rig.telnet.count("MVUP") == 1).await;
 }
 
 #[actix::test]
