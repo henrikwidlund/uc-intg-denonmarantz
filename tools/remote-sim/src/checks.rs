@@ -17,11 +17,13 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 mod keys;
+mod lookup;
 mod media;
 mod prompt;
 mod signal;
 
 pub use keys::media_keys;
+pub use lookup::address_lookup;
 pub use media::media_info;
 use prompt::{Answer, Ask, SKIP_CHECK, ask};
 pub use prompt::{stdin_lines, terminal};
@@ -2486,6 +2488,9 @@ pub async fn http_mode(ctx: &mut Ctx) -> Check {
     // after a failure.
     let force = result.is_err();
     let address = ctx.opt.address.clone();
+    // A note if the old sound mode did not come back and the receiver is in a third mode: neither
+    // the mode before nor the mode set in HTTP mode (see [`other_sound`]).
+    let mut kept = None;
     let undo = async {
         let telnet = async {
             let values = SetupValues {
@@ -2547,17 +2552,50 @@ pub async fn http_mode(ctx: &mut Ctx) -> Check {
             .ok()
             .or_else(|| ctx.client.attr(&mp, "sound_mode_list").cloned())
             .unwrap_or(Value::Null);
-        let sound = restore_sound(ctx, &old_sound, &strings(&list), force).await;
+        let sound = match restore_sound(ctx, &old_sound, &strings(&list), force).await {
+            Err(e) => {
+                let now = ctx.client.text(&mp, "sound_mode");
+                let receiver = receiver_sound(ctx);
+                if !now.is_empty() && other_sound(&receiver, changes.sound.as_ref()) {
+                    kept = Some(format!(
+                        "not restored, the driver shows {now}, the receiver {receiver} ({e})"
+                    ));
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+            ok => ok,
+        };
         join_errors(errors, sound)
     }
     .await;
     let note = first_error(result, undo)?;
-    let shown = if old_sound.is_empty() {
-        "not shown".to_owned()
-    } else {
-        format!("shown after {waited} ms, restored")
+    let shown = match (old_sound.is_empty(), kept) {
+        (true, _) => "not shown".to_owned(),
+        (false, Some(kept)) => format!("shown after {waited} ms, {kept}"),
+        (false, None) => format!("shown after {waited} ms, restored"),
     };
     Ok(format!("{note} (sound mode with telnet {shown})"))
+}
+
+/// The receiver has a mode `now` that is neither of `modes`: its modes before and after the change
+/// in HTTP mode. All are the raw modes of the second connection. The input signal can change, for
+/// example with a source change, and the receiver then picks a mode that fits the signal: the old
+/// mode may not come back. False without `modes`.
+fn other_sound(now: &str, modes: Option<&(String, String)>) -> bool {
+    modes.is_some_and(|(before, after)| {
+        !now.is_empty() && !now.eq_ignore_ascii_case(before) && !now.eq_ignore_ascii_case(after)
+    })
+}
+
+/// The raw sound mode of the receiver from the second connection. Empty without that connection or
+/// a mode.
+fn receiver_sound(ctx: &Ctx) -> String {
+    ctx.oracle
+        .as_ref()
+        .and_then(|oracle| oracle.state().zone(Zone::Main).sound_mode.clone())
+        .unwrap_or_default()
 }
 
 /// What [`http_checks`] changed, for [`http_mode`] to set back.
@@ -2568,11 +2606,15 @@ struct HttpChanges {
     /// The signal time at the start, as the setup page shows it (see [`signal_secs`]). Set before a
     /// change of the signal time.
     signal_secs: Option<u16>,
+    /// The raw sound modes of the receiver (second connection) before and after the change in
+    /// HTTP mode.
+    sound: Option<(String, String)>,
 }
 
 /// The checks in HTTP mode. The sound mode is changed only if `old_sound`, the mode shown with
 /// telnet, is known: [`http_mode`] sets it back. `changes` gets the values at the start before
-/// they are changed, for [`http_mode`] to set them back with the switch back to telnet.
+/// they are changed, for [`http_mode`] to set them back with the switch back to telnet, and the
+/// sound modes of the receiver before and after the change.
 async fn http_checks(ctx: &mut Ctx, old_sound: &str, changes: &mut HttpChanges) -> Check {
     let mp = ctx.mp();
     let before = entity_ids(ctx).await?.len();
@@ -2671,13 +2713,32 @@ async fn http_checks(ctx: &mut Ctx, old_sound: &str, changes: &mut HttpChanges) 
     } else {
         "STEREO"
     };
+    let receiver_before = receiver_sound(ctx);
     let start = Instant::now();
     select_sound(ctx, group).await?;
     ctx.client
         .wait_attr(&mp, "sound_mode", 15, |v| {
-            v.as_str().is_some_and(|m| m != old)
+            v.as_str().is_some_and(|m| !m.is_empty() && m != old)
         })
         .await?;
+    // The second connection can get the new mode later than the driver. Without a mode before the
+    // change, or without a change, `sound` stays `None`, so a failed set back fails.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let sound = if receiver_before.is_empty() {
+        None
+    } else {
+        loop {
+            let now = receiver_sound(ctx);
+            if !now.is_empty() && !now.eq_ignore_ascii_case(&receiver_before) {
+                break Some(now);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            ctx.client.listen_ms(200).await?;
+        }
+    };
+    changes.sound = sound.map(|after| (receiver_before, after));
     note.push(format!("sound mode {} ms", start.elapsed().as_millis()));
     note.push(format!("sound mode was {old} in HTTP mode"));
     Ok(note.join(", "))
@@ -3889,8 +3950,11 @@ pub async fn restore_power(ctx: &mut Ctx) -> Check {
     let Some((muted, volume)) = ctx.start.as_ref().map(|s| (s.muted, s.volume)) else {
         return Ok(String::new());
     };
-    let mut notes = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
     ctx.client.listen_ms(300).await?;
+    if let Some(note) = volume_answer(ctx).await {
+        notes.push(note);
+    }
     let mut errors = Ok(());
     if !is_on(&ctx.client.text(&mp, "state")) || receiver_off(ctx) {
         let on = on_again(ctx, volume).await;
@@ -3898,7 +3962,7 @@ pub async fn restore_power(ctx: &mut Ctx) -> Check {
             return on.map(|()| String::new());
         }
         if on.is_ok() {
-            notes.push("the receiver is on again, like at the start");
+            notes.push("the receiver is on again, like at the start".into());
         }
         errors = on;
     } else if ctx.oracle.is_some() {
@@ -3910,7 +3974,7 @@ pub async fn restore_power(ctx: &mut Ctx) -> Check {
         .as_ref()
         .and_then(|oracle| oracle.state().zone(Zone::Main).muted);
     if muted.is_none() {
-        notes.push("the mute state at the start is not known, it is not set back");
+        notes.push("the mute state at the start is not known, it is not set back".into());
     }
     if let Some(muted) = muted
         && (ctx.client.attr(&mp, "muted") != Some(&json!(muted))
@@ -3918,15 +3982,46 @@ pub async fn restore_power(ctx: &mut Ctx) -> Check {
     {
         let mute = set_muted(ctx, muted, volume, true).await;
         if mute.is_ok() {
-            notes.push(if muted {
-                "muted again"
-            } else {
-                "unmuted again"
-            });
+            notes.push(
+                if muted {
+                    "muted again"
+                } else {
+                    "unmuted again"
+                }
+                .into(),
+            );
         }
         errors = join_errors(errors, mute);
     }
     errors.map(|()| notes.join(", "))
+}
+
+/// Time in which [`restore_power`] starts new volume queries. Right after a
+/// network restart the receiver can answer late.
+const VOLUME_RETRY: Duration = Duration::from_secs(30);
+
+/// Ask the receiver for the volume until it answers. A new query starts only within
+/// [`VOLUME_RETRY`], and each query waits for its answer. Gives a note if it answered only after
+/// more than one query, or not at all. Does nothing without the second connection.
+async fn volume_answer(ctx: &Ctx) -> Option<String> {
+    let oracle = ctx.oracle.as_ref()?;
+    let start = Instant::now();
+    let mut tries = 0u32;
+    loop {
+        tries += 1;
+        match oracle.fresh_volume().await {
+            Ok(_) if tries == 1 => return None,
+            Ok(_) => {
+                return Some(format!(
+                    "the receiver answered the volume query after {tries} queries"
+                ));
+            }
+            Err(e) if start.elapsed() >= VOLUME_RETRY => {
+                return Some(format!("no volume after {tries} queries: {e}"));
+            }
+            Err(_) => sleep(Duration::from_secs(1)).await,
+        }
+    }
 }
 
 /// The panic line of the driver log and the line after it, which holds the panic message.
@@ -4294,7 +4389,10 @@ async fn sweep_back(
         }
     }
     if let (Some(oracle), Some(saved)) = (&ctx.oracle, dynamic_eq) {
-        match restore::write(oracle.avr(), &["PSDYNEQ ?"], saved).await {
+        match restore::write(oracle.avr(), &["PSDYNEQ ?"], saved)
+            .await
+            .map(restore::Missed::into_lines)
+        {
             Ok(missed) if missed.is_empty() => {}
             Ok(missed) => problems.push(format!("Dynamic EQ not set back: {missed:?}")),
             Err(e) => problems.push(format!("Dynamic EQ not set back: {e}")),
@@ -4444,10 +4542,17 @@ pub async fn settings_restore(ctx: &mut Ctx) -> Check {
         changed.iter().any(|l| l != &sleep && l != "SLPOFF"),
         "the sleep timer did not change to {other}: {changed:?}"
     );
-    let missed = restore::write(avr, restore::QUERIES, &saved).await?;
+    let mut missed = restore::write(avr, restore::QUERIES, &saved).await?;
+    let sound = missed.take_sound_mode();
+    let missed = missed.into_lines();
     ensure!(
         missed.is_empty(),
-        "not set back: {missed:?}. They stay in {}",
+        "not set back: {missed:?}{}. They stay in {}",
+        if sound.is_empty() {
+            String::new()
+        } else {
+            format!(", {sound:?}")
+        },
         restore::FILE.display()
     );
     restore::forget().await;
@@ -4456,8 +4561,13 @@ pub async fn settings_restore(ctx: &mut Ctx) -> Check {
         "{} was not removed",
         restore::FILE.display()
     );
+    let sound_note = if sound.is_empty() {
+        String::new()
+    } else {
+        format!(", sound mode not taken: {sound:?}{}", restore::SOUND_NOTE)
+    };
     Ok(format!(
-        "{} settings read, {sleep} -> {other} -> {sleep}, all set back",
+        "{} settings read, {sleep} -> {other} -> {sleep}, all set back{sound_note}",
         saved.len()
     ))
 }
@@ -4490,28 +4600,40 @@ pub async fn simple_commands(ctx: &mut Ctx) -> Check {
         .oracle
         .as_ref()
         .ok_or_else(|| Fail::new("the second connection is gone"))?;
-    // The file stays if a setting did not come back: the next run sends them again.
+    // The file stays if a setting did not come back: the next run sends them again. A sound mode
+    // that the receiver did not take does not keep the file.
     let mut missed = restore::write(oracle.avr(), restore::QUERIES, &saved).await?;
+    let sound = missed.take_sound_mode();
+    let sent = matches!(missed, restore::Missed::Lines(_));
+    let mut missed = missed.into_lines();
     if missed.is_empty() {
         restore::forget().await;
     }
     // The receiver often does not take the audio restorer back here, but takes it at the start of
     // the next run. It is not a failure: the line stays in the file for the next run.
-    let late: Vec<String> = missed
-        .extract_if(.., |line| line.starts_with("PSRSTR"))
-        .collect();
-    let late_note = if late.is_empty() {
+    let late: Vec<String> = if sent {
+        missed
+            .extract_if(.., |line| line.starts_with("PSRSTR"))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut late_note = if late.is_empty() {
         String::new()
     } else {
         format!(". Not taken: {late:?}. The next run sets them back")
     };
+    if !sound.is_empty() {
+        let _ = write!(
+            late_note,
+            ". Sound mode not taken: {sound:?}{}",
+            restore::SOUND_NOTE
+        );
+    }
     match (result, missed.is_empty()) {
-        (Ok(note), true) if late.is_empty() => {
-            Ok(format!("{note}, {} settings set back", saved.len()))
-        }
         (Ok(note), true) => Ok(format!(
-            "{note}, {} settings set back, not taken: {late:?}. The next run sets them back",
-            saved.len() - late.len()
+            "{note}, {} settings set back{late_note}",
+            saved.len() - late.len() - sound.len()
         )),
         (Ok(note), false) => Err(Fail::new(format!(
             "{note}. Settings not set back: {missed:?}{late_note}"
@@ -6492,6 +6614,16 @@ mod tests {
         assert!(above_baseline(40.5, Some(55.0)), "the limit counts");
         assert!(above_baseline(40.5, None));
         assert!(!above_baseline(40.0, None));
+    }
+
+    #[test]
+    fn other_sound_needs_another_receiver_mode() {
+        let modes = ("DOLBY SURROUND".to_owned(), "STEREO".to_owned());
+        assert!(other_sound("MULTI CH IN", Some(&modes)));
+        assert!(!other_sound("Stereo", Some(&modes)));
+        assert!(!other_sound("dolby surround", Some(&modes)));
+        assert!(!other_sound("", Some(&modes)));
+        assert!(!other_sound("MULTI CH IN", None));
     }
 
     #[test]

@@ -22,15 +22,14 @@ use tokio::sync::broadcast::error::RecvError;
 
 /// The keys that are sent while the setup menu is open, in this order. The menu opens at its top
 /// level, where each item opens a list and no item is a setting. Down and up only move between
-/// these items. Enter opens its list and back closes that list again. Left and right are sent at
-/// the top level and come last: right can open a list, and in a list left and right can change a
-/// value, so after them no other key is sent in the menu.
-const MENU_KEYS: [&str; 6] = [
+/// these items. Enter opens its list and back closes that list again. Right is sent at the top
+/// level and comes last: it can open a list, and in a list right can change a value, so after it no
+/// other key is sent in the menu. Left is not sent: at the top level it closes the menu.
+const MENU_KEYS: [&str; 5] = [
     "cursor_down",
     "cursor_up",
     "cursor_enter",
     "back",
-    "cursor_left",
     "cursor_right",
 ];
 
@@ -666,14 +665,13 @@ mod tests {
     }
 
     #[test]
-    fn menu_keys_end_with_left_and_right() {
-        // Enter must come before left and right, back must come right after enter, and the keys
-        // must end with left and right.
+    fn menu_keys_end_with_right() {
+        // Back must come right after enter, the keys must end with right, and left closes the
+        // menu, so it is not sent.
         let pos = |k: &str| MENU_KEYS.iter().position(|m| *m == k).unwrap();
-        assert!(pos("cursor_enter") < pos("cursor_left"));
         assert!(pos("cursor_enter") < pos("cursor_right"));
         assert_eq!(MENU_KEYS.last(), Some(&"cursor_right"));
-        assert_eq!(pos("cursor_left") + 1, pos("cursor_right"));
+        assert!(!MENU_KEYS.contains(&"cursor_left"));
         assert_eq!(pos("back"), pos("cursor_enter") + 1);
     }
 

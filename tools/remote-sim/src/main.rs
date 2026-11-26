@@ -7,7 +7,8 @@
 //! added to `--avoid-sources`.
 //!
 //! Usage: `remote-sim <receiver address> [--driver <path>] [--only a,b] [--skip a,b]
-//! [--kinds a,b] [--avoid-sources a,b] [--no-power] [--no-oracle] [--port <port>] [--commands <path>]`
+//! [--kinds a,b] [--avoid-sources a,b] [--host-name <name>] [--no-power] [--no-oracle]
+//! [--port <port>] [--commands <path>]`
 
 mod checks;
 mod driver;
@@ -22,7 +23,7 @@ use std::time::Instant;
 use ws::Client;
 
 /// All steps in the order of [`run`].
-const STEPS: [&str; 41] = [
+const STEPS: [&str; 42] = [
     "metadata",
     "setup",
     "entities",
@@ -53,6 +54,7 @@ const STEPS: [&str; 41] = [
     "ws_close",
     "unreachable",
     "config_file",
+    "address_lookup",
     "driver_restart",
     "debug_log",
     "python_config",
@@ -176,6 +178,8 @@ pub struct Options {
     /// of these, without case. Also filled from [`AVOID_FILE`]. Empty: the checks select no source
     /// at all.
     pub avoid_sources: Vec<String>,
+    /// Host name of the receiver for the `address_lookup` check. `None`: that part is skipped.
+    pub host_name: Option<String>,
 }
 
 impl Options {
@@ -314,6 +318,7 @@ fn parse_from(mut args: impl Iterator<Item = String>) -> Result<Options, String>
         commands: repo_root().join("resources/commands.tsv"),
         kinds: Vec::new(),
         avoid_sources: Vec::new(),
+        host_name: None,
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -334,6 +339,13 @@ fn parse_from(mut args: impl Iterator<Item = String>) -> Result<Options, String>
             "--avoid-sources" => {
                 opt.avoid_sources
                     .extend(name_list("--avoid-sources", args.next())?);
+            }
+            "--host-name" => {
+                let name = args.next().ok_or("--host-name needs a name")?;
+                if name.is_empty() || name.starts_with('-') {
+                    return Err(format!("--host-name needs a name, not {name:?}"));
+                }
+                opt.host_name = Some(name);
             }
             "--no-oracle" => opt.no_oracle = true,
             "--no-power" => opt.no_power = true,
@@ -411,7 +423,7 @@ async fn main() {
         Ok(o) => o,
         Err(e) => {
             eprintln!(
-                "{e}\nUsage: remote-sim <receiver address> [--driver <path>] [--only a,b] [--skip a,b] [--kinds a,b] [--avoid-sources a,b] [--no-power] [--no-oracle] [--port <port>] [--commands <path>]"
+                "{e}\nUsage: remote-sim <receiver address> [--driver <path>] [--only a,b] [--skip a,b] [--kinds a,b] [--avoid-sources a,b] [--host-name <name>] [--no-power] [--no-oracle] [--port <port>] [--commands <path>]"
             );
             std::process::exit(2);
         }
@@ -544,6 +556,7 @@ async fn middle_steps(ctx: &mut Ctx) {
     ctx.step("ws_close", checks::ws_close).await;
     ctx.step("unreachable", checks::unreachable).await;
     ctx.step("config_file", checks::config_file).await;
+    ctx.step("address_lookup", checks::address_lookup).await;
     ctx.step("driver_restart", checks::driver_restart).await;
     ctx.step("debug_log", checks::debug_log).await;
     ctx.step("python_config", checks::python_config).await;
@@ -573,6 +586,7 @@ pub mod tests {
             commands: PathBuf::new(),
             kinds: Vec::new(),
             avoid_sources: avoid.iter().map(|a| (*a).to_owned()).collect(),
+            host_name: None,
         }
     }
 
@@ -736,6 +750,18 @@ pub mod tests {
             panic!("two addresses accepted");
         };
         assert!(e.contains("more than one receiver address"), "{e}");
+    }
+
+    #[test]
+    fn host_name_option() {
+        assert!(parse(&["192.0.2.1", "--host-name"]).is_err(), "missing");
+        assert!(parse(&["192.0.2.1", "--host-name", ""]).is_err(), "empty");
+        assert!(
+            parse(&["192.0.2.1", "--host-name", "--no-power"]).is_err(),
+            "option"
+        );
+        let opt = parse(&["192.0.2.1", "--host-name", "avr"]).expect("valid");
+        assert_eq!(opt.host_name.as_deref(), Some("avr"));
     }
 
     #[test]

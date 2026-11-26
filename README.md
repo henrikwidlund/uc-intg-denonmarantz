@@ -314,32 +314,34 @@ button), adding and removing a second receiver, and the sleep and wake of the Re
 `tools/remote-sim` is a program that acts as the Remote and runs all other tests with a real receiver. Some checks
 ask you to do something (see below). It opens a second connection to the receiver and checks that every select and
 sensor shows what the receiver has, after each change. It also sends the simple commands that the driver offers on
-the remote entity, but not the commands only for Marantz receivers, commands with `VOLUME` in the name (also
-Dynamic Volume), commands with `RESET` as a whole part of the name, the tuner presets, Quick Select, Smart
-Select, zone favorites, memory commands, the network restart, the triggers, the remote lock and the LFE level of
-the 7.1 input. The speaker and Auro-Matic 3D presets are sent and set back. It starts the
-driver without mDNS, so it needs no root rights. The checks switch the receiver on and off and change source, sound
-mode and some settings, and restore them, also when a check fails, unless you choose at a question to leave the
-source as it is. The `mute` check runs only if the mute state is known, the receiver is not muted, its volume is at
-or below -40 dB and the driver shows the same volume as the receiver. An unmute comes only after the volume is at
-or below the volume before the change and at or below -40 dB (the volume of the receiver, or of the driver without
-the second connection). At the end, `restore_power` sets the power and the mute state back to the start and, with
-the second connection, lowers the volume to the start volume (not above -40 dB) if it is higher. While the simple
-commands are sent, the sound can stop for some seconds, for example when HDMI audio goes to the TV. The settings
-that they change and the source are saved in `remote-sim-restore.txt` in the repository folder first. A source that
-may not be selected is saved only as a line that is never sent. If the source is not read, the check is skipped. If
-a run stops before they are set back, the next run sets them back at its start. It sets the source back only if the
-main zone is on, exactly one source was saved, and both the saved source and the current source may be selected
+the remote entity, but not the commands only for Marantz receivers, commands with `VOLUME` in the name (also Dynamic
+Volume), commands with `RESET` as a whole part of the name, the tuner presets, Quick Select, Smart Select, zone
+favorites, memory commands, the network restart, the triggers, the remote lock and the LFE level of the 7.1 input.
+The speaker and Auro-Matic 3D presets are sent and set back. It starts the driver without mDNS, so it needs no root
+rights. The checks switch the receiver on and off and change source, sound mode and some settings, and restore them,
+also when a check fails, unless you choose at a question to leave the source as it is. The `mute` check runs only if
+the mute state is known, the receiver is not muted, its volume is at or below -40 dB and the driver shows the same
+volume as the receiver. An unmute comes only after the volume is at or below the volume before the change and at or
+below -40 dB (the volume of the receiver, or of the driver without the second connection). At the end,
+`restore_power` sets the power and the mute state back to the start and, with the second connection, lowers the
+volume to the start volume (not above -40 dB) if it is higher. If the receiver does not answer the volume query, it
+starts new queries for up to 30 s, and each query waits up to 10 s for its answer. While the simple commands are
+sent, the sound can stop for some seconds, for example when HDMI audio goes to the TV. The settings that they change
+and the source are saved in `remote-sim-restore.txt` in the repository folder first. A source that may not be
+selected is saved only as a line that is never sent. If the source is not read, the check is skipped. If a run stops
+before they are set back, the next run sets them back at its start. A sound mode that the receiver does not take is
+only a note and does not keep the file: the input signal can limit the sound modes. It sets the source back only if
+the main zone is on, exactly one source was saved, and both the saved source and the current source may be selected
 (see `--avoid-sources`). Some settings are kept for each source, so if the source cannot be set back and is not the
 saved source already, nothing is set back and the file stays. This is also true at the end of a check, and when the
 source must be set back while the main zone is off. While the file is still there, the checks that change these
 settings are skipped. A source change stops HEOS and AirPlay, and they do not start again. The checks never set the
-volume above -40 dB. A power on can start with a higher volume of the receiver: if it is above -40 dB, it is
-lowered to -40 dB at once. If the second connection cannot read the volume, a check that makes sound or changes the
-source fails. If a source must be set back then, it asks you to do it. `ws_keepalive` and `ws_close` use another
-WebSocket connection to the driver: `ws_keepalive` sends a ping every second for 5 s and needs each pong within
-1 s. `ws_close` closes with code 4001 and reason `bye`, needs the same code and reason back, and the driver log
-must show within 3 s that the session ended.
+volume above -40 dB. A power on can start with a higher volume of the receiver: if it is above -40 dB, it is lowered
+to -40 dB at once. If the second connection cannot read the volume, a check that makes sound or changes the source
+fails. If a source must be set back then, it asks you to do it. `ws_keepalive` and `ws_close` use another WebSocket
+connection to the driver: `ws_keepalive` sends a ping every second for 5 s and needs each pong within 1 s.
+`ws_close` closes with code 4001 and reason `bye`, needs the same code and reason back, and the driver log must show
+within 3 s that the session ended.
 
 More checks:
 
@@ -385,7 +387,8 @@ More checks:
 - `media_keys` (after `remote_commands`) sends the navigation and playback keys of the media player, never a
   volume or source command:
   - Menu: with the second connection and a receiver that has the menu query, it opens the setup menu, sends
-    the cursor keys, enter and back while the menu is open, and closes it. The menu is always closed at the end.
+    the cursor keys down, up and right, enter and back while the menu is open, and closes it. Left is not sent:
+    it closes the menu. The menu is always closed at the end.
     It is skipped if the menu is open at the start.
   - Info and option: with the same needs, it sends info, option and back while the setup menu is closed.
   - Channel: only on the analog tuner on a preset, at or below -40 dB: channel up, then down, and the preset and
@@ -394,14 +397,26 @@ More checks:
     item, at or below -40 dB: next, then previous, and the item must come back.
 - `source` selects another source (see `--avoid-sources`), checks that a source without media shows its name as
   the title, and sets the start source back. It is skipped if the volume is above -40 dB.
-- `http_mode` switches the driver to HTTP mode and back to telnet. In HTTP mode it sets the signal check time to
-  0 and checks that the HDR, pixel depth, FRL and color space sensors are removed, then sets it to 5 and checks
-  that they are back. It lowers the bass by one step and sets it back, only if tone control is on and the Dirac
-  filter is off. The report shows the MultEQ and Dynamic EQ values. It changes the dimmer (if the driver offers
-  it over HTTP) and the sound mode (if the driver showed one with telnet). It selects another source (see
-  `--avoid-sources`), but not if the volume is above -40 dB. It sets the signal check time, the source, the
-  dimmer and the sound mode back. If the switch back to telnet fails, the signal check time and the sound mode
-  are not set back, and the check fails.
+- `http_mode` switches the driver to HTTP mode and back to telnet. In HTTP mode it sets the signal check time to 0
+  and checks that the HDR, pixel depth, FRL and color space sensors are removed, then sets it to 5 and checks that
+  they are back. It lowers the bass by one step and sets it back, only if tone control is on and the Dirac filter is
+  off. The report shows the MultEQ and Dynamic EQ values. It changes the dimmer (if the driver offers it over HTTP)
+  and the sound mode (if the driver showed one with telnet). It selects another source (see `--avoid-sources`), but
+  not if the volume is above -40 dB. It sets the signal check time, the source, the dimmer and the sound mode back.
+  If the old sound mode does not come back, it is only a note if the driver shows a mode and the second connection
+  shows that the receiver is no longer in the mode set in HTTP mode: the input signal can change, for example with a
+  source change, and the receiver then picks a mode that fits the signal. It fails without the second connection or
+  its mode, if the second connection did not show a new mode within 5 s after the change, and if the receiver is
+  back in its mode from before the change. If the switch back to telnet fails, the signal check time and the sound
+  mode are not set back, and the check fails.
+- `address_lookup` (after `config_file`) writes the documentation address `192.0.2.1`, where nothing answers, as the
+  stored address in `config.json` and starts the driver again. The driver must find the receiver and store its
+  address again. It writes the saved `config.json` back at the end. The parts:
+  - Host name: with `--host-name`, the host name is stored too, and the driver must use it. The part is skipped
+    without `--host-name`, or if the name does not resolve to the receiver address on this computer.
+  - Search: without a host name, the driver must find the receiver by its MAC address or serial number within
+    20 s. While the driver still connects, the dimmer is set to the option it already has: the command must wait
+    for the connect and work.
 - `configure_options` (after `http_mode`) changes "Show all sources", sets it back and checks the source list
   without a restart of the driver.
 - `log` fails on a panic or an ERROR line in the driver log (except the line of the broken file check). It shows
@@ -458,6 +473,7 @@ Options:
 - `ws_idle` runs only with `--only ws_idle`. Another WebSocket connection to the driver sends nothing for 45 s
   and must then still get an answer to a request. The driver closes a connection after 40 s without a message,
   so only the answers to the pings of the driver keep it open.
+- `--host-name <name>`: the host name of the receiver for the `address_lookup` check.
 - `--no-power` skips the power check. The other checks still switch the receiver on if it is off.
 - `--no-oracle` does not open the second connection. The values are then not compared with the receiver.
   Without the second connection the volume cannot be read from the receiver, so the checks do not switch the

@@ -163,9 +163,10 @@ fn is_saved(line: &str) -> bool {
 /// and the receiver is read again after each. Nothing is sent, or nothing more, if the source
 /// differs and the main zone is not on, if the receiver did not take the source or does not report
 /// it later, or if another source than a marked one (see [`mark_source`]) is selected or there is
-/// more than one marked line. Then all lines are returned. Else returns the lines that the receiver
-/// did not take: they have a different value when read again.
-pub async fn write(avr: &Avr, queries: &[&str], lines: &[String]) -> Result<Vec<String>, Fail> {
+/// more than one marked line. Then all lines without the marked ones are returned as
+/// [`Missed::NotSent`]. Else returns as [`Missed::Lines`] the lines that the receiver did not take:
+/// they have a different value when read again.
+pub async fn write(avr: &Avr, queries: &[&str], lines: &[String]) -> Result<Missed, Fail> {
     let marked = lines.iter().any(|l| l.starts_with(MARKED_SOURCE));
     let start = single_code(lines, MARKED_SOURCE);
     let lines: Vec<String> = lines
@@ -178,7 +179,7 @@ pub async fn write(avr: &Avr, queries: &[&str], lines: &[String]) -> Result<Vec<
     let mut now = read(avr, queries).await?;
     // The marked source is not set back, so nothing is sent while another source is selected.
     if marked && !start.is_some_and(|code| single_code(&now, SOURCE) == Some(code)) {
-        return Ok(lines.to_vec());
+        return Ok(Missed::NotSent(lines.to_vec()));
     }
     // Some settings are kept for each source, and a speaker preset changes the settings of the
     // preset. So both go first and alone, and the other lines are compared with the values of the
@@ -192,7 +193,7 @@ pub async fn write(avr: &Avr, queries: &[&str], lines: &[String]) -> Result<Vec<
             if prefix == SOURCE
                 && avr.snapshot().zone(Zone::Main).power != Some(denon_marantz::proto::Power::On)
             {
-                return Ok(lines.to_vec());
+                return Ok(Missed::NotSent(lines.to_vec()));
             }
             send(avr, std::slice::from_ref(line)).await?;
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -200,18 +201,18 @@ pub async fn write(avr: &Avr, queries: &[&str], lines: &[String]) -> Result<Vec<
             // Without the saved source, the other lines would change the settings of another
             // source.
             if prefix == SOURCE && !taken(&now, line) {
-                return Ok(lines.to_vec());
+                return Ok(Missed::NotSent(lines.to_vec()));
             }
         }
     }
     let changed = with_detour(lines, differing(lines, &now));
     if changed.is_empty() {
-        return Ok(changed);
+        return Ok(Missed::Lines(changed));
     }
     // A source line is sent only alone, after the power check above: here the receiver lost the
     // source again, or did not report it.
     if changed.iter().any(|l| l.starts_with(SOURCE)) {
-        return Ok(lines.to_vec());
+        return Ok(Missed::NotSent(lines.to_vec()));
     }
     send(avr, &changed).await?;
     // The receiver needs time to apply a source, a sound mode or a speaker preset.
@@ -219,7 +220,7 @@ pub async fn write(avr: &Avr, queries: &[&str], lines: &[String]) -> Result<Vec<
     let now = read(avr, queries).await?;
     let missed = differing(lines, &now);
     if missed.is_empty() {
-        return Ok(missed);
+        return Ok(Missed::Lines(missed));
     }
     // A busy receiver can answer too late, or ignore a line while it applies the source, the sound
     // mode or a speaker preset. Send the missed lines again and ask for them only. The Dirac and
@@ -227,7 +228,7 @@ pub async fn write(avr: &Avr, queries: &[&str], lines: &[String]) -> Result<Vec<
     // change MultEQ and Dynamic EQ, and a preset change can change all settings. A source line is
     // sent only alone, after the power check above.
     if missed.iter().any(|l| l.starts_with(SOURCE)) {
-        return Ok(lines.to_vec());
+        return Ok(Missed::NotSent(lines.to_vec()));
     }
     let missed = with_detour(lines, missed);
     send(avr, &missed).await?;
@@ -254,12 +255,14 @@ pub async fn write(avr: &Avr, queries: &[&str], lines: &[String]) -> Result<Vec<
         }
     }
     let now = read(avr, &again).await?;
-    Ok(lines
-        .iter()
-        .filter(|line| position(line).is_some_and(|i| again.contains(&QUERIES[i])))
-        .filter(|line| !taken(&now, line))
-        .cloned()
-        .collect())
+    Ok(Missed::Lines(
+        lines
+            .iter()
+            .filter(|line| position(line).is_some_and(|i| again.contains(&QUERIES[i])))
+            .filter(|line| !taken(&now, line))
+            .cloned()
+            .collect(),
+    ))
 }
 
 fn differing(lines: &[String], now: &[String]) -> Vec<String> {
@@ -339,6 +342,40 @@ fn send_order(lines: &[String]) -> Vec<&str> {
 fn is_tone_level(line: &str) -> bool {
     line.starts_with("PSBAS") || line.starts_with("PSTRE")
 }
+
+/// The saved lines that are not set back, see [`write`].
+#[derive(Debug, PartialEq)]
+pub enum Missed {
+    /// Lines that were sent, but the receiver did not take.
+    Lines(Vec<String>),
+    /// [`write`] stopped early because of the source. Some of these lines may already be sent, but
+    /// they were not checked.
+    NotSent(Vec<String>),
+}
+
+impl Missed {
+    /// Take the sound mode lines out of lines that the receiver did not take. The receiver refuses
+    /// a sound mode that does not fit the input signal, so such a line is only a note: it does not
+    /// keep [`FILE`]. Lines that were not sent are kept.
+    pub fn take_sound_mode(&mut self) -> Vec<String> {
+        match self {
+            Self::Lines(lines) => lines
+                .extract_if(.., |line| line.starts_with(SOUND_MODE))
+                .collect(),
+            Self::NotSent(_) => Vec::new(),
+        }
+    }
+
+    /// All lines, sent or not.
+    pub fn into_lines(self) -> Vec<String> {
+        match self {
+            Self::Lines(lines) | Self::NotSent(lines) => lines,
+        }
+    }
+}
+
+/// Text after a sound mode that the receiver did not take.
+pub const SOUND_NOTE: &str = " (the input signal can limit the sound modes)";
 
 const SOURCE: &str = "SI";
 const SOUND_MODE: &str = "MS";
@@ -439,15 +476,33 @@ pub async fn after_early_stop(opt: &Options) -> Option<String> {
     }
     .await;
     Some(match result {
-        Ok(Ok(missed)) if missed.is_empty() => {
-            forget().await;
-            format!("{} settings of the last run set back", lines.len())
-        }
-        // The file stays: the next run tries again.
-        Ok(Ok(missed)) => format!(
-            "settings of the last run set back, not taken: {missed:?}. They stay in {}",
+        Ok(Ok(Missed::NotSent(_))) => format!(
+            "settings of the last run not set back: the source could not be set back. They stay in {}",
             FILE.display()
         ),
+        Ok(Ok(mut missed)) => {
+            let sound = missed.take_sound_mode();
+            let mut missed = missed.into_lines();
+            if !missed.is_empty() {
+                // The file stays: the next run tries again.
+                missed.extend(sound);
+                missed.sort_by_key(|line| position(line));
+                format!(
+                    "settings of the last run set back, not taken: {missed:?}. They stay in {}",
+                    FILE.display()
+                )
+            } else {
+                forget().await;
+                let set = lines.len() - sound.len();
+                if sound.is_empty() {
+                    format!("{set} settings of the last run set back")
+                } else {
+                    format!(
+                        "{set} settings of the last run set back, sound mode not taken: {sound:?}{SOUND_NOTE}"
+                    )
+                }
+            }
+        }
         Ok(Err(why)) => format!(
             "settings of the last run not set back, because the source cannot be set back: {why}. They stay in {}",
             FILE.display()
@@ -496,6 +551,18 @@ async fn source_refused(oracle: &Oracle, opt: &Options, lines: &[String]) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sound_mode_lines_are_taken_out_only_after_a_send() {
+        let lines = || vec!["MSDOLBY AUDIO-DSUR".to_owned(), "PSRSTR OFF".to_owned()];
+        let mut missed = Missed::Lines(lines());
+        assert_eq!(missed.take_sound_mode(), ["MSDOLBY AUDIO-DSUR"]);
+        assert!(missed.take_sound_mode().is_empty());
+        assert_eq!(missed.into_lines(), ["PSRSTR OFF"]);
+        let mut not_sent = Missed::NotSent(lines());
+        assert!(not_sent.take_sound_mode().is_empty());
+        assert_eq!(not_sent.into_lines(), lines());
+    }
 
     #[test]
     fn answers_are_kept_in_the_order_of_the_queries() {

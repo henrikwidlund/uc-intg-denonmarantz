@@ -278,15 +278,18 @@ step "Setup: discovery and options" \
 On the page 'Setup mode': leave the address empty. Press Next.
 Pick the receiver. Keep the defaults. Press Next.
 Then start the setup again: 'Configuration mode' > 'Configure selected device' > Next. Press Next on the
-next page without a change." \
+next page without a change.
+Then once more 'Configure selected device': write the host name of the receiver in the address field (for
+example the name that the router shows). Press Next. Open 'Configure selected device' again, then cancel." \
 "The page 'Setup mode' says that the address is optional and that the search finds receivers only on the
 same network as the Remote. A page 'Please choose your Denon or Marantz AVR' has the receiver and these
 fields: show all sources, manufacturer, connection mode, Dirac, AM/FM tuner, signal check time (5 s; not
 on receivers from before about 2016) and a note.
 'Device supports Dirac' shows the real value of the receiver.
 The setup ends with success in about a second.
-The page 'Configure your AVR' shows the address and the same fields with the saved values." \
-"recent_log 'discovering|adding|not found|WARN|ERROR'"
+The page 'Configure your AVR' shows the address and the same fields with the saved values.
+With the host name the setup also ends with success, and the address field then shows the host name." \
+"recent_log 'discovering|adding|not found|host name|WARN|ERROR'"
 
 step "Setup: entities" \
 "Setup is done." \
