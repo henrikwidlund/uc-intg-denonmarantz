@@ -151,8 +151,9 @@ Commands with a number are sent as raw text with the remote entity:
   for the name, and at most 10 seconds for the name and all its IP addresses together. When you add a receiver
   and the setup cannot look up the name, it connects with the name; if that fails, nothing is saved. When you
   add a receiver and no address answers in this time, nothing is saved. When you change the address of a
-  configured receiver, the setup saves the first IP address if the receiver answers at none in this time, and
-  the name as the address if it cannot look up the name. If `address` in `config.json` is a host name and
+  configured receiver and the receiver answers at none in this time, the setup saves the first IP address where
+  no other receiver answers. It saves the name as the address if other receivers answer at all IP addresses or
+  if it cannot look up the name. If `address` in `config.json` is a host name and
   `host` is not set, the driver moves the name to `host` when it saves a new address.
 - After the Remote wakes up, the network of the Remote can be down for a short time. The driver tries again
   for up to 3 seconds. A connection to the receiver that does not open in 0.25 seconds is tried again. A start or
@@ -447,6 +448,7 @@ cargo run --release --manifest-path tools/remote-sim/Cargo.toml -- <receiver add
 ```
 
 Before it starts the driver, the tool builds it with `cargo build --release --locked` in the repository folder.
+It starts the binary that cargo names, so the target folder of cargo is used, for example from `CARGO_TARGET_DIR`.
 If the build fails, the tool stops before it connects to the receiver.
 
 Options:
@@ -492,8 +494,9 @@ Options:
   `heos` does not ask you to start HEOS Music, and no source is selected. The `mute` check then uses the volume
   of the driver.
 - `--driver <path>`, `--port <port>` and `--commands <path>` change the driver binary, the port and the
-  command table. The default driver binary is `target/release/uc-intg-denonmarantz` and the default command
-  table is `resources/commands.tsv`, both in the repository folder, so the tool works from any folder.
+  command table. With `--no-build`, the default driver binary is `target/release/uc-intg-denonmarantz`. The
+  default command table is `resources/commands.tsv`. Both are in the repository folder, so the tool works from
+  any folder.
 - `RUST_LOG` is added after the default driver log filter. A level in it replaces the default level for the
   same name, for example
   `denon_marantz=trace,denon_marantz_heos=trace`. The checks read debug lines of the driver, so do not set

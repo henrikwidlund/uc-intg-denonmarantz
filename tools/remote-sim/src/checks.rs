@@ -13,6 +13,7 @@ use denon_marantz::{Command, Query, Zone};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
@@ -1055,14 +1056,12 @@ pub async fn remote_ui(ctx: &mut Ctx) -> Check {
 
 // ---------------------------------------------------------------- wake and sleep
 
-async fn connects(ctx: &Ctx) -> usize {
-    ctx.driver.log_text().await.matches("connected in").count()
-}
+/// Part of a driver log line for a full connect.
+const CONNECTED_IN: &str = "connected in";
 
 pub async fn standby(ctx: &mut Ctx) -> Check {
     ensure_on(ctx).await?;
     let mp = ctx.mp();
-    let before = connects(ctx).await;
     ctx.client.send_event("enter_standby").await?;
     let asleep = async {
         ctx.client.listen(3).await?;
@@ -1072,17 +1071,12 @@ pub async fn standby(ctx: &mut Ctx) -> Check {
     }
     .await;
     if let Err(e) = asleep {
-        // Wake the Remote up again, else the next checks run in standby.
-        let undo = async {
-            ctx.client.send_event("exit_standby").await?;
-            wait_status(ctx, "Connected", 8).await.map(|_| ())
-        }
-        .await;
-        return first_error(Err(e), undo);
+        return first_error(Err(e), wake_again(ctx).await);
     }
+    let mark = ctx.driver.log_size().await;
     ctx.client.send_event("exit_standby").await?;
     let start = Instant::now();
-    while connects(ctx).await == before {
+    while !ctx.driver.log_from(mark).await.contains(CONNECTED_IN) {
         ensure!(
             start.elapsed() < Duration::from_secs(8),
             "no new connection after exit_standby"
@@ -1199,16 +1193,17 @@ fn after_wake(tail: &str, failed: usize, telnet: bool) -> Result<usize, String> 
     Ok(tail.matches(TELNET_RETRY).count())
 }
 
-/// Wait until the last status line of the driver log shows `status`. Returns the length of the
-/// log in which it was seen.
-async fn wait_status(ctx: &mut Ctx, status: &str, secs: u64) -> Result<usize, Fail> {
+/// Wait until the last status line of the driver log after byte `from` shows `status`. Status
+/// lines before `from` do not count. Returns the byte offset after the whole lines in which it was
+/// seen.
+async fn wait_status(ctx: &mut Ctx, from: u64, status: &str, secs: u64) -> Result<u64, Fail> {
     debug_assert!(STATUSES.contains(&status), "{status}");
     let start = Instant::now();
     loop {
-        let log = ctx.driver.log_text().await;
+        let (log, end) = ctx.driver.log_lines(from).await;
         let last = last_status(&log);
         if last == Some(status) {
-            return Ok(log.len());
+            return Ok(end);
         }
         ensure!(
             start.elapsed() < Duration::from_secs(secs),
@@ -1219,18 +1214,40 @@ async fn wait_status(ctx: &mut Ctx, status: &str, secs: u64) -> Result<usize, Fa
     }
 }
 
-/// The standby and wake-up events of [`quick_wake`], up to the last standby. Returns the length of
-/// the driver log in which the driver is disconnected.
-async fn standby_burst(ctx: &mut Ctx) -> Result<usize, Fail> {
+/// Wake the Remote up after a failed step, else the next checks run in standby. Waits until the
+/// driver is connected after the wake-up, see [`woke`].
+async fn wake_again(ctx: &mut Ctx) -> Result<(), Fail> {
+    let (log, from) = ctx.driver.log_lines(0).await;
+    let before = last_status(&log).map(str::to_owned);
+    drop(log);
+    ctx.client.send_event("exit_standby").await?;
+    ctx.client.listen_ms(1000).await?;
+    let (tail, _) = ctx.driver.log_lines(from).await;
+    if woke(before.as_deref(), last_status(&tail)) {
+        return Ok(());
+    }
+    wait_status(ctx, from, "Connected", 7).await.map(drop)
+}
+
+/// Whether the driver is connected after a wake-up: the last status line after it is
+/// `Connected`, or there is none and the last one before it is `Connected`.
+fn woke(before: Option<&str>, after: Option<&str>) -> bool {
+    after.or(before) == Some("Connected")
+}
+
+/// The standby and wake-up events of [`quick_wake`], up to the last standby. `from` is the size
+/// of the driver log before the step. Returns the byte offset of the driver log after the lines
+/// in which the driver is disconnected.
+async fn standby_burst(ctx: &mut Ctx, from: u64) -> Result<u64, Fail> {
     ctx.client.send_event("enter_standby").await?;
-    wait_status(ctx, "Disconnected", 5).await?;
+    wait_status(ctx, from, "Disconnected", 5).await?;
     for (awake, asleep) in QUICK_GAPS_MS {
         ctx.client.send_event("exit_standby").await?;
         ctx.client.listen_ms(awake).await?;
         ctx.client.send_event("enter_standby").await?;
         ctx.client.listen_ms(asleep).await?;
     }
-    wait_status(ctx, "Disconnected", 3).await
+    wait_status(ctx, from, "Disconnected", 3).await
 }
 
 /// The Remote wakes up and goes to standby again with short gaps. With the short gaps, a standby
@@ -1242,33 +1259,23 @@ async fn standby_burst(ctx: &mut Ctx) -> Result<usize, Fail> {
 /// how many telnet retry lines came after the last wake-up.
 pub async fn quick_wake(ctx: &mut Ctx) -> Check {
     ensure_on(ctx).await?;
-    let log = ctx.driver.log_text().await;
-    ensure!(!log.is_empty(), "the driver log is empty");
+    let start = ctx.driver.log_size().await;
+    ensure!(start > 0, "the driver log is empty");
     let config = read_config(ctx).await?;
     let telnet = config_device(ctx, &config)?["use_telnet"] != false;
-    let failed_before = failed_connects(&log);
-    let canceled_before = canceled_connects(&log);
-    let from = match standby_burst(ctx).await {
+    let from = match standby_burst(ctx, start).await {
         Ok(from) => from,
-        Err(e) => {
-            // Wake the Remote up again, else the next checks run in standby.
-            let undo = async {
-                ctx.client.send_event("exit_standby").await?;
-                wait_status(ctx, "Connected", 8).await.map(|_| ())
-            }
-            .await;
-            return first_error(Err(e), undo);
-        }
+        Err(e) => return first_error(Err(e), wake_again(ctx).await),
     };
     ctx.client.send_event("exit_standby").await?;
-    wait_status(ctx, "Connected", 8).await?;
+    wait_status(ctx, from, "Connected", 8).await?;
     ctx.client.listen(2).await?;
-    let log = ctx.driver.log_text().await;
-    let tail = log.get(from..).unwrap_or_default();
-    let failed = failed_connects(&log).saturating_sub(failed_before);
-    let retries = after_wake(tail, failed, telnet).map_err(Fail::new)?;
-    let ms = connect_ms(tail).map_or_else(|| "?".to_owned(), |ms| ms.to_string());
-    let canceled = canceled_connects(&log).saturating_sub(canceled_before);
+    let step = ctx.driver.log_from(start).await;
+    let tail = ctx.driver.log_from(from).await;
+    let failed = failed_connects(&step);
+    let retries = after_wake(&tail, failed, telnet).map_err(Fail::new)?;
+    let ms = connect_ms(&tail).map_or_else(|| "?".to_owned(), |ms| ms.to_string());
+    let canceled = canceled_connects(&step);
     ctx.client.refresh_states().await?;
     let state = wait_available(ctx, 5).await?;
     verify_fresh(ctx).await?;
@@ -3169,7 +3176,7 @@ pub async fn ws_close(ctx: &mut Ctx) -> Check {
     let client = Client::connect(ctx.driver.port).await?;
     // The driver logs lines of a session with the peer address as `[id]`.
     let id = format!("[{}]", client.local_addr());
-    let mark = log_size(ctx).await;
+    let mark = ctx.driver.log_size().await;
     let frame = client
         .close(CLOSE_CODE, CLOSE_REASON, Duration::from_secs(3))
         .await?;
@@ -3227,11 +3234,16 @@ pub async fn unreachable(ctx: &mut Ctx) -> Check {
             .await?;
         if response["code"] == 200 {
             // The driver can find the receiver by its id while the command waits. It saves the
-            // address a moment after the answer.
+            // address a moment after the answer. The receiver address can be a host name, and the
+            // driver can save one of its IP addresses.
+            let ips: Vec<IpAddr> = tokio::net::lookup_host((address.as_str(), 0))
+                .await
+                .map(|addrs| addrs.map(|a| a.ip()).collect())
+                .unwrap_or_default();
             let mut found = false;
             for _ in 0..10 {
                 let config = read_config(ctx).await?;
-                if config_device(ctx, &config)?["address"] == address.as_str() {
+                if is_address(&config_device(ctx, &config)?["address"], &address, &ips) {
                     found = true;
                     break;
                 }
@@ -3257,6 +3269,14 @@ pub async fn unreachable(ctx: &mut Ctx) -> Check {
     configure(ctx, &address, None).await?;
     wait_available(ctx, 60).await?;
     result
+}
+
+/// The `address` field of a configuration is `address`, or one of `ips`, the IP addresses of
+/// `address`.
+fn is_address(field: &Value, address: &str, ips: &[IpAddr]) -> bool {
+    field.as_str().is_some_and(|field| {
+        field == address || field.parse::<IpAddr>().is_ok_and(|ip| ips.contains(&ip))
+    })
 }
 
 // ---------------------------------------------------------------- configuration file
@@ -3585,13 +3605,6 @@ fn debug_lines(log: &str) -> usize {
         .count()
 }
 
-/// Size of the driver log in bytes. 0 if it cannot be read.
-async fn log_size(ctx: &Ctx) -> u64 {
-    tokio::fs::metadata(&ctx.driver.log)
-        .await
-        .map_or(0, |m| m.len())
-}
-
 /// The log after byte `start`. Only that part is read.
 async fn log_after(ctx: &Ctx, start: u64) -> String {
     ctx.driver.log_from(start).await
@@ -3648,7 +3661,7 @@ async fn debug_log_checks(ctx: &mut Ctx) -> Check {
     let settings = ctx.driver.dir.join(SETTINGS_FILE);
     ctx.driver.stop().await;
     tokio::fs::write(&settings, r#"{"debug_log":false}"#).await?;
-    let start = log_size(ctx).await;
+    let start = ctx.driver.log_size().await;
     restart_plain(ctx).await?;
     entity_ids(ctx).await?;
     let log = log_after(ctx, start).await;
@@ -3658,7 +3671,7 @@ async fn debug_log_checks(ctx: &mut Ctx) -> Check {
         debug_lines(&log)
     );
 
-    let start = log_size(ctx).await;
+    let start = ctx.driver.log_size().await;
     save_debug_log(ctx, true).await?;
     entity_ids(ctx).await?;
     let log = log_after(ctx, start).await;
@@ -3675,7 +3688,7 @@ async fn debug_log_checks(ctx: &mut Ctx) -> Check {
     );
     wait_settings(ctx, true).await?;
 
-    let start = log_size(ctx).await;
+    let start = ctx.driver.log_size().await;
     save_debug_log(ctx, false).await?;
     entity_ids(ctx).await?;
     let log = log_after(ctx, start).await;
@@ -3693,7 +3706,7 @@ async fn debug_log_checks(ctx: &mut Ctx) -> Check {
     save_debug_log(ctx, true).await?;
     wait_settings(ctx, true).await?;
     ctx.driver.stop().await;
-    let start = log_size(ctx).await;
+    let start = ctx.driver.log_size().await;
     restart_plain(ctx).await?;
     entity_ids(ctx).await?;
     let log = log_after(ctx, start).await;
@@ -4371,8 +4384,12 @@ pub async fn select_sweep(ctx: &mut Ctx) -> Check {
         Ok((summary, verified))
     }
     .await;
-    let clean = result.is_ok() && problems.is_empty();
-    let undo = sweep_back(ctx, &dirac_original, dynamic_eq.as_deref(), clean).await;
+    let sweep = if result.is_ok() && problems.is_empty() {
+        Sweep::Clean
+    } else {
+        Sweep::Failed
+    };
+    let undo = sweep_back(ctx, &dirac_original, dynamic_eq.as_deref(), sweep).await;
     let (summary, verified) = first_error(result, undo).map_err(|e| {
         if problems.is_empty() {
             e
@@ -4398,21 +4415,37 @@ pub async fn select_sweep(ctx: &mut Ctx) -> Check {
     Ok(format!("{verified} verified. {}", summary.join(" | ")))
 }
 
-/// Set the Dirac filter back to `dirac`, then Dynamic EQ to the saved answer lines. The Dirac
-/// filter is not sent if the sweep passed (`clean`) and the driver shows `dirac`: the driver and
-/// the receiver were then compared, if the receiver gives the filter. A refused or ignored Dirac
-/// filter counts as not set back.
+/// How the select sweep ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sweep {
+    /// No error and no problem.
+    Clean,
+    /// An error or a problem.
+    Failed,
+}
+
+/// Whether [`sweep_back`] sends the Dirac filter `dirac`. It is not sent if the start filter is
+/// not known, or if the sweep is [`Sweep::Clean`] and the driver shows `dirac` (`shown`): the
+/// driver and the receiver were then compared, if the receiver gives the filter.
+fn dirac_back_needed(dirac: &Value, shown: Option<&Value>, sweep: Sweep) -> bool {
+    *dirac != Value::Null
+        && dirac.as_str() != Some("--")
+        && !(sweep == Sweep::Clean && shown == Some(dirac))
+}
+
+/// Set the Dirac filter back to `dirac` if [`dirac_back_needed`], then Dynamic EQ to the saved
+/// answer lines. A refused or ignored Dirac filter counts as not set back.
 async fn sweep_back(
     ctx: &mut Ctx,
     dirac: &Value,
     dynamic_eq: Option<&[String]>,
-    clean: bool,
+    sweep: Sweep,
 ) -> Result<(), Fail> {
     let mut problems = Vec::new();
     let shown = ctx
         .client
         .attr(&ctx.select("dirac_filter"), "current_option");
-    if *dirac != Value::Null && *dirac != json!("--") && !(clean && shown == Some(dirac)) {
+    if dirac_back_needed(dirac, shown, sweep) {
         match sweep_one(ctx, "dirac_filter", dirac).await {
             Ok(Outcome::Refused(reason)) => {
                 problems.push(format!("dirac_filter back to {dirac}: refused: {reason}"));
@@ -4446,7 +4479,7 @@ async fn sweep_back(
 /// Set one option, wait for the select and its sensor, then compare with the receiver.
 async fn sweep_one(ctx: &mut Ctx, kind: &str, option: &Value) -> Result<Outcome, Fail> {
     let select = ctx.select(kind);
-    let log_start = log_size(ctx).await;
+    let log_start = ctx.driver.log_size().await;
     let (response, _) = ctx
         .client
         .command(
@@ -4569,6 +4602,8 @@ pub async fn settings_restore(ctx: &mut Ctx) -> Check {
         .into_iter()
         .find(|l| *l != sleep)
         .unwrap_or("SLP120");
+    // Set right before the set back, which can send lines and then fail.
+    let mut writing = false;
     let result = async {
         avr.telnet_send(Zone::Main, Command::Raw(other)).await?;
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -4578,6 +4613,7 @@ pub async fn settings_restore(ctx: &mut Ctx) -> Check {
             changed.iter().any(|l| l != &sleep && l != "SLPOFF"),
             "the sleep timer did not change to {other}: {changed:?}"
         );
+        writing = true;
         restore::write(avr, restore::QUERIES, &saved).await
     }
     .await;
@@ -4587,16 +4623,38 @@ pub async fn settings_restore(ctx: &mut Ctx) -> Check {
             // A failed send can still reach the receiver, the receiver can take the new timer
             // after the read, or the set back can stop early.
             let undo = sleep_back(avr, &sleep).await;
+            // The check changes only the sleep timer. A set back that stopped while it sent can
+            // leave other settings changed, for example Dirac: the file stays.
+            if undo.is_ok() && !writing {
+                restore::forget().await;
+            }
+            let e = if writing {
+                Fail::new(format!(
+                    "{e}. The settings stay in {}",
+                    restore::FILE.display()
+                ))
+            } else {
+                e
+            };
             return first_error(Err(e), undo);
         }
     };
     // The write stopped because of the source. The sleep timer is the same for every source, so
-    // it is set back.
-    let undo = if matches!(missed, restore::Missed::NotSent(_)) {
-        sleep_back(avr, &sleep).await
-    } else {
-        Ok(())
-    };
+    // it is set back. The check changes no other setting, so then nothing is left to set back.
+    if matches!(missed, restore::Missed::NotSent(_)) {
+        return Err(match sleep_back(avr, &sleep).await {
+            Ok(()) => {
+                restore::forget().await;
+                Fail::new(
+                    "the set back stopped because of the source. The sleep timer was set back",
+                )
+            }
+            Err(e) => Fail::new(format!(
+                "the set back stopped because of the source. Not set back: {e}. The settings stay in {}",
+                restore::FILE.display()
+            )),
+        });
+    }
     let sound = missed.take_sound_mode();
     let missed = missed.into_lines();
     let body = if missed.is_empty() {
@@ -4612,7 +4670,7 @@ pub async fn settings_restore(ctx: &mut Ctx) -> Check {
             restore::FILE.display()
         )))
     };
-    first_error(body, undo)?;
+    body?;
     restore::forget().await;
     ensure!(
         !restore::FILE.exists(),
@@ -6285,6 +6343,17 @@ mod tests {
     }
 
     #[test]
+    fn woke_needs_the_connected_status() {
+        assert!(woke(None, Some("Connected")));
+        assert!(woke(Some("Disconnected"), Some("Connected")));
+        assert!(woke(Some("Connected"), None), "the driver stayed connected");
+        assert!(!woke(Some("Connected"), Some("Disconnected")));
+        assert!(!woke(Some("Connected"), Some("Connecting")));
+        assert!(!woke(Some("Disconnected"), None));
+        assert!(!woke(None, None));
+    }
+
+    #[test]
     fn last_status_reads_the_last_status_line() {
         assert_eq!(None, last_status(""));
         assert_eq!(None, last_status("[A] connected in 20 ms\n"));
@@ -6726,5 +6795,33 @@ mod tests {
         assert_eq!(mv_command(-0.5), None);
         assert_eq!(mv_command(35.25), None, "not a half step");
         assert_eq!(mv_command(f64::NAN), None);
+    }
+
+    #[test]
+    fn the_dirac_filter_is_skipped_only_after_a_clean_sweep_that_shows_it() {
+        let start = json!("Filter 1");
+        let other = json!("Off");
+        assert!(!dirac_back_needed(&start, Some(&start), Sweep::Clean));
+        assert!(dirac_back_needed(&start, Some(&start), Sweep::Failed));
+        assert!(dirac_back_needed(&start, Some(&other), Sweep::Clean));
+        assert!(dirac_back_needed(&start, None, Sweep::Clean));
+        // The start filter is not known.
+        assert!(!dirac_back_needed(&Value::Null, None, Sweep::Failed));
+        assert!(!dirac_back_needed(
+            &json!("--"),
+            Some(&other),
+            Sweep::Failed
+        ));
+    }
+
+    #[test]
+    fn a_saved_address_matches_the_name_or_its_ips() {
+        let ips: [IpAddr; 1] = ["192.0.2.6".parse().unwrap()];
+        assert!(is_address(&json!("avr.local"), "avr.local", &ips));
+        assert!(is_address(&json!("192.0.2.6"), "avr.local", &ips));
+        assert!(!is_address(&json!("192.0.2.1"), "avr.local", &ips));
+        assert!(is_address(&json!("192.0.2.6"), "192.0.2.6", &[]));
+        assert!(!is_address(&json!("192.0.2.1"), "192.0.2.6", &[]));
+        assert!(!is_address(&Value::Null, "avr.local", &ips));
     }
 }

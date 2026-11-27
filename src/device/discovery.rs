@@ -55,7 +55,7 @@ pub async fn discover() -> Result<Vec<DiscoveredReceiver>, Error> {
 #[cfg(not(test))]
 pub async fn discover_for(cfg: &DeviceConfig) -> Result<Vec<DiscoveredReceiver>, Error> {
     denon_marantz::discover_all_until(&denon_marantz::DiscoveryConfig::default(), |r| {
-        cfg.same_receiver(r.serial_number.as_deref(), r.mac_address.as_deref()) == Some(true)
+        is_receiver(cfg, r)
     })
     .await
 }
@@ -91,15 +91,18 @@ pub async fn resolve(host: &str) -> std::io::Result<Vec<String>> {
         .collect())
 }
 
-/// Find the receiver of a configuration in the discovered ones, by its MAC address or serial
-/// number.
+/// Find the receiver of a configuration in the discovered ones, see [`is_receiver`].
 pub fn find<'a>(
     cfg: &DeviceConfig,
     found: &'a [DiscoveredReceiver],
 ) -> Option<&'a DiscoveredReceiver> {
-    found.iter().find(|r| {
-        cfg.same_receiver(r.serial_number.as_deref(), r.mac_address.as_deref()) == Some(true)
-    })
+    found.iter().find(|r| is_receiver(cfg, r))
+}
+
+/// Whether a discovered receiver is the receiver of a configuration, by its MAC address or serial
+/// number. `false` if neither can be compared.
+fn is_receiver(cfg: &DeviceConfig, r: &DiscoveredReceiver) -> bool {
+    cfg.same_receiver(r.into()) == Some(true)
 }
 
 /// What an earlier connection found out about a receiver. The type saves the type lookup. The brand
@@ -666,6 +669,14 @@ pub struct Identified {
 }
 
 impl Identified {
+    /// The serial number and the MAC address.
+    pub fn ids(&self) -> config_store::Ids<'_> {
+        config_store::Ids {
+            serial: self.serial.as_deref(),
+            mac: self.mac.as_deref(),
+        }
+    }
+
     /// Fails with the reason if the answers do not prove the receiver type, if the description
     /// was not read, or if the receiver gives no MAC address and is not an old receiver with a
     /// serial number.
@@ -1134,6 +1145,63 @@ mod resolve_tests {
         unique.dedup();
         assert_eq!(ips.len(), unique.len(), "{ips:?}");
         assert!(ips.iter().all(|ip| !ip.contains('[')), "{ips:?}");
+    }
+}
+
+#[cfg(test)]
+mod is_receiver_tests {
+    use super::*;
+    use denon_marantz::TypeProof;
+
+    /// A configuration with the serial number `SERIAL1` and the MAC address `0123456789AB`.
+    fn cfg() -> DeviceConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": "SERIAL1",
+            "mac": "0123456789AB",
+            "name": "AVR",
+            "address": "192.0.2.1",
+        }))
+        .expect("config")
+    }
+
+    fn found(serial: Option<&str>, mac: Option<&str>) -> DiscoveredReceiver {
+        DiscoveredReceiver {
+            host: "192.0.2.1".into(),
+            brand: Brand::Denon,
+            manufacturer: "Denon".into(),
+            model_name: None,
+            friendly_name: None,
+            serial_number: serial.map(str::to_owned),
+            mac_address: mac.map(str::to_owned),
+            type_proof: TypeProof::Read,
+        }
+    }
+
+    #[test]
+    fn the_mac_address_finds_the_receiver() {
+        assert!(is_receiver(
+            &cfg(),
+            &found(Some("OTHER"), Some("01:23:45:67:89:ab"))
+        ));
+    }
+
+    #[test]
+    fn the_serial_number_finds_the_receiver_without_a_mac_address() {
+        assert!(is_receiver(&cfg(), &found(Some("SERIAL1"), None)));
+    }
+
+    #[test]
+    fn another_receiver_is_not_the_receiver() {
+        assert!(!is_receiver(
+            &cfg(),
+            &found(Some("SERIAL1"), Some("0123456789AC"))
+        ));
+        assert!(!is_receiver(&cfg(), &found(Some("OTHER"), None)));
+    }
+
+    #[test]
+    fn a_receiver_without_ids_is_not_the_receiver() {
+        assert!(!is_receiver(&cfg(), &found(None, None)));
     }
 }
 

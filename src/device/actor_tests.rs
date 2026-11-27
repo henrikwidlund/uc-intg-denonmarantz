@@ -839,13 +839,11 @@ async fn a_stop_before_a_sequence_does_not_stop_it() {
     rig.telnet.send("PWON");
     let stop = Command::new(EntityKind::Remote, "stop_send".into(), None);
     rig.actor.send(stop).await.expect("send").expect("stop");
-    let params = serde_json::json!({ "sequence": ["cursor_up"], "repeat": 3 });
-    let run = Command::new(
-        EntityKind::Remote,
-        "send_cmd_sequence".into(),
-        params.as_object().cloned(),
-    );
-    rig.actor.send(run).await.expect("send").expect("run");
+    rig.actor
+        .send(cursor_up_sequence())
+        .await
+        .expect("send")
+        .expect("run");
     until("all steps", 5, || rig.telnet.count("MNCUP") == 3).await;
 }
 
@@ -2464,6 +2462,20 @@ fn media_command(cmd_id: &str) -> Command {
     Command::new(EntityKind::MediaPlayer, cmd_id.into(), None)
 }
 
+/// A remote sequence of 3 `cursor_up` steps. The receiver gets `MNCUP` for each step.
+fn cursor_up_sequence() -> Command {
+    let params = serde_json::Map::from_iter([
+        ("sequence".to_owned(), serde_json::json!(["cursor_up"])),
+        ("repeat".to_owned(), 3.into()),
+    ]);
+    Command::new(EntityKind::Remote, "send_cmd_sequence".into(), Some(params))
+}
+
+/// How often `MNCUP` was sent, by telnet and by HTTP.
+fn mncup_sent(rig: &Rig) -> usize {
+    rig.telnet.count("MNCUP") + rig.http.commands().iter().filter(|c| *c == "MNCUP").count()
+}
+
 /// A rig whose receiver values are stored, connected again with a start that reads slowly. Also
 /// gives how often it was connected before.
 async fn slow_start_rig() -> (Rig, usize) {
@@ -2523,13 +2535,11 @@ async fn a_command_that_waits_for_the_start_is_answered_before_its_deadline() {
 /// Returns how many steps the receiver got, counted 500 ms after the start ended.
 async fn sequence_during_the_start(stop: bool) -> usize {
     let (rig, connected) = slow_start_rig().await;
-    let params = serde_json::json!({ "sequence": ["cursor_up"], "repeat": 3 });
-    let run = Command::new(
-        EntityKind::Remote,
-        "send_cmd_sequence".into(),
-        params.as_object().cloned(),
-    );
-    rig.actor.send(run).await.expect("send").expect("run");
+    rig.actor
+        .send(cursor_up_sequence())
+        .await
+        .expect("send")
+        .expect("run");
     if stop {
         let stop = Command::new(EntityKind::Remote, "stop_send".into(), None);
         rig.actor.send(stop).await.expect("send").expect("stop");
@@ -2544,7 +2554,7 @@ async fn sequence_during_the_start(stop: bool) -> usize {
     })
     .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    rig.telnet.count("MNCUP") + rig.http.commands().iter().filter(|c| *c == "MNCUP").count()
+    mncup_sent(&rig)
 }
 
 #[actix::test]
@@ -2758,13 +2768,11 @@ async fn a_command_waits_longer_than_the_retry_time_for_the_first_connect() {
 async fn a_remote_run_waits_longer_than_the_retry_time_for_the_first_connect() {
     let rig = slow_first_connect_rig().await;
     let start = Instant::now();
-    let params = serde_json::json!({ "sequence": ["cursor_up"], "repeat": 3 });
-    let run = Command::new(
-        EntityKind::Remote,
-        "send_cmd_sequence".into(),
-        params.as_object().cloned(),
-    );
-    rig.actor.send(run).await.expect("send").expect("run");
+    rig.actor
+        .send(cursor_up_sequence())
+        .await
+        .expect("send")
+        .expect("run");
     until("connected", 15, || {
         status_count(&rig.events, DeviceStatus::Connected) >= 1
     })
@@ -2775,8 +2783,7 @@ async fn a_remote_run_waits_longer_than_the_retry_time_for_the_first_connect() {
         "{:?}",
         start.elapsed()
     );
-    let sent =
-        || rig.telnet.count("MNCUP") + rig.http.commands().iter().filter(|c| *c == "MNCUP").count();
+    let sent = || mncup_sent(&rig);
     until("the steps", 5, || sent() >= 3).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(3, sent());
@@ -2834,13 +2841,11 @@ async fn a_command_that_waits_for_a_connect_is_answered_at_once_after_a_setup_ch
 async fn a_sequence_that_waits_for_a_connect_is_not_sent_after_a_standby_and_a_wake_up() {
     // The start takes about 6 s.
     let (rig, _) = slow_start_rig_with(Duration::from_secs(5), Duration::from_secs(8)).await;
-    let params = serde_json::json!({ "sequence": ["cursor_up"], "repeat": 3 });
-    let run = Command::new(
-        EntityKind::Remote,
-        "send_cmd_sequence".into(),
-        params.as_object().cloned(),
-    );
-    rig.actor.send(run).await.expect("send").expect("run");
+    rig.actor
+        .send(cursor_up_sequence())
+        .await
+        .expect("send")
+        .expect("run");
     // The run waits for the connect.
     tokio::time::sleep(Duration::from_secs(1)).await;
     rig.http.set_read_delay(Duration::ZERO);
@@ -2852,8 +2857,7 @@ async fn a_sequence_that_waits_for_a_connect_is_not_sent_after_a_standby_and_a_w
     })
     .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let sent =
-        rig.telnet.count("MNCUP") + rig.http.commands().iter().filter(|c| *c == "MNCUP").count();
+    let sent = mncup_sent(&rig);
     assert_eq!(0, sent);
 }
 

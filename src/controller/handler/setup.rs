@@ -5,7 +5,7 @@
 //! Driver setup flow: discovery, options and reconfiguration.
 
 use crate::config_store::{
-    DEFAULT_SIGNAL_SECS, DeviceConfig, DriverSettings, Feature, MIN_SIGNAL_SECS, SaveWait,
+    DEFAULT_SIGNAL_SECS, DeviceConfig, DriverSettings, Feature, Ids, MIN_SIGNAL_SECS, SaveWait,
     backup_json, is_ip, parse_backup, same_ids,
 };
 use crate::controller::devices::{ConnectTrigger, sorted_configs};
@@ -80,6 +80,14 @@ pub struct Found {
 }
 
 impl Found {
+    /// The serial number and the MAC address.
+    fn ids(&self) -> Ids<'_> {
+        Ids {
+            serial: self.serial.as_deref(),
+            mac: self.mac.as_deref(),
+        }
+    }
+
     fn new(receiver: &denon_marantz::DiscoveredReceiver, detected: Detected) -> Self {
         Self {
             address: receiver.host.clone(),
@@ -366,18 +374,27 @@ impl Entered {
 
     /// The host name `host` with the first of its IP addresses where the receiver with `ids`
     /// answers, or a receiver that cannot be compared with it. If none answers within `limit`, the
-    /// first IP address. If the name cannot be resolved in that time, the name. `limit` includes
-    /// the resolve.
+    /// first IP address that did not answer as another receiver: its identify failed, or it had
+    /// no result within `limit`. If all IP addresses answer as other receivers, or the name cannot
+    /// be resolved in that time, the name. `limit` includes the resolve.
     async fn resolve(host: String, ids: ReceiverIds, limit: Duration) -> Self {
         let deadline = Instant::now() + limit;
         let mut ips = Vec::new();
+        // The first IP address that failed, and the number of IP addresses with a result.
+        let mut failed = None;
+        let mut tried = 0;
         let answered = tokio::time::timeout_at(deadline, async {
             ips = resolve_name(&host).await;
             for (i, ip) in ips.iter().enumerate() {
-                match discovery::identify(ip, None).await {
+                let result = discovery::identify(ip, None).await;
+                tried = i + 1;
+                match result {
                     Ok(avr) if ids.same(avr.info()) != Some(false) => return Some(i),
                     Ok(_) => debug!("[{host}] another receiver answers at {ip}"),
-                    Err(e) => debug!("[{host}] address {ip} failed: {e}"),
+                    Err(e) => {
+                        debug!("[{host}] address {ip} failed: {e}");
+                        failed.get_or_insert(i);
+                    }
                 }
             }
             None
@@ -387,10 +404,14 @@ impl Entered {
             info!("[{host}] no answer within {limit:?}");
             None
         });
-        let address = match answered {
-            Some(i) => ips.swap_remove(i),
-            None if !ips.is_empty() => ips.swap_remove(0),
-            None => host.clone(),
+        let untried = (tried < ips.len()).then_some(tried);
+        let address = if let Some(i) = answered.or(failed).or(untried) {
+            ips.swap_remove(i)
+        } else {
+            if !ips.is_empty() {
+                info!("[{host}] other receivers answer at all addresses");
+            }
+            host.clone()
         };
         Self {
             address,
@@ -413,14 +434,17 @@ impl ReceiverIds {
         }
     }
 
+    /// The serial number and the MAC address.
+    fn ids(&self) -> Ids<'_> {
+        Ids {
+            serial: self.serial.as_deref(),
+            mac: self.mac.as_deref(),
+        }
+    }
+
     /// Whether the receiver of `info` is this one. See [`same_ids`].
     fn same(&self, info: &denon_marantz::Info) -> Option<bool> {
-        same_ids(
-            self.serial.as_deref(),
-            self.mac.as_deref(),
-            info.serial_number.as_deref(),
-            info.mac_address.as_deref(),
-        )
+        same_ids(self.ids(), info.into())
     }
 }
 
@@ -840,12 +864,7 @@ impl Controller {
                     // A setup that replaces the receivers offers the configured ones too.
                     let found: Vec<Found> = found
                         .into_iter()
-                        .filter(|f| {
-                            act.setup_replace
-                                || act
-                                    .find_device(f.serial.as_deref(), f.mac.as_deref())
-                                    .is_none()
-                        })
+                        .filter(|f| act.setup_replace || act.find_device(f.ids()).is_none())
                         .collect();
                     if found.is_empty() {
                         info!("[{ws_id}] no new receiver found");
@@ -881,8 +900,7 @@ impl Controller {
                     };
                     // A receiver that is configured already is updated: it keeps its id, which
                     // can be the serial number of the Python integration.
-                    let old =
-                        act.find_device(identified.serial.as_deref(), identified.mac.as_deref());
+                    let old = act.find_device(identified.ids());
                     let mut cfg = DeviceConfig {
                         update_audyssey: false,
                         zone2: false,
@@ -3346,8 +3364,18 @@ mod tests {
         /// The receivers and the setup on this thread connect to the HTTP port `first` for
         /// [`FIRST_IP`], and to `rest` for all other addresses. The search finds nothing.
         fn ports_by_address(first: u16, rest: u16) {
+            ports_by_ip(&[(FIRST_IP, first)], rest);
+        }
+
+        /// Like [`ports_by_address`], with a port for each address in `ports` and `rest` for all
+        /// other addresses.
+        fn ports_by_ip(ports: &[(&'static str, u16)], rest: u16) {
+            let ports = ports.to_vec();
             let setup: crate::device::discovery::TestBuilder = std::rc::Rc::new(move |host, _| {
-                let port = if host == FIRST_IP { first } else { rest };
+                let port = ports
+                    .iter()
+                    .find(|(ip, _)| *ip == host)
+                    .map_or(rest, |(_, port)| *port);
                 crate::test_support::test_builder(port, 1, denon_marantz::Avr::builder(FAKE_HOST))
             });
             crate::device::discovery::TEST_BUILDER.with(|slot| *slot.borrow_mut() = Some(setup));
@@ -3426,6 +3454,90 @@ mod tests {
             let device = choose_at(&controller, &events, name, SECOND_IP).await;
             assert_eq!(json!(SECOND_IP), device["address"]);
             assert_eq!(json!(HOST_NAME), device["host"]);
+        }
+
+        /// The ids of a receiver that is not the one of `Fake`.
+        fn ids_of_another_receiver() -> ReceiverIds {
+            ReceiverIds {
+                serial: None,
+                mac: Some("0123456789AC".into()),
+            }
+        }
+
+        #[actix::test]
+        async fn a_host_name_skips_an_address_where_another_receiver_answers() {
+            let other = crate::test_support::Fake::start(true).await;
+            // Another receiver answers at the first address, and nothing at the second one.
+            ports_by_address(other.port(), 1);
+            resolve_to(&[FIRST_IP, SECOND_IP]);
+            let limit = Duration::from_secs(5);
+            let entered =
+                Entered::resolve(HOST_NAME.into(), ids_of_another_receiver(), limit).await;
+            assert_eq!(
+                Entered {
+                    address: SECOND_IP.into(),
+                    host: Some(HOST_NAME.into()),
+                },
+                entered
+            );
+        }
+
+        #[actix::test]
+        async fn a_host_name_takes_the_address_without_a_result_at_the_time_limit() {
+            let other = crate::test_support::Fake::start(true).await;
+            let (port, task) = silent_port().await;
+            // Another receiver answers at the first address. The second one has no answer
+            // within the limit, which is below the request time of the tests (500 ms).
+            ports_by_address(other.port(), port);
+            resolve_to(&[FIRST_IP, SECOND_IP]);
+            let limit = Duration::from_millis(300);
+            let entered =
+                Entered::resolve(HOST_NAME.into(), ids_of_another_receiver(), limit).await;
+            assert_eq!(
+                Entered {
+                    address: SECOND_IP.into(),
+                    host: Some(HOST_NAME.into()),
+                },
+                entered
+            );
+            task.abort();
+        }
+
+        #[actix::test]
+        async fn a_host_name_takes_a_failed_address_before_one_without_a_result() {
+            let other = crate::test_support::Fake::start(true).await;
+            let (port, task) = silent_port().await;
+            // Another receiver, a refused port, and no answer within the limit.
+            ports_by_ip(&[(FIRST_IP, other.port()), (SECOND_IP, 1)], port);
+            resolve_to(&[FIRST_IP, SECOND_IP, "192.0.2.3"]);
+            let limit = Duration::from_millis(300);
+            let entered =
+                Entered::resolve(HOST_NAME.into(), ids_of_another_receiver(), limit).await;
+            assert_eq!(
+                Entered {
+                    address: SECOND_IP.into(),
+                    host: Some(HOST_NAME.into()),
+                },
+                entered
+            );
+            task.abort();
+        }
+
+        #[actix::test]
+        async fn a_host_name_is_kept_as_the_address_if_other_receivers_answer_at_all_addresses() {
+            let other = crate::test_support::Fake::start(true).await;
+            ports_by_address(other.port(), other.port());
+            resolve_to(&[FIRST_IP, SECOND_IP]);
+            let limit = Duration::from_secs(5);
+            let entered =
+                Entered::resolve(HOST_NAME.into(), ids_of_another_receiver(), limit).await;
+            assert_eq!(
+                Entered {
+                    address: HOST_NAME.into(),
+                    host: Some(HOST_NAME.into()),
+                },
+                entered
+            );
         }
 
         /// A port of the loopback address that takes connections and never answers. Abort the

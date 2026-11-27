@@ -131,30 +131,78 @@ fn avoid_names(text: &str) -> Vec<String> {
 /// Arguments of `cargo` that build the driver in the repository folder.
 const BUILD_ARGS: [&str; 3] = ["build", "--release", "--locked"];
 
-/// Build the driver with [`BUILD_ARGS`]. The output of cargo goes to the terminal.
-async fn build_driver() -> Result<(), String> {
+/// Argument of `cargo` that writes the build messages as JSON lines to stdout. The diagnostics and
+/// the progress go to stderr as text.
+const MESSAGE_ARG: &str = "--message-format=json-render-diagnostics";
+
+/// Name of the driver binary.
+const BIN_NAME: &str = "uc-intg-denonmarantz";
+
+/// Build the driver with [`BUILD_ARGS`] and return the path of the binary that cargo gives. It is
+/// in the target folder of cargo, for example from `CARGO_TARGET_DIR`. The diagnostics and the
+/// progress of cargo go to the terminal.
+async fn build_driver() -> Result<PathBuf, String> {
     let manifest = repo_root().join("Cargo.toml");
     println!(
         "Building the driver: cargo {} --manifest-path {}",
         BUILD_ARGS.join(" "),
         manifest.display()
     );
-    let status = tokio::process::Command::new("cargo")
-        .args(BUILD_ARGS)
-        .arg("--manifest-path")
-        .arg(&manifest)
-        .current_dir(repo_root())
-        .stdin(std::process::Stdio::null())
-        .status()
+    let build = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
+        use std::io::BufRead;
+        let mut child = std::process::Command::new("cargo")
+            .args(BUILD_ARGS)
+            .arg(MESSAGE_ARG)
+            .arg("--manifest-path")
+            .arg(&manifest)
+            .current_dir(repo_root())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        let mut bin = None;
+        if let Some(stdout) = child.stdout.take() {
+            // Cargo writes UTF-8 JSON. Reading stops at a line that is not UTF-8 or at a read error.
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                if let Some(path) = artifact_executable(&line) {
+                    bin = Some(path);
+                }
+            }
+        }
+        Ok((child.wait()?, bin))
+    });
+    let (status, bin) = build
         .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r.map_err(|e| e.to_string()))
         .map_err(|e| format!("cannot run cargo to build the driver: {e}. Use --no-build to start the driver as it is"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
+    if !status.success() {
+        return Err(format!(
             "the driver build failed ({status}). Fix the build, or use --no-build to start the driver as it is"
-        ))
+        ));
     }
+    bin.ok_or_else(|| {
+        format!("cargo did not name the {BIN_NAME} binary. Use --driver <path> to start it")
+    })
+}
+
+/// The path of the driver binary in a JSON message of cargo. `None` for other messages.
+fn artifact_executable(line: &str) -> Option<PathBuf> {
+    // Most messages have no binary: they are not parsed.
+    if !line.contains("\"executable\":\"") {
+        return None;
+    }
+    let message: serde_json::Value = serde_json::from_str(line).ok()?;
+    let is_bin = message["reason"] == "compiler-artifact"
+        && message["target"]["name"] == BIN_NAME
+        && message["target"]["kind"]
+            .as_array()
+            .is_some_and(|kinds| kinds.iter().any(|k| k == "bin"));
+    is_bin
+        .then(|| message["executable"].as_str().map(PathBuf::from))
+        .flatten()
 }
 
 /// A failed or skipped check.
@@ -489,17 +537,20 @@ async fn main() {
         println!("{note}");
     }
     // Before the receiver is contacted: a failed build stops the run.
-    if !opt.no_build
-        && let Err(e) = build_driver().await
-    {
-        eprintln!("{e}");
-        if restore::FILE.exists() {
-            eprintln!(
-                "The settings of the last run are not set back. They are in {}",
-                restore::FILE.display()
-            );
+    if !opt.no_build {
+        match build_driver().await {
+            Ok(bin) => opt.bin = bin,
+            Err(e) => {
+                eprintln!("{e}");
+                if restore::FILE.exists() {
+                    eprintln!(
+                        "The settings of the last run are not set back. They are in {}",
+                        restore::FILE.display()
+                    );
+                }
+                std::process::exit(2);
+            }
         }
-        std::process::exit(2);
     }
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -827,6 +878,26 @@ pub mod tests {
                 .no_build
         );
         assert_eq!(["build", "--release", "--locked"], BUILD_ARGS);
+    }
+
+    #[test]
+    fn the_driver_binary_is_taken_from_the_cargo_messages() {
+        let bin = r#"{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"uc-intg-denonmarantz"},"executable":"/t/release/uc-intg-denonmarantz","fresh":true}"#;
+        assert_eq!(
+            Some(PathBuf::from("/t/release/uc-intg-denonmarantz")),
+            artifact_executable(bin)
+        );
+        let other = r#"{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"other"},"executable":"/t/release/other"}"#;
+        assert_eq!(None, artifact_executable(other));
+        let lib = r#"{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"uc-intg-denonmarantz"},"executable":null}"#;
+        assert_eq!(None, artifact_executable(lib));
+        let test = r#"{"reason":"compiler-artifact","target":{"kind":["test"],"name":"uc-intg-denonmarantz"},"executable":"/t/release/deps/uc_intg_denonmarantz-1"}"#;
+        assert_eq!(None, artifact_executable(test));
+        assert_eq!(
+            None,
+            artifact_executable(r#"{"reason":"build-finished","success":true}"#)
+        );
+        assert_eq!(None, artifact_executable("not json \"executable\":\""));
     }
 
     #[test]

@@ -331,9 +331,18 @@ impl DeviceConfig {
         }
     }
 
-    /// Whether a receiver with this serial number and MAC address is this one. See [`same_ids`].
-    pub fn same_receiver(&self, serial: Option<&str>, mac: Option<&str>) -> Option<bool> {
-        same_ids(self.serial(), self.mac(), serial, mac)
+    /// The serial number and the MAC address, with the id as one of them. See [`Self::serial`]
+    /// and [`Self::mac`].
+    pub fn ids(&self) -> Ids<'_> {
+        Ids {
+            serial: self.serial(),
+            mac: self.mac(),
+        }
+    }
+
+    /// Whether the receiver with `other` is this one. See [`same_ids`].
+    pub fn same_receiver(&self, other: Ids<'_>) -> Option<bool> {
+        same_ids(self.ids(), other)
     }
 
     /// The address for the user: the host name if there is one, else `address`.
@@ -357,13 +366,13 @@ impl DeviceConfig {
 
     /// Store the serial number and the MAC address if they are not stored yet. Returns true if one
     /// was added.
-    pub fn add_ids(&mut self, serial: Option<&str>, mac: Option<&str>) -> bool {
+    pub fn add_ids(&mut self, ids: Ids<'_>) -> bool {
         let before = (self.serial.is_some(), self.mac.is_some());
         if self.serial.is_none() {
-            self.serial = serial.filter(|s| !s.is_empty()).map(str::to_owned);
+            self.serial = ids.serial.filter(|s| !s.is_empty()).map(str::to_owned);
         }
         if self.mac.is_none() {
-            self.mac = mac.and_then(mac_text);
+            self.mac = ids.mac.and_then(mac_text);
         }
         before != (self.serial.is_some(), self.mac.is_some())
     }
@@ -512,7 +521,10 @@ impl DeviceConfig {
         }
         let kind = found.kind();
         let new_kind = kind != self.kind();
-        let new_ids = self.add_ids(found.serial.as_deref(), found.mac.as_deref());
+        let new_ids = self.add_ids(Ids {
+            serial: found.serial.as_deref(),
+            mac: found.mac.as_deref(),
+        });
         let new_info = found.info.is_some() && self.info != found.info;
         let new_missing = self.missing != found.missing;
         if self.address == found.address
@@ -674,19 +686,38 @@ fn lowercase(text: &str) -> impl Iterator<Item = char> + '_ {
     text.chars().flat_map(char::to_lowercase)
 }
 
-/// Whether two receivers are the same: `a` with its serial number and MAC address, and `b` with
-/// its own. The MAC addresses are compared if both are known, else the serial numbers. `None` if
-/// neither can be compared.
-pub fn same_ids(
-    a_serial: Option<&str>,
-    a_mac: Option<&str>,
-    b_serial: Option<&str>,
-    b_mac: Option<&str>,
-) -> Option<bool> {
-    if let (Some(a), Some(b)) = (a_mac.and_then(parse_mac), b_mac.and_then(parse_mac)) {
+/// The serial number and the MAC address of a receiver.
+#[derive(Debug, Clone, Copy)]
+pub struct Ids<'a> {
+    pub serial: Option<&'a str>,
+    pub mac: Option<&'a str>,
+}
+
+impl<'a> From<&'a denon_marantz::Info> for Ids<'a> {
+    fn from(info: &'a denon_marantz::Info) -> Self {
+        Self {
+            serial: info.serial_number.as_deref(),
+            mac: info.mac_address.as_deref(),
+        }
+    }
+}
+
+impl<'a> From<&'a denon_marantz::DiscoveredReceiver> for Ids<'a> {
+    fn from(r: &'a denon_marantz::DiscoveredReceiver) -> Self {
+        Self {
+            serial: r.serial_number.as_deref(),
+            mac: r.mac_address.as_deref(),
+        }
+    }
+}
+
+/// Whether two receivers are the same. The MAC addresses are compared if both are valid, else the
+/// serial numbers. `None` if neither can be compared.
+pub fn same_ids(a: Ids<'_>, b: Ids<'_>) -> Option<bool> {
+    if let (Some(a), Some(b)) = (a.mac.and_then(parse_mac), b.mac.and_then(parse_mac)) {
         return Some(a == b);
     }
-    if let (Some(a), Some(b)) = (a_serial, b_serial) {
+    if let (Some(a), Some(b)) = (a.serial, b.serial) {
         return Some(a == b);
     }
     None
@@ -1182,24 +1213,66 @@ mod tests {
     fn the_same_receiver_is_found_by_the_mac_address_first() {
         let mut d = device();
         // The id is the serial number, no MAC address is stored.
-        assert_eq!(Some(true), d.same_receiver(Some("SERIAL-1"), None));
+        assert_eq!(
+            Some(true),
+            d.same_receiver(Ids {
+                serial: Some("SERIAL-1"),
+                mac: None
+            })
+        );
         assert_eq!(
             Some(false),
-            d.same_receiver(Some("OTHER"), Some("0123456789AB"))
+            d.same_receiver(Ids {
+                serial: Some("OTHER"),
+                mac: Some("0123456789AB")
+            })
         );
-        assert_eq!(None, d.same_receiver(None, Some("0123456789AB")));
+        assert_eq!(
+            None,
+            d.same_receiver(Ids {
+                serial: None,
+                mac: Some("0123456789AB")
+            })
+        );
 
-        assert!(d.add_ids(Some("SERIAL-1"), Some("0123456789ab")));
-        assert!(!d.add_ids(Some("OTHER"), Some("AABBCCDDEEFF")));
+        assert!(d.add_ids(Ids {
+            serial: Some("SERIAL-1"),
+            mac: Some("0123456789ab")
+        }));
+        assert!(!d.add_ids(Ids {
+            serial: Some("OTHER"),
+            mac: Some("AABBCCDDEEFF")
+        }));
         assert_eq!(Some("0123456789AB"), d.mac());
         // Both MAC addresses are known: the serial number is not compared.
-        assert_eq!(Some(true), d.same_receiver(None, Some("0123456789ab")));
+        assert_eq!(
+            Some(true),
+            d.same_receiver(Ids {
+                serial: None,
+                mac: Some("0123456789ab")
+            })
+        );
         assert_eq!(
             Some(false),
-            d.same_receiver(Some("SERIAL-1"), Some("AABBCCDDEEFF"))
+            d.same_receiver(Ids {
+                serial: Some("SERIAL-1"),
+                mac: Some("AABBCCDDEEFF")
+            })
         );
-        assert_eq!(Some(true), d.same_receiver(Some("SERIAL-1"), None));
-        assert_eq!(None, d.same_receiver(None, None));
+        assert_eq!(
+            Some(true),
+            d.same_receiver(Ids {
+                serial: Some("SERIAL-1"),
+                mac: None
+            })
+        );
+        assert_eq!(
+            None,
+            d.same_receiver(Ids {
+                serial: None,
+                mac: None
+            })
+        );
     }
 
     #[test]
@@ -1694,17 +1767,23 @@ mod tests {
 
     #[test]
     fn the_same_receiver_is_found_by_the_ids() {
+        const fn ids<'a>(serial: Option<&'a str>, mac: Option<&'a str>) -> Ids<'a> {
+            Ids { serial, mac }
+        }
         let mac = Some("01:23:45:67:89:AB");
         assert_eq!(
             Some(true),
-            same_ids(Some("A"), mac, Some("B"), Some("0123456789ab"))
+            same_ids(ids(Some("A"), mac), ids(Some("B"), Some("0123456789ab")))
         );
         assert_eq!(
             Some(false),
-            same_ids(Some("A"), mac, Some("A"), Some("0123456789AC"))
+            same_ids(ids(Some("A"), mac), ids(Some("A"), Some("0123456789AC")))
         );
-        assert_eq!(Some(true), same_ids(Some("A"), mac, Some("A"), None));
-        assert_eq!(None, same_ids(None, mac, Some("A"), None));
+        assert_eq!(
+            Some(true),
+            same_ids(ids(Some("A"), mac), ids(Some("A"), None))
+        );
+        assert_eq!(None, same_ids(ids(None, mac), ids(Some("A"), None)));
     }
 
     #[test]

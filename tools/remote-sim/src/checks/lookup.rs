@@ -4,8 +4,8 @@
 //! How the driver finds the receiver when the stored address does not answer.
 
 use super::{
-    UNUSED_ADDRESS, config_back, config_device, connect_ms, first_error, log_after, log_size,
-    read_config, restart, wait_available,
+    UNUSED_ADDRESS, config_back, config_device, connect_ms, first_error, log_after, read_config,
+    restart, wait_available,
 };
 use crate::{Check, Ctx, Fail};
 use serde_json::{Value, json};
@@ -123,7 +123,7 @@ async fn command_during_connect(ctx: &mut Ctx, from: u64, option: Option<&str>) 
 async fn start(ctx: &mut Ctx, config: Value) -> Result<u64, Fail> {
     ctx.driver.stop().await;
     tokio::fs::write(ctx.driver.config_file(), config.to_string()).await?;
-    let from = log_size(ctx).await;
+    let from = ctx.driver.log_size().await;
     restart(ctx).await?;
     ctx.client.refresh_states().await?;
     Ok(from)

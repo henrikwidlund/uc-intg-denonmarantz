@@ -480,7 +480,7 @@ pub async fn forget() {
 /// back.
 pub async fn after_early_stop(opt: &Options) -> Option<String> {
     let text = tokio::fs::read_to_string(&*FILE).await.ok()?;
-    let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    let lines = load(&text);
     let result = async {
         let oracle = Oracle::connect(&opt.address).await?;
         if let Some(why) = source_refused(&oracle, opt, &lines).await {
@@ -530,6 +530,22 @@ pub async fn after_early_stop(opt: &Options) -> Option<String> {
             FILE.display()
         ),
     })
+}
+
+/// The lines of the text of [`FILE`]. Like [`read`], spaces at the end of a source line, marked
+/// or not, are removed. A source line with a blank code is kept: [`source_refused`] then finds no
+/// single saved source.
+fn load(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|line| {
+            if line.strip_prefix('#').unwrap_or(line).starts_with(SOURCE) {
+                line.trim_end()
+            } else {
+                line
+            }
+            .to_owned()
+        })
+        .collect()
 }
 
 /// Why the saved source is not the source now and cannot be set back. `None` if the lines have no
@@ -632,6 +648,15 @@ mod tests {
         assert!(!is_saved("SI"));
         assert!(!is_saved("SI  "));
         assert!(is_saved("SITV"));
+    }
+
+    #[test]
+    fn source_lines_of_the_file_are_trimmed_on_load() {
+        assert_eq!(
+            vec!["SITV", "#SIBD", "SI", "MSSTEREO ", "PSDEL 000"],
+            load("SITV  \n#SIBD \nSI \nMSSTEREO \nPSDEL 000\n")
+        );
+        assert!(load("").is_empty());
     }
 
     #[test]

@@ -1038,9 +1038,7 @@ impl DenonActor {
                 self.cfg.name
             );
         }
-        let new_ids = self
-            .cfg
-            .add_ids(info.serial_number.as_deref(), info.mac_address.as_deref());
+        let new_ids = self.cfg.add_ids(info.into());
         // Values with a type that is not proven are not stored: the next connect would keep them.
         let new_info = info.type_proof.is_proven() && self.cfg.info.as_ref() != Some(info);
         if new_info {
@@ -1732,7 +1730,7 @@ pub(super) fn read_differently(old: &Info, new: &Info) -> bool {
 /// An error if the receiver is not the one of the configuration. A receiver that gives neither id
 /// is used.
 fn other_receiver(cfg: &DeviceConfig, info: &Info) -> Option<AvrError> {
-    let same = cfg.same_receiver(info.serial_number.as_deref(), info.mac_address.as_deref());
+    let same = cfg.same_receiver(info.into());
     (same == Some(false)).then(|| {
         AvrError::InvalidRequest(format!(
             "another receiver answers at {}: serial {:?}, MAC {:?}",

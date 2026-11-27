@@ -121,6 +121,28 @@ impl Driver {
     /// The driver log after byte `start`. Empty if it cannot be read. Bytes that are not UTF-8,
     /// for example a character cut at `start` or at the end of a write, become U+FFFD.
     pub async fn log_from(&self, start: u64) -> String {
+        self.read_from(start).await.map_or_else(String::new, lossy)
+    }
+
+    /// The whole lines of the driver log after byte `start`, and the byte offset after the last
+    /// of them. A line that is still being written is left out. Empty, with `start`, if the log
+    /// cannot be read.
+    pub async fn log_lines(&self, start: u64) -> (String, u64) {
+        let Some(mut bytes) = self.read_from(start).await else {
+            return (String::new(), start);
+        };
+        let len = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        bytes.truncate(len);
+        (lossy(bytes), start + len as u64)
+    }
+
+    /// Size of the driver log in bytes. 0 if it cannot be read.
+    pub async fn log_size(&self) -> u64 {
+        tokio::fs::metadata(&self.log).await.map_or(0, |m| m.len())
+    }
+
+    /// The bytes of the driver log after byte `start`. `None` if it cannot be read.
+    async fn read_from(&self, start: u64) -> Option<Vec<u8>> {
         let path = self.log.clone();
         let read = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
             let mut file = std::fs::File::open(path)?;
@@ -132,10 +154,7 @@ impl Driver {
             file.read_to_end(&mut bytes)?;
             Ok(bytes)
         });
-        match read.await {
-            Ok(Ok(bytes)) => lossy(bytes),
-            _ => String::new(),
-        }
+        read.await.ok()?.ok()
     }
 }
 
@@ -189,11 +208,26 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let driver = Driver::new(Path::new("none"), &dir, 0);
         assert_eq!("", driver.log_text().await, "no file");
+        assert_eq!(0, driver.log_size().await, "no file");
         tokio::fs::write(&driver.log, "ab\u{e4}cd").await.unwrap();
         assert_eq!("ab\u{e4}cd", driver.log_text().await);
         assert_eq!("cd", driver.log_from(4).await);
         assert_eq!("\u{fffd}cd", driver.log_from(3).await, "cut character");
         assert_eq!("", driver.log_from(100).await, "after the end");
+        assert_eq!(6, driver.log_size().await);
+        tokio::fs::write(&driver.log, "ab\ncd\nef").await.unwrap();
+        assert_eq!(("ab\ncd\n".to_owned(), 6), driver.log_lines(0).await);
+        assert_eq!(("cd\n".to_owned(), 6), driver.log_lines(3).await);
+        assert_eq!(
+            (String::new(), 6),
+            driver.log_lines(6).await,
+            "no whole line"
+        );
+        assert_eq!(
+            (String::new(), 100),
+            driver.log_lines(100).await,
+            "after the end"
+        );
         tokio::fs::remove_dir_all(&dir).await.unwrap();
     }
 

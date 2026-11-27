@@ -3,7 +3,7 @@
 
 //! Receivers of the controller: entity states, subscriptions and commands.
 
-use crate::config_store::DeviceConfig;
+use crate::config_store::{DeviceConfig, Ids};
 use crate::controller::{Controller, R2RequestMsg, SendWsMessage};
 use crate::device::{
     Command, Connect, DenonActor, DeviceEvent, DeviceStatus, Disconnect, Stop, UpdateConfig,
@@ -142,16 +142,12 @@ impl Controller {
         );
     }
 
-    /// The configured receiver with this serial number or MAC address.
-    pub(super) fn find_device(
-        &self,
-        serial: Option<&str>,
-        mac: Option<&str>,
-    ) -> Option<&DeviceConfig> {
+    /// The configured receiver with `ids`. See [`same_ids`](crate::config_store::same_ids).
+    pub(super) fn find_device(&self, ids: Ids<'_>) -> Option<&DeviceConfig> {
         self.devices
             .values()
             .map(|d| &d.cfg)
-            .find(|cfg| cfg.same_receiver(serial, mac) == Some(true))
+            .find(|cfg| cfg.same_receiver(ids) == Some(true))
     }
 
     /// True if the key belongs to the running actor of the device.
