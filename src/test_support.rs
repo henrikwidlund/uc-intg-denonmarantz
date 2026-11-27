@@ -58,8 +58,8 @@ const UPDATE_NAMES: [&str; 13] = [
 
 /// The answer to an `AppCommand` request: the items for the queries that the request has, in the
 /// order of the request.
-fn answer_for(request: &[u8], power_on: bool) -> Vec<u8> {
-    let whole = String::from_utf8(update_answer(power_on)).expect("text");
+fn answer_for(request: &[u8], power_on: bool, main_source: &str) -> Vec<u8> {
+    let whole = String::from_utf8(update_answer(power_on, main_source)).expect("text");
     let request = String::from_utf8_lossy(request);
     let mut asked: Vec<(usize, usize)> = UPDATE_NAMES
         .iter()
@@ -80,8 +80,8 @@ fn answer_for(request: &[u8], power_on: bool) -> Vec<u8> {
     out.into_bytes()
 }
 
-/// The answer to the update request: the main zone is on.
-fn update_answer(power_on: bool) -> Vec<u8> {
+/// The answer to the update request: the main zone is on if `power_on`.
+fn update_answer(power_on: bool, main_source: &str) -> Vec<u8> {
     let power = if power_on { "ON" } else { "OFF" };
     format!(
         "<rx>\
@@ -90,7 +90,7 @@ fn update_answer(power_on: bool) -> Vec<u8> {
             <listvalue><zone>Zone2</zone><value>0</value></listvalue></list></cmd>\
         <cmd><value>2</value></cmd>\
         <cmd><mode>1</mode></cmd>\
-        <cmd><zone1><source>MPLAY</source></zone1><zone2><source>CD</source></zone2></cmd>\
+        <cmd><zone1><source>{main_source}</source></zone1><zone2><source>CD</source></zone2></cmd>\
         <cmd><zone1><volume>-36.5</volume><limit>-10</limit></zone1>\
             <zone2><volume>--</volume><limit>OFF</limit></zone2></cmd>\
         <cmd><zone1>off</zone1><zone2>ON</zone2></cmd>\
@@ -210,6 +210,7 @@ impl Fake {
             description_reads: AtomicUsize::new(0),
             read_delay_ms: AtomicU64::new(0),
             audyssey_answers: AtomicUsize::new(0),
+            main_source: Mutex::new("MPLAY"),
         });
         let (port, listeners) = bind_loopback(0, "bind the fake receiver").await;
         let commands = Arc::new(Mutex::new(Vec::new()));
@@ -272,6 +273,12 @@ impl Fake {
     pub fn set_read_delay(&self, delay: Duration) {
         let ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
         self.pages.read_delay_ms.store(ms, Ordering::SeqCst);
+    }
+
+    /// The receiver answers reads of the state with this main-zone source. It is `MPLAY` at the
+    /// start.
+    pub fn set_main_source(&self, source: &'static str) {
+        *self.pages.main_source.lock().expect("lock") = source;
     }
 
     /// How often the receiver was asked for its description: once for each connect that looks the
@@ -338,6 +345,8 @@ struct Pages {
     read_delay_ms: AtomicU64,
     /// How often an `AppCommand0300` request was answered.
     audyssey_answers: AtomicUsize,
+    /// The main-zone source in the answer to a read of the state.
+    main_source: Mutex<&'static str>,
 }
 
 async fn serve(
@@ -387,7 +396,8 @@ async fn serve(
                 if delay > 0 {
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                 }
-                Some(answer_for(&body, power_on))
+                let source = *pages.main_source.lock().expect("lock");
+                Some(answer_for(&body, power_on, source))
             }
             // Every receiver that is read with `AppCommand` is asked. A receiver with Dirac Live
             // answers the Audyssey values blank.

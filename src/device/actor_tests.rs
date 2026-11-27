@@ -384,6 +384,17 @@ async fn names_are_asked_only_while_they_are_used_and_then_stored() {
         })
     };
     assert!(!options_of(before));
+    // Zone 2 power does not build the options again.
+    let before = rig.events.lock().expect("lock").len();
+    for line in ["Z2ON", "Z2OFF", "SLP020"] {
+        rig.telnet.send(line);
+    }
+    let sleep = EntityKind::Sensor(SensorKind::SleepTimer);
+    until("the sleep timer", 5, || {
+        entity_state(&rig.events, sleep, "value") == Some(20.into())
+    })
+    .await;
+    assert!(!options_of(before));
     // The options are empty while the receiver is off, and come back when it turns on.
     rig.telnet.send("ZMOFF");
     until("no options", 5, || {
@@ -419,7 +430,6 @@ async fn names_are_asked_only_while_they_are_used_and_then_stored() {
     .await;
     let before = rig.events.lock().expect("lock").len();
     rig.telnet.send("SLP010");
-    let sleep = EntityKind::Sensor(SensorKind::SleepTimer);
     until("the sleep timer", 5, || {
         entity_state(&rig.events, sleep, "value") == Some(10.into())
     })
@@ -430,6 +440,50 @@ async fn names_are_asked_only_while_they_are_used_and_then_stored() {
             if changes.iter().any(|(k, attrs)| *k == favorite && attrs.contains_key("options")))
     });
     assert!(!built);
+}
+
+/// Wait until the start is done. The receiver must have no sound mode list and its main zone must
+/// stay on: the select shows no options while the start runs and the groups when it is done.
+async fn until_synced(events: &Mutex<Vec<DeviceEvent>>) {
+    let select = EntityKind::Select(SelectKind::SoundMode);
+    until("the end of the start", 10, || {
+        let events = events.lock().expect("lock");
+        let mut empty = false;
+        events
+            .iter()
+            .filter_map(|event| match event {
+                DeviceEvent::Changes { changes, .. } => changes
+                    .iter()
+                    .find(|(kind, _)| *kind == select)
+                    .and_then(|(_, attrs)| attrs.get("options")),
+                _ => None,
+            })
+            .any(|options| {
+                let groups = options
+                    .as_array()
+                    .is_some_and(|o| o.iter().any(|v| v == "MOVIE"));
+                empty |= !groups;
+                empty && groups
+            })
+    })
+    .await;
+}
+
+#[actix::test]
+async fn a_new_source_name_that_plays_the_tuner_asks_the_names() {
+    // The main source comes only from HTTP, as a name that the user gave.
+    let http = older_receiver().await;
+    http.set_main_source("Radio");
+    let rig = rig_on(http, |_| cfg(), answers_all, QUICK).await;
+    until_synced(&rig.events).await;
+    assert_eq!(0, rig.telnet.count("OPTPN ?"));
+
+    // The tuner gets that name, so the main source plays the tuner.
+    rig.telnet.send("SSFUNTUNER Radio");
+    rig.telnet.send("SSFUN END");
+    until("the tuner presets", 5, || rig.telnet.count("OPTPN ?") >= 1).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(1, rig.telnet.count("OPTPN ?"));
 }
 
 #[actix::test]
@@ -652,6 +706,17 @@ async fn a_pause_shows_paused_until_the_source_changes() {
         media_state(&rig.events) == Some("PAUSED".into())
     })
     .await;
+    // Zone 2 does not end the pause of the main zone. The sleep timer shows that the lines
+    // before it were handled.
+    for line in ["Z2ON", "Z2TUNER", "Z2OFF", "SLP010"] {
+        rig.telnet.send(line);
+    }
+    let sleep = EntityKind::Sensor(SensorKind::SleepTimer);
+    until("the sleep timer", 5, || {
+        entity_state(&rig.events, sleep, "value") == Some(10.into())
+    })
+    .await;
+    assert_eq!(Some("PAUSED".into()), media_state(&rig.events));
     rig.telnet.send("SIDVD");
     until("not paused", 5, || {
         media_state(&rig.events).is_some_and(|s| s != "PAUSED")

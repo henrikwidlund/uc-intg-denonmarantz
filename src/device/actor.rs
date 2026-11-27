@@ -574,14 +574,14 @@ impl DenonActor {
     }
 
     /// Send the entities of a changed setting soon.
-    fn schedule_emit_for(&mut self, setting: Setting, ctx: &mut Context<Self>) {
-        match setting_parts(setting) {
+    fn schedule_emit_for(&mut self, change: Change, ctx: &mut Context<Self>) {
+        match setting_parts(change.setting) {
             Some(part) => self.dirty_part |= part,
             None => self.dirty_full = true,
         }
-        // The selects with many options have no options while the receiver is off. New names
+        // The selects with many options have no options while the main zone is off. New names
         // come with `save_names`.
-        if setting == Setting::Power {
+        if change.setting == Setting::Power && is_main(change.zone) {
             self.dirty_labels = true;
         }
         self.arm_emit(ctx);
@@ -1351,16 +1351,16 @@ impl DenonActor {
         }));
     }
 
-    /// A new source, a change of the source list, a power change, or a title that plays again ends
-    /// the pause.
-    fn clear_pause(&mut self, setting: Setting) {
+    /// A new main-zone source, a change of the source list, a main-zone power change, or a title
+    /// that plays again ends the pause.
+    fn clear_pause(&mut self, change: Change) {
         if !self.paused {
             return;
         }
         let playing = self.avr.as_ref().is_some_and(|avr| {
             avr.state().borrow().device().now_playing.is_playing() == Some(true)
         });
-        if ends_pause(setting, playing) {
+        if ends_pause(change.setting, change.zone, playing) {
             self.paused = false;
         }
     }
@@ -1856,7 +1856,8 @@ const fn part_bit(kind: EntityKind) -> u8 {
     }
 }
 
-/// The selects with many options: their options change only with the power or new stored names.
+/// The selects with many options: their options change only with the main-zone power or new
+/// stored names.
 const fn has_many_options(kind: EntityKind) -> bool {
     matches!(
         kind,
@@ -1884,11 +1885,17 @@ fn build_changes(
         .collect()
 }
 
-/// A new source, a change of the source list or a power change ends a pause. So does a title that
-/// plays again. A new source name can change what the source plays.
-const fn ends_pause(setting: Setting, playing: bool) -> bool {
+/// Whether a change is of the main zone or of the whole receiver.
+const fn is_main(zone: Option<denon_marantz::Zone>) -> bool {
+    matches!(zone, None | Some(denon_marantz::Zone::Main))
+}
+
+/// A new main-zone source, a change of the source list or a main-zone power change ends a pause.
+/// So does a title that plays again. A new source name can change what the source plays.
+const fn ends_pause(setting: Setting, zone: Option<denon_marantz::Zone>, playing: bool) -> bool {
     match setting {
-        Setting::Source | Setting::Sources | Setting::Power => true,
+        Setting::Source | Setting::Power => is_main(zone),
+        Setting::Sources => true,
         Setting::NowPlaying => playing,
         _ => false,
     }
@@ -1941,14 +1948,14 @@ const RELOAD_QUERIES: [(u8, &[Query]); 5] = [
 ];
 
 /// A setting whose change makes the receiver change other values without sending them. Returns
-/// the reasons to read values again.
-const fn reload_after(setting: Setting) -> Option<u8> {
+/// the reasons to read values again. Only a main-zone source changes the digital codec.
+const fn reload_after(setting: Setting, zone: Option<denon_marantz::Zone>) -> Option<u8> {
     match setting {
         Setting::SpeakerPreset => Some(RELOAD_PRESET),
         Setting::DiracFilter => Some(RELOAD_FILTER),
         Setting::DynamicEq => Some(RELOAD_DYNAMIC_EQ),
         Setting::MultiEq => Some(RELOAD_MULTI_EQ),
-        Setting::Source => Some(RELOAD_SOURCE),
+        Setting::Source if is_main(zone) => Some(RELOAD_SOURCE),
         _ => None,
     }
 }
@@ -1961,10 +1968,10 @@ impl Handler<Changed> for DenonActor {
             return;
         }
         if let Some(change) = msg.1 {
-            if let Some(parts) = reload_after(change.setting) {
+            if let Some(parts) = reload_after(change.setting, change.zone) {
                 self.schedule_reload(ctx, parts);
             }
-            self.clear_pause(change.setting);
+            self.clear_pause(change);
             // The kept sound mode can be missing from a new list.
             if change.setting == Setting::SoundModes {
                 self.sound_mode = None;
@@ -1977,9 +1984,7 @@ impl Handler<Changed> for DenonActor {
                 Setting::NetworkPresetNames => {
                     self.schedule_names_save(discovery::Names::NetworkFavorites, ctx);
                 }
-                Setting::Source | Setting::Power
-                    if change.zone.is_none_or(|z| z == denon_marantz::Zone::Main) =>
-                {
+                Setting::Source | Setting::Power if is_main(change.zone) => {
                     // The library sends a change only when the value changed, or for the
                     // source, when its kind changed.
                     if let Some(avr) = &self.avr {
@@ -2004,7 +2009,7 @@ impl Handler<Changed> for DenonActor {
                 Setting::Sources => self.ask_names(),
                 _ => {}
             }
-            self.schedule_emit_for(change.setting, ctx);
+            self.schedule_emit_for(change, ctx);
         } else {
             // Changes were lost.
             self.schedule_emit(ctx);
@@ -3060,7 +3065,10 @@ mod tests {
 
     #[test]
     fn a_new_preset_reads_the_dirac_slots_too() {
-        assert_eq!(Some(RELOAD_PRESET), reload_after(Setting::SpeakerPreset));
+        assert_eq!(
+            Some(RELOAD_PRESET),
+            reload_after(Setting::SpeakerPreset, None)
+        );
         let (_, queries) = RELOAD_QUERIES[0];
         assert!(queries.contains(&Query::DiracSlots));
         assert!(queries.contains(&Query::DiracFilter));
@@ -3068,19 +3076,29 @@ mod tests {
 
     #[test]
     fn a_filter_change_does_not_read_the_filter() {
-        assert_eq!(Some(RELOAD_FILTER), reload_after(Setting::DiracFilter));
+        assert_eq!(
+            Some(RELOAD_FILTER),
+            reload_after(Setting::DiracFilter, None)
+        );
         assert!(!FILTER_VALUES.contains(&Query::DiracFilter));
     }
 
     #[test]
     fn an_audyssey_change_reads_the_values_that_depend_on_it() {
-        assert_eq!(Some(RELOAD_DYNAMIC_EQ), reload_after(Setting::DynamicEq));
-        assert_eq!(Some(RELOAD_MULTI_EQ), reload_after(Setting::MultiEq));
+        assert_eq!(
+            Some(RELOAD_DYNAMIC_EQ),
+            reload_after(Setting::DynamicEq, None)
+        );
+        assert_eq!(Some(RELOAD_MULTI_EQ), reload_after(Setting::MultiEq, None));
     }
 
     #[test]
-    fn a_new_source_reads_the_digital_codec() {
-        assert_eq!(Some(RELOAD_SOURCE), reload_after(Setting::Source));
+    fn a_new_main_zone_source_reads_the_digital_codec() {
+        let main = Some(denon_marantz::Zone::Main);
+        assert_eq!(Some(RELOAD_SOURCE), reload_after(Setting::Source, main));
+        for zone in [denon_marantz::Zone::Zone2, denon_marantz::Zone::Zone3] {
+            assert_eq!(None, reload_after(Setting::Source, Some(zone)));
+        }
     }
 
     #[test]
@@ -3093,22 +3111,32 @@ mod tests {
 
     #[test]
     fn a_new_source_a_source_list_change_or_a_power_change_end_the_pause() {
-        assert!(ends_pause(Setting::Source, false));
-        assert!(ends_pause(Setting::Sources, false));
-        assert!(ends_pause(Setting::Power, false));
+        let main = Some(denon_marantz::Zone::Main);
+        assert!(ends_pause(Setting::Source, main, false));
+        assert!(ends_pause(Setting::Source, None, false));
+        assert!(ends_pause(Setting::Sources, None, false));
+        assert!(ends_pause(Setting::Power, main, false));
+    }
+
+    #[test]
+    fn a_change_in_another_zone_does_not_end_the_pause() {
+        for zone in [denon_marantz::Zone::Zone2, denon_marantz::Zone::Zone3] {
+            assert!(!ends_pause(Setting::Source, Some(zone), false));
+            assert!(!ends_pause(Setting::Power, Some(zone), false));
+        }
     }
 
     #[test]
     fn a_title_that_plays_again_ends_the_pause() {
-        assert!(ends_pause(Setting::NowPlaying, true));
-        assert!(!ends_pause(Setting::NowPlaying, false));
-        assert!(!ends_pause(Setting::Volume, true));
+        assert!(ends_pause(Setting::NowPlaying, None, true));
+        assert!(!ends_pause(Setting::NowPlaying, None, false));
+        assert!(!ends_pause(Setting::Volume, None, true));
     }
 
     #[test]
     fn other_settings_are_not_read_again() {
         for setting in [Setting::Volume, Setting::Dimmer, Setting::NowPlaying] {
-            assert_eq!(None, reload_after(setting), "{setting:?}");
+            assert_eq!(None, reload_after(setting, None), "{setting:?}");
         }
     }
 }
