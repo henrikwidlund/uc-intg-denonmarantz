@@ -25,15 +25,15 @@ Bluetooth or with zone 2. Please report problems as
 
 ## Features
 
-- **Media player**: power, volume and mute, input source, sound mode, navigation, menu, options, info,
-  channel up and down, play and pause, next and previous. Title, artist, album and cover for network audio
-  and HD radio. Receivers with `CommApiVers` 0301 or higher have HEOS. On receivers with HEOS, network audio
-  shows what HEOS plays, with position, length, repeat and shuffle, and play, pause, stop, next, previous,
-  repeat and shuffle go to HEOS. Volume and mute stay on the receiver: HEOS shares one volume for all zones.
-  The Remote must be able to reach the receiver on TCP port 1255 (HEOS) and 8015 (covers from AirPlay and
-  USB, seen on an AVC-A10H). Volume up and down use the step of the receiver (0.5 dB). The volume step of a
-  Python integration configuration is not used. A volume above the top of the scale that the receiver lists
-  is set to the top.
+- **Media player**: power, volume and mute, input source, sound mode, navigation, menu, options, info, channel
+  up and down, play and pause, next and previous. Title, artist, album and cover for network audio (also USB
+  and iPod) and HD radio. Receivers with `CommApiVers` 0301 or higher have HEOS. On receivers with HEOS,
+  network audio shows what HEOS plays, with position, length, repeat and shuffle, and play, pause, stop, next,
+  previous, repeat and shuffle go to HEOS. Volume and mute stay on the receiver: HEOS shares one volume for
+  all zones. The Remote must be able to reach the receiver on TCP port 1255 (HEOS) and 8015 (covers from
+  AirPlay and USB, seen on an AVC-A10H). Volume up and down use the step of the receiver (0.5 dB). The volume
+  step of a Python integration configuration is not used. A volume above the top of the scale that the
+  receiver lists is set to the top.
 - **Remote**: the simple commands of the Python integration (about 370), `BT_LEVEL_UP`/`DOWN`,
   `TACTILE_CHANNEL_*` (the channel of the tactile transducer, `CVTTR`), commands of older receivers (see
   [Older receivers](#older-receivers)), up to 15 UI pages, button mapping, repeat and button sequences. Text
@@ -375,10 +375,10 @@ More checks:
 - `media_info` (after `heos`) is skipped without `--avoid-sources` or the second connection. It is also skipped if
   the driver shows no tuner entities and there is no terminal. It fails if a part fails and is skipped only if both
   parts are skipped. The parts:
-  - Tuner: it selects a tuner source and checks the title (the title from the receiver, else the frequency
-    text) and the artist (the artist from the receiver, else the band). Then it sets the start source back.
-    The part runs only if the driver shows the tuner entities and the frequency sensor (the driver shows it
-    only in telnet mode), a tuner source and the start source may be selected and are in the source list, and
+  - Tuner: it selects the `TUNER` source (not HD Radio) and checks the title (the title from the receiver, else the
+    frequency text) and the artist (the artist from the receiver, else the band). Then it sets the start source
+    back. The part runs only if the driver shows the tuner entities and the frequency sensor (the driver shows it
+    only in telnet mode), the `TUNER` source and the start source may be selected and are in the source list, and
     the volume is at or below -40 dB. If the tuner is the start source, no source is selected.
   - Bluetooth: it asks you to play music from a phone over Bluetooth, then shows the media info and asks if it is
     right. The part runs only with a terminal, input levels at or below 0 dB and a volume of the receiver and the

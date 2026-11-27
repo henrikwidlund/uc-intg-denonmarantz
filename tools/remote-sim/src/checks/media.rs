@@ -5,10 +5,9 @@
 
 use super::prompt::{Answer, Ask, ask, ask_hint, terminal};
 use super::{
-    SourceRule, TUNER_CODES, above_baseline, add_back_note, add_set_back, cap_volume,
-    driver_volume, ensure_on, first_error, highest, label_fits, lower_volume, read_sources,
-    receiver_volume, restore_source, sound_volume, source_back, source_rule, start_source_ok,
-    strings, too_loud, unmute_limit,
+    SourceRule, above_baseline, add_back_note, add_set_back, cap_volume, driver_volume, ensure_on,
+    first_error, highest, label_fits, lower_volume, read_sources, receiver_volume, restore_source,
+    sound_volume, source_back, source_rule, start_source_ok, strings, too_loud, unmute_limit,
 };
 use crate::{Check, Ctx, Fail};
 use denon_marantz::Zone;
@@ -95,35 +94,20 @@ fn combine(parts: &[(&str, Part)]) -> Check {
 
 /// The name in the driver list `list` of a tuner source that may be selected, or why there is
 /// none. The start source `old` must be one that may be selected: the set back selects it again.
-/// `TUNER` comes before `HDRADIO`. Only the selected source must pass the rule, because the check
-/// selects it by its name.
+/// Only `TUNER`: HD radio shows no frequency when it has no title. Only the selected source must
+/// pass the rule, because the check selects it by its name.
 fn tuner_source(rule: &SourceRule<'_>, old: &str, list: &[String]) -> Result<String, String> {
     start_source_ok(rule, old, list)?;
-    let mut listed = false;
-    let mut allowed = false;
-    for code in TUNER_CODES {
-        let Some(info) = rule.info(code) else {
-            continue;
-        };
-        listed = true;
-        if !rule.code_ok(code) {
-            continue;
-        }
-        allowed = true;
-        if let Some(label) = list
-            .iter()
-            .find(|l| label_fits(info, l) && rule.label_ok(l))
-        {
-            return Ok(label.clone());
-        }
+    let Some(info) = rule.info("TUNER") else {
+        return Err("the receiver has no TUNER source".to_owned());
+    };
+    if !rule.code_ok("TUNER") {
+        return Err("no tuner source may be selected".to_owned());
     }
-    Err(if allowed {
-        "no tuner source that may be selected is in the source list".to_owned()
-    } else if listed {
-        "no tuner source may be selected".to_owned()
-    } else {
-        "the receiver has no tuner source".to_owned()
-    })
+    list.iter()
+        .find(|l| label_fits(info, l) && rule.label_ok(l))
+        .cloned()
+        .ok_or_else(|| "no tuner source that may be selected is in the source list".to_owned())
 }
 
 /// Select a tuner source, check the media info and set the start source back, also after a
@@ -570,12 +554,12 @@ mod tests {
         };
         assert_eq!(
             tuner_source(&rule, "Apple TV", &list(&["Apple TV"])),
-            Err("the receiver has no tuner source".to_owned())
+            Err("the receiver has no TUNER source".to_owned())
         );
     }
 
     #[test]
-    fn tuner_source_prefers_tuner_and_needs_a_listed_name() {
+    fn tuner_source_is_only_the_tuner_and_needs_a_listed_name() {
         let opt = options(&["oppo"]);
         let sources = [
             source("MPLAY", "Apple TV"),
@@ -593,7 +577,7 @@ mod tests {
         );
         assert_eq!(
             tuner_source(&rule, "Apple TV", &list(&["Apple TV", "HD Radio"])),
-            Ok("HD Radio".to_owned())
+            Err("no tuner source that may be selected is in the source list".to_owned())
         );
         assert_eq!(
             tuner_source(&rule, "Apple TV", &list(&["Apple TV"])),
