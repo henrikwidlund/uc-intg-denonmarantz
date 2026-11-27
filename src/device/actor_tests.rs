@@ -2846,6 +2846,45 @@ async fn a_command_is_not_sent_again_without_time_left() {
     assert_eq!(0, rig.telnet.count("MVUP"));
 }
 
+/// A receiver in standby: the library holds the next line after a power-on.
+fn in_standby(line: &str) -> Vec<String> {
+    match line {
+        "PW?" => vec!["PWSTANDBY".into()],
+        "ZM?" => vec!["ZMOFF".into()],
+        "PWON" | "ZMON" => Vec::new(),
+        _ => answers_all(line),
+    }
+}
+
+/// The library drops a line that waits when telnet closes. The command is sent again, over HTTP
+/// while telnet is down.
+#[actix::test]
+async fn a_command_dropped_by_a_closed_telnet_connection_is_sent_again_over_http() {
+    let rig = rig_on(Fake::start(false).await, |_| cfg(), in_standby, QUICK).await;
+    until("the first read", 5, || rig.telnet.count("SLP?") >= 1).await;
+    let command = |cmd_id: &str| Command::new(EntityKind::MediaPlayer, cmd_id.into(), None);
+    rig.actor
+        .send(command("on"))
+        .await
+        .expect("send")
+        .expect("on");
+    let up = rig.actor.send(command("volume_up"));
+    let closed = async {
+        // Within the power-on hold of the library.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        rig.telnet.close();
+    };
+    let (up, ()) = tokio::join!(up, closed);
+    up.expect("send").expect("volume up");
+    assert_eq!(0, rig.telnet.count("MVUP"));
+    assert_eq!(
+        1,
+        rig.http.commands().iter().filter(|c| *c == "MVUP").count(),
+        "{:?}",
+        rig.http.commands()
+    );
+}
+
 #[actix::test]
 async fn a_failed_mute_toggle_does_not_change_the_next_one() {
     let fake = Fake::start(true).await;

@@ -1392,7 +1392,8 @@ impl DenonActor {
         }
     }
 
-    /// Run the steps of a remote command in the background.
+    /// Run the steps of a remote command in the background. It first waits for a running connect,
+    /// until the deadline of `msg`. A stop ends the wait and the run.
     fn spawn_run(
         &self,
         run: remote::RemoteRun,
@@ -1404,22 +1405,28 @@ impl DenonActor {
         let cfg = self.cfg.clone();
         let expected = self.expected.clone();
         let received = Instant::now();
-        let stop = self.run_stop.subscribe();
+        let mut stop = self.run_stop.subscribe();
         let disconnects = self.disconnects;
         let attempt = connecting.as_ref().map(|c| c.attempt.clone());
         let deadline = msg.deadline;
         ctx.spawn(
             async move {
-                let _ = timeout_at(deadline, connect_ended(connecting)).await;
+                // A stop ends the wait for the connect.
+                let stopped = tokio::select! {
+                    biased;
+                    _ = stop.changed() => true,
+                    _ = timeout_at(deadline, connect_ended(connecting)) => false,
+                };
+                (stop, stopped)
             }
             .into_actor(self)
-            .then(move |(), act, _| {
+            .then(move |(stop, stopped), act, _| {
                 let avr = act.avr.clone();
                 let heos = act.heos.clone();
                 let name = act.cfg.name.clone();
                 let stale = act.stale(attempt.as_ref(), disconnects);
                 async move {
-                    if stop.has_changed().unwrap_or(true) {
+                    if stopped || stop.has_changed().unwrap_or(true) {
                         debug!("[{name}] {} stopped, steps sent: 0", command_name(&msg));
                         return;
                     }
