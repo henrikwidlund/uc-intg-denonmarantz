@@ -73,10 +73,6 @@ jobs:
           build-args: |
             UC_VERSION=${{ steps.meta.outputs.version }}
             UC_RELEASE_DATE=${{ env.UC_RELEASE_DATE }}
-          # Only pull requests use the cache. A tag run can only read a cache saved on main or on
-          # the same tag, and this workflow does not run on main.
-          cache-from: ${{ github.event_name == 'pull_request' && format('type=gha,scope={0}', env.PLATFORM_PAIR) || '' }}
-          cache-to: ${{ github.event_name == 'pull_request' && format('type=gha,scope={0},mode=max', env.PLATFORM_PAIR) || '' }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=${{ github.event_name != 'pull_request' }},name-canonical=true,push=${{ github.event_name != 'pull_request' }}
 
       - name: Export digest
