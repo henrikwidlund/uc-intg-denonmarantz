@@ -211,18 +211,23 @@ pub fn attributes(v: &View<'_>, out: &mut Map<String, Value>) {
     }
 
     // As in the Python integration: a source that does not play media shows its name as the title.
-    // The tuner shows the frequency, the band and the station when there is no other text.
+    // The tuner shows the frequency and the band when there is no other text. The tuner values stay
+    // after a source change: other sources do not use them. HD radio has its own values.
     let now = &device.now_playing;
-    let playing_source = v.state.main_playing_kind().is_some();
-    let title = if playing_source {
-        now.title.clone().or_else(|| sensor::tuner_text(device))
-    } else {
-        Some(source)
+    let kind = v.state.main_playing_kind();
+    let tuner = kind == Some(PlayingKind::Tuner);
+    let title = match kind {
+        Some(PlayingKind::Tuner) => now.title.clone().or_else(|| sensor::tuner_text(device)),
+        Some(_) => now.title.clone(),
+        None => Some(source),
     };
-    let artist = now
-        .artist
-        .clone()
-        .or_else(|| device.tuner.band.map(|b| b.label().to_owned()));
+    let artist = now.artist.clone().or_else(|| {
+        device
+            .tuner
+            .band
+            .filter(|_| tuner)
+            .map(|b| b.label().to_owned())
+    });
     let album = now.album.clone().or_else(|| now.station.clone());
     set(out, Attr::MediaTitle, text(title));
     set(out, Attr::MediaArtist, text(artist));

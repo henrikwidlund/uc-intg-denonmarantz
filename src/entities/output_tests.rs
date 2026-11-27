@@ -261,6 +261,20 @@ fn the_tuner_shows_the_frequency_and_the_band() {
 }
 
 #[test]
+fn network_audio_and_hd_radio_without_a_title_do_not_show_the_tuner() {
+    let cfg = cfg();
+    let usb = state(&["PWON", "TFAN008750", "SIUSB"]);
+    let player = attrs(&view(&usb, &cfg), EntityKind::MediaPlayer);
+    assert_eq!(json!(""), player["media_title"]);
+    assert_eq!(json!(""), player["media_artist"]);
+    // HD radio has its own frequency and band: it does not show the values of the tuner.
+    let hd = state(&["PWON", "TFAN008750", "SIHDRADIO"]);
+    let player = attrs(&view(&hd, &cfg), EntityKind::MediaPlayer);
+    assert_eq!(json!(""), player["media_title"]);
+    assert_eq!(json!(""), player["media_artist"]);
+}
+
+#[test]
 fn a_renamed_tuner_shows_the_frequency() {
     let cfg = cfg();
     let mut state = state(&["PWON", "TFAN008750"]);
