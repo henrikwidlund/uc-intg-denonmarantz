@@ -136,7 +136,33 @@ impl Driver {
         (lossy(bytes), start + len as u64)
     }
 
-    /// Size of the driver log in bytes. 0 if it cannot be read.
+    /// The byte offset after the last whole line of the driver log. Reads the log from the end in
+    /// chunks. 0 if the log has no whole line or cannot be read.
+    pub async fn line_end(&self) -> u64 {
+        let path = self.log.clone();
+        let end = tokio::task::spawn_blocking(move || {
+            line_end_in(&mut std::fs::File::open(path)?, LINE_END_CHUNK)
+        });
+        end.await.ok().and_then(Result::ok).unwrap_or(0)
+    }
+
+    /// The last match of `find` in the whole lines of the driver log, and the byte offset after
+    /// them. `find` must give the last match in its text. It gets the end of the log first and
+    /// more of it only while it finds nothing. `(None, 0)` if the log cannot be read.
+    pub async fn find_last<T, F>(&self, find: F) -> (Option<T>, u64)
+    where
+        T: Send + 'static,
+        F: Fn(&str) -> Option<T> + Send + 'static,
+    {
+        let path = self.log.clone();
+        let found = tokio::task::spawn_blocking(move || {
+            find_last_in(&mut std::fs::File::open(path)?, LINE_END_CHUNK, find)
+        });
+        found.await.ok().and_then(Result::ok).unwrap_or((None, 0))
+    }
+
+    /// Size of the driver log in bytes. 0 if it cannot be read. The offset can be inside a line,
+    /// see [`Driver::line_end`].
     pub async fn log_size(&self) -> u64 {
         tokio::fs::metadata(&self.log).await.map_or(0, |m| m.len())
     }
@@ -155,6 +181,68 @@ impl Driver {
             Ok(bytes)
         });
         read.await.ok()?.ok()
+    }
+}
+
+/// Bytes that [`Driver::line_end`] reads at a time from the end of the log, and the first window
+/// of [`Driver::find_last`].
+const LINE_END_CHUNK: usize = 64 * 1024;
+
+/// The byte offset after the last `\n` of `file`, or 0 if it has none. Reads `chunk` bytes at a
+/// time, from the end.
+fn line_end_in<F: Read + Seek>(file: &mut F, chunk: usize) -> std::io::Result<u64> {
+    debug_assert!(chunk > 0, "chunk 0 never ends");
+    let mut end = file.seek(SeekFrom::End(0))?;
+    let chunk = usize::try_from(end).map_or(chunk, |end| end.min(chunk));
+    let mut buf = vec![0; chunk];
+    while end > 0 {
+        let len = usize::try_from(end).map_or(chunk, |end| end.min(chunk));
+        let start = end - len as u64;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buf[..len])?;
+        if let Some(i) = buf[..len].iter().rposition(|&b| b == b'\n') {
+            return Ok(start + i as u64 + 1);
+        }
+        end = start;
+    }
+    Ok(0)
+}
+
+/// The last match of `find` in the whole lines of `file`, and the byte offset after them. Reads
+/// `chunk` bytes before the last line end first, then twice as many each time `find` gives
+/// nothing. The first line of the read part is left out unless the part starts at byte 0, because
+/// it can be cut.
+fn find_last_in<R, T>(
+    file: &mut R,
+    chunk: usize,
+    find: impl Fn(&str) -> Option<T>,
+) -> std::io::Result<(Option<T>, u64)>
+where
+    R: Read + Seek,
+{
+    let end = line_end_in(file, chunk)?;
+    let mut window = chunk as u64;
+    let mut bytes = Vec::new();
+    loop {
+        let start = end.saturating_sub(window);
+        bytes.resize(usize::try_from(end - start).unwrap_or(usize::MAX), 0);
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut bytes)?;
+        let skip = if start == 0 {
+            0
+        } else {
+            bytes
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(bytes.len(), |i| i + 1)
+        };
+        if let Some(found) = find(&String::from_utf8_lossy(&bytes[skip..])) {
+            return Ok((Some(found), end));
+        }
+        if start == 0 {
+            return Ok((None, end));
+        }
+        window = window.saturating_mul(2);
     }
 }
 
@@ -228,7 +316,60 @@ mod tests {
             driver.log_lines(100).await,
             "after the end"
         );
+        assert_eq!(6, driver.line_end().await);
+        let last = |log: &str| log.lines().last().map(str::to_owned);
+        assert_eq!((Some("cd".to_owned()), 6), driver.find_last(last).await);
+        tokio::fs::remove_file(&driver.log).await.unwrap();
+        assert_eq!(0, driver.line_end().await, "no file");
+        assert_eq!((None, 0), driver.find_last(last).await, "no file");
         tokio::fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[test]
+    fn the_line_end_is_found_across_chunks() {
+        let end = |text: &str, chunk| line_end_in(&mut std::io::Cursor::new(text), chunk).unwrap();
+        assert_eq!(0, end("", 4), "empty");
+        assert_eq!(0, end("abcdefghij", 4), "no newline");
+        assert_eq!(1, end("\nabcdefgh", 4), "first byte");
+        assert_eq!(3, end("ab\ncdefghij", 4), "in the first chunk of the file");
+        assert_eq!(9, end("abcdefgh\nij", 4), "in the last chunk");
+        assert_eq!(10, end("abcdefghi\n", 4), "at the end");
+        assert_eq!(4, end("abc\ndefg", 4), "at a chunk border");
+    }
+
+    #[test]
+    fn the_last_match_is_found_from_the_end() {
+        let last = |text: &str, chunk| {
+            let find = |log: &str| {
+                log.lines()
+                    .rev()
+                    .find(|l| l.starts_with('s'))
+                    .map(str::to_owned)
+            };
+            find_last_in(&mut std::io::Cursor::new(text), chunk, find).unwrap()
+        };
+        assert_eq!((None, 0), last("", 4), "empty");
+        assert_eq!(
+            (None, 9),
+            last("ab\ncd\nef\nsx", 4),
+            "no whole line matches"
+        );
+        assert_eq!(
+            (Some("s2".to_owned()), 12),
+            last("s1\nab\ns2\ncd\n", 4),
+            "last match"
+        );
+        assert_eq!(
+            (Some("s1".to_owned()), 12),
+            last("s1\nabcdefgh\n", 4),
+            "found after the window grew"
+        );
+        // With 3 bytes, the second read starts at "s1" inside the line "abs1".
+        assert_eq!(
+            (None, 8),
+            last("abs1\ncd\n", 3),
+            "a line cut by the read part is not matched"
+        );
     }
 
     #[test]

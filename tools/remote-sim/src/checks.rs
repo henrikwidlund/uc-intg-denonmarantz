@@ -1193,10 +1193,10 @@ fn after_wake(tail: &str, failed: usize, telnet: bool) -> Result<usize, String> 
     Ok(tail.matches(TELNET_RETRY).count())
 }
 
-/// Wait until the last status line of the driver log after byte `from` shows `status`. Status
-/// lines before `from` do not count. Returns the byte offset after the whole lines in which it was
-/// seen.
-async fn wait_status(ctx: &mut Ctx, from: u64, status: &str, secs: u64) -> Result<u64, Fail> {
+/// Wait up to `limit` until the last status line of the driver log after byte `from` shows
+/// `status`. Status lines before `from` do not count. Returns the byte offset after the whole
+/// lines in which it was seen.
+async fn wait_status(ctx: &mut Ctx, from: u64, status: &str, limit: Duration) -> Result<u64, Fail> {
     debug_assert!(STATUSES.contains(&status), "{status}");
     let start = Instant::now();
     loop {
@@ -1206,27 +1206,37 @@ async fn wait_status(ctx: &mut Ctx, from: u64, status: &str, secs: u64) -> Resul
             return Ok(end);
         }
         ensure!(
-            start.elapsed() < Duration::from_secs(secs),
-            "status {}, not {status}, after {secs} s",
-            last.unwrap_or("none")
+            start.elapsed() < limit,
+            "status {}, not {status}, after {} s",
+            last.unwrap_or("none"),
+            limit.as_secs()
         );
         ctx.client.listen_ms(200).await?;
     }
 }
 
 /// Wake the Remote up after a failed step, else the next checks run in standby. Waits until the
-/// driver is connected after the wake-up, see [`woke`].
+/// driver is connected after the wake-up, see [`woke`]. When the driver looks connected 1 s after
+/// the wake-up, it checks again 2 s later. When it is not connected at either check, it waits up
+/// to 7 s for `Connected`.
 async fn wake_again(ctx: &mut Ctx) -> Result<(), Fail> {
-    let (log, from) = ctx.driver.log_lines(0).await;
-    let before = last_status(&log).map(str::to_owned);
-    drop(log);
+    let (before, from) = ctx
+        .driver
+        .find_last(|log| last_status(log).map(str::to_owned))
+        .await;
     ctx.client.send_event("exit_standby").await?;
     ctx.client.listen_ms(1000).await?;
     let (tail, _) = ctx.driver.log_lines(from).await;
     if woke(before.as_deref(), last_status(&tail)) {
-        return Ok(());
+        ctx.client.listen_ms(2000).await?;
+        let (tail, _) = ctx.driver.log_lines(from).await;
+        if woke(before.as_deref(), last_status(&tail)) {
+            return Ok(());
+        }
     }
-    wait_status(ctx, from, "Connected", 7).await.map(drop)
+    wait_status(ctx, from, "Connected", Duration::from_secs(7))
+        .await
+        .map(drop)
 }
 
 /// Whether the driver is connected after a wake-up: the last status line after it is
@@ -1235,19 +1245,19 @@ fn woke(before: Option<&str>, after: Option<&str>) -> bool {
     after.or(before) == Some("Connected")
 }
 
-/// The standby and wake-up events of [`quick_wake`], up to the last standby. `from` is the size
-/// of the driver log before the step. Returns the byte offset of the driver log after the lines
-/// in which the driver is disconnected.
+/// The standby and wake-up events of [`quick_wake`], up to the last standby. `from` is the byte
+/// offset in the driver log where the step starts. Returns the byte offset of the driver log after
+/// the lines in which the driver is disconnected.
 async fn standby_burst(ctx: &mut Ctx, from: u64) -> Result<u64, Fail> {
     ctx.client.send_event("enter_standby").await?;
-    wait_status(ctx, from, "Disconnected", 5).await?;
+    wait_status(ctx, from, "Disconnected", Duration::from_secs(5)).await?;
     for (awake, asleep) in QUICK_GAPS_MS {
         ctx.client.send_event("exit_standby").await?;
         ctx.client.listen_ms(awake).await?;
         ctx.client.send_event("enter_standby").await?;
         ctx.client.listen_ms(asleep).await?;
     }
-    wait_status(ctx, from, "Disconnected", 3).await
+    wait_status(ctx, from, "Disconnected", Duration::from_secs(3)).await
 }
 
 /// The Remote wakes up and goes to standby again with short gaps. With the short gaps, a standby
@@ -1259,8 +1269,9 @@ async fn standby_burst(ctx: &mut Ctx, from: u64) -> Result<u64, Fail> {
 /// how many telnet retry lines came after the last wake-up.
 pub async fn quick_wake(ctx: &mut Ctx) -> Check {
     ensure_on(ctx).await?;
-    let start = ctx.driver.log_size().await;
-    ensure!(start > 0, "the driver log is empty");
+    // The end of the whole lines, so the step text does not start inside a line.
+    let start = ctx.driver.line_end().await;
+    ensure!(start > 0, "the driver log has no whole line");
     let config = read_config(ctx).await?;
     let telnet = config_device(ctx, &config)?["use_telnet"] != false;
     let from = match standby_burst(ctx, start).await {
@@ -1268,7 +1279,7 @@ pub async fn quick_wake(ctx: &mut Ctx) -> Check {
         Err(e) => return first_error(Err(e), wake_again(ctx).await),
     };
     ctx.client.send_event("exit_standby").await?;
-    wait_status(ctx, from, "Connected", 8).await?;
+    wait_status(ctx, from, "Connected", Duration::from_secs(8)).await?;
     ctx.client.listen(2).await?;
     let step = ctx.driver.log_from(start).await;
     let tail = ctx.driver.log_from(from).await;
@@ -1299,11 +1310,8 @@ fn count_lines(log: &str, parts: &[&str]) -> usize {
     parts.iter().map(|p| log.matches(p).count()).sum()
 }
 
-/// Where the last loss line of `log` starts, if the log has more loss lines than `lost_before`.
-fn last_loss(log: &str, lost_before: usize) -> Option<usize> {
-    if count_lines(log, &LOSS_LINES) <= lost_before {
-        return None;
-    }
+/// Where the last loss line of `log` starts, if any.
+fn last_loss(log: &str) -> Option<usize> {
     LOSS_LINES.iter().filter_map(|p| log.rfind(p)).max()
 }
 
@@ -1318,7 +1326,8 @@ fn connected_after(log: &str, from: usize) -> bool {
 /// connection is opened again. Only with `--only receiver_restart`.
 pub async fn receiver_restart(ctx: &mut Ctx) -> Check {
     ensure_on(ctx).await?;
-    let lost_before = count_lines(&ctx.driver.log_text().await, &LOSS_LINES);
+    // Start at a line end, so the first line read is whole.
+    let mark = ctx.driver.line_end().await;
     let remote = ctx.remote();
     ctx.client
         .command_ok(
@@ -1334,8 +1343,8 @@ pub async fn receiver_restart(ctx: &mut Ctx) -> Check {
     let mut from: Option<usize> = None;
     let mut lost = 0;
     loop {
-        let log = ctx.driver.log_text().await;
-        if let Some(at) = last_loss(&log, lost_before) {
+        let (log, _) = ctx.driver.log_lines(mark).await;
+        if let Some(at) = last_loss(&log) {
             from = Some(at);
         } else if from.is_none() && ctx.client.text(&mp, "state") == "UNAVAILABLE" {
             from = Some(log.len());
@@ -2469,7 +2478,7 @@ async fn abort_driver_setup(ctx: &mut Ctx) -> Result<(), Fail> {
 pub async fn abort_setup(ctx: &mut Ctx) -> Check {
     let config = tokio::fs::read_to_string(ctx.driver.config_file()).await?;
     let ids = entity_ids(ctx).await?;
-    let aborts_before = ctx.driver.log_text().await.matches(ABORT_LINE).count();
+    let from = ctx.driver.log_size().await;
     for round in 1..=2 {
         ctx.client.clear_setup();
         ctx.client
@@ -2489,13 +2498,7 @@ pub async fn abort_setup(ctx: &mut Ctx) -> Check {
             .map_err(|e| Fail::new(format!("abort: {e}")));
         join_errors(page, abort)?;
     }
-    let aborts = ctx
-        .driver
-        .log_text()
-        .await
-        .matches(ABORT_LINE)
-        .count()
-        .saturating_sub(aborts_before);
+    let aborts = ctx.driver.log_from(from).await.matches(ABORT_LINE).count();
     ensure!(
         aborts == 2,
         "the driver logged {aborts} of 2 aborted setup flows (the info log of the driver is needed)"
@@ -3896,6 +3899,8 @@ pub async fn unused_receiver(ctx: &mut Ctx) -> Check {
         .ok_or_else(|| Fail::new("config.json is not a list"))?
         .push(unused);
     ctx.driver.stop().await;
+    // The driver is stopped, so the log does not grow.
+    let from = ctx.driver.log_size().await;
     let result = async {
         tokio::fs::write(ctx.driver.config_file(), config.to_string()).await?;
         ctx.driver.start().await?;
@@ -3916,24 +3921,26 @@ pub async fn unused_receiver(ctx: &mut Ctx) -> Check {
         let name = format!("[{UNUSED_NAME}]");
         let tried = |log: &str| log.contains(UNUSED_ADDRESS) || log.contains(&name);
         ensure!(
-            !tried(&ctx.driver.log_text().await),
+            !tried(&ctx.driver.log_from(from).await),
             "the unused receiver was connected"
         );
         // A subscribed entity makes it used.
+        let from = ctx.driver.log_size().await;
         let one = other[0].clone();
         ctx.client
             .request_ok("subscribe_events", json!({ "entity_ids": [one] }))
             .await?;
         ctx.client.listen(2).await?;
         ensure!(
-            tried(&ctx.driver.log_text().await),
+            tried(&ctx.driver.log_from(from).await),
             "no connect after the subscribe"
         );
+        let from = ctx.driver.log_size().await;
         ctx.client
             .request_ok("unsubscribe_events", json!({ "entity_ids": [one] }))
             .await?;
         ctx.client.listen(1).await?;
-        let log = ctx.driver.log_text().await;
+        let log = ctx.driver.log_from(from).await;
         ensure!(
             log.contains(&format!("[{UNUSED_NAME}] not in use, disconnecting")),
             "no disconnect after the unsubscribe"
@@ -6495,16 +6502,16 @@ mod tests {
     #[test]
     fn only_a_connect_after_the_last_loss_counts() {
         let old = "[A] connected in 20 ms\n";
-        assert_eq!(None, last_loss(old, 0));
+        assert_eq!(None, last_loss(old));
         let lost = format!("{old}telnet connection lost\n");
-        let at = last_loss(&lost, 0).expect("lost");
+        let at = last_loss(&lost).expect("lost");
         assert!(
             !connected_after(&lost, at),
             "the old connect is before the loss"
         );
-        assert_eq!(None, last_loss(&lost, 1), "a loss from before the restart");
         let again = format!("{lost}[A] telnet disconnected\ntelnet connected\n");
-        let at = last_loss(&again, 1).expect("lost");
+        let at = last_loss(&again).expect("lost");
+        assert!(at > lost.len(), "the last loss line");
         assert!(connected_after(&again, at));
         assert!(
             !connected_after("[A] telnet disconnected\n", 0),
