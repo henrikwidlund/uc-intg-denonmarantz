@@ -50,9 +50,9 @@ const FEATURES: &[F] = &[
     F::Info,
 ];
 
-/// Commands that every receiver has, in the names of the Python integration, for the simple
-/// commands of the remote entity. Commands that need a parameter are left out: a simple command has
-/// none.
+/// Simple commands of the remote entity for every receiver, in the names of the Python
+/// integration. `stop` is offered only if [`has_stop`]. Commands that need a parameter are left
+/// out: a simple command has none.
 pub const BASE_COMMANDS: &[&str] = &[
     "play_pause",
     "stop",
@@ -74,6 +74,12 @@ pub const BASE_COMMANDS: &[&str] = &[
     "info",
 ];
 
+/// The receiver offers stop: Denon receivers, and receivers that may have HEOS. Marantz receivers
+/// stop only while HEOS plays.
+pub fn has_stop(cfg: &DeviceConfig) -> bool {
+    cfg.is_denon || cfg.may_have_heos()
+}
+
 pub fn definition(mut entity: AvailableIntgEntity, cfg: &DeviceConfig) -> AvailableIntgEntity {
     entity.device_class = Some(MediaPlayerDeviceClass::Receiver.as_ref().into());
     let mut features: Vec<String> = FEATURES.iter().map(|f| f.as_ref().to_string()).collect();
@@ -84,8 +90,7 @@ pub fn definition(mut entity: AvailableIntgEntity, cfg: &DeviceConfig) -> Availa
     if cfg.offers(Feature::Tuner) {
         features.push(F::ChannelSwitcher.as_ref().to_string());
     }
-    // HEOS stops on both brands.
-    if cfg.is_denon || cfg.may_have_heos() {
+    if has_stop(cfg) {
         features.push(F::Stop.as_ref().to_string());
     }
     // The Remote keeps the features of an entity: a receiver that may have HEOS gets them before

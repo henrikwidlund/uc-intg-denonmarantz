@@ -38,7 +38,8 @@ Bluetooth or with zone 2. Please report problems as
   `TACTILE_CHANNEL_*` (the channel of the tactile transducer, `CVTTR`), commands of older receivers (see
   [Older receivers](#older-receivers)), up to 15 UI pages, button mapping, repeat and button sequences. Text
   of up to 28 characters is sent to the receiver as it is. `volume`, `select_source` and `select_sound_mode`
-  are not simple commands: they need a parameter.
+  are not simple commands: they need a parameter. `stop` is a simple command only on Denon receivers and on
+  receivers that may have HEOS.
 - **Selects**: sound mode, input source, reference level, dynamic volume, dimmer, eco mode. With telnet also
   monitor output, speaker preset, picture mode, digital codec and, if the receiver has Dirac, the Dirac filter
   (only the slots that have a filter).

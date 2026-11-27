@@ -53,9 +53,11 @@ pub fn definition(mut entity: AvailableIntgEntity, cfg: &DeviceConfig) -> Availa
         .map(|f| f.as_ref().to_string())
         .collect(),
     );
+    let stop = media_player::has_stop(cfg);
     let simple: Vec<&str> = media_player::BASE_COMMANDS
         .iter()
         .copied()
+        .filter(|&cmd| stop || cmd != "stop")
         .chain(simple_commands::supported(cfg))
         .collect();
     let mut options = Map::new();
@@ -359,6 +361,28 @@ mod tests {
             names.dedup();
             assert_eq!(count, names.len(), "repeated simple command");
         }
+    }
+
+    #[test]
+    fn stop_is_a_simple_command_only_if_the_receiver_can_stop() {
+        use crate::config_store::{CommApiVersion, ReceiverGeneration};
+        let has_stop = |is_denon: bool, version: &str, generation: Option<ReceiverGeneration>| {
+            let mut cfg = crate::entities::tests::cfg(true, true);
+            cfg.is_denon = is_denon;
+            cfg.comm_api_version = CommApiVersion::parse(version);
+            cfg.receiver_type = generation;
+            let entity = crate::entities::definition(&cfg, crate::entities::EntityKind::Remote);
+            entity.options.expect("options")["simple_commands"]
+                .as_array()
+                .expect("simple_commands")
+                .contains(&json!("stop"))
+        };
+        assert!(has_stop(true, "0300", None));
+        assert!(has_stop(false, "0301", None));
+        assert!(!has_stop(false, "0300", None));
+        // No version: the receiver may have HEOS, unless it is of the oldest generation.
+        assert!(has_stop(false, "", None));
+        assert!(!has_stop(false, "", Some(ReceiverGeneration::Avr)));
     }
 
     #[test]
