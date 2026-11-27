@@ -6,9 +6,12 @@
 //! is never set above the limit in `checks::MAX_VOLUME`. The names in [`AVOID_FILE`] are always
 //! added to `--avoid-sources`.
 //!
+//! Before the driver starts, it is built with [`BUILD_ARGS`], unless `--no-build` or `--driver` is
+//! given.
+//!
 //! Usage: `remote-sim <receiver address> [--driver <path>] [--only a,b] [--skip a,b]
 //! [--kinds a,b] [--avoid-sources a,b] [--host-name <name>] [--no-power] [--no-oracle]
-//! [--port <port>] [--commands <path>]`
+//! [--no-build] [--port <port>] [--commands <path>]`
 
 mod checks;
 mod driver;
@@ -125,6 +128,35 @@ fn avoid_names(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Arguments of `cargo` that build the driver in the repository folder.
+const BUILD_ARGS: [&str; 3] = ["build", "--release", "--locked"];
+
+/// Build the driver with [`BUILD_ARGS`]. The output of cargo goes to the terminal.
+async fn build_driver() -> Result<(), String> {
+    let manifest = repo_root().join("Cargo.toml");
+    println!(
+        "Building the driver: cargo {} --manifest-path {}",
+        BUILD_ARGS.join(" "),
+        manifest.display()
+    );
+    let status = tokio::process::Command::new("cargo")
+        .args(BUILD_ARGS)
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .current_dir(repo_root())
+        .stdin(std::process::Stdio::null())
+        .status()
+        .await
+        .map_err(|e| format!("cannot run cargo to build the driver: {e}. Use --no-build to start the driver as it is"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the driver build failed ({status}). Fix the build, or use --no-build to start the driver as it is"
+        ))
+    }
+}
+
 /// A failed or skipped check.
 pub struct Fail {
     pub msg: String,
@@ -170,6 +202,8 @@ pub struct Options {
     pub no_power: bool,
     /// No second connection to the receiver: the values are not compared with it.
     pub no_oracle: bool,
+    /// Do not build the driver before the start.
+    pub no_build: bool,
     pub port: u16,
     pub commands: PathBuf,
     /// Selects for the sweep. Empty: all.
@@ -314,6 +348,7 @@ fn parse_from(mut args: impl Iterator<Item = String>) -> Result<Options, String>
         skip: Vec::new(),
         no_power: false,
         no_oracle: false,
+        no_build: false,
         port: 19090,
         commands: repo_root().join("resources/commands.tsv"),
         kinds: Vec::new(),
@@ -322,7 +357,10 @@ fn parse_from(mut args: impl Iterator<Item = String>) -> Result<Options, String>
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--driver" => opt.bin = args.next().ok_or("--driver needs a path")?.into(),
+            "--driver" => {
+                opt.bin = args.next().ok_or("--driver needs a path")?.into();
+                opt.no_build = true;
+            }
             "--only" => opt.only.extend(step_list("--only", args.next())?),
             "--skip" => {
                 let list = step_list("--skip", args.next())?;
@@ -348,6 +386,7 @@ fn parse_from(mut args: impl Iterator<Item = String>) -> Result<Options, String>
                 opt.host_name = Some(name);
             }
             "--no-oracle" => opt.no_oracle = true,
+            "--no-build" => opt.no_build = true,
             "--no-power" => opt.no_power = true,
             "--port" => {
                 opt.port = args
@@ -423,7 +462,7 @@ async fn main() {
         Ok(o) => o,
         Err(e) => {
             eprintln!(
-                "{e}\nUsage: remote-sim <receiver address> [--driver <path>] [--only a,b] [--skip a,b] [--kinds a,b] [--avoid-sources a,b] [--host-name <name>] [--no-power] [--no-oracle] [--port <port>] [--commands <path>]"
+                "{e}\nUsage: remote-sim <receiver address> [--driver <path>] [--only a,b] [--skip a,b] [--kinds a,b] [--avoid-sources a,b] [--host-name <name>] [--no-power] [--no-oracle] [--no-build] [--port <port>] [--commands <path>]"
             );
             std::process::exit(2);
         }
@@ -448,6 +487,19 @@ async fn main() {
     }
     if let Some(note) = skip_note(&opt.skip) {
         println!("{note}");
+    }
+    // Before the receiver is contacted: a failed build stops the run.
+    if !opt.no_build
+        && let Err(e) = build_driver().await
+    {
+        eprintln!("{e}");
+        if restore::FILE.exists() {
+            eprintln!(
+                "The settings of the last run are not set back. They are in {}",
+                restore::FILE.display()
+            );
+        }
+        std::process::exit(2);
     }
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -582,6 +634,7 @@ pub mod tests {
             skip: Vec::new(),
             no_power: false,
             no_oracle: false,
+            no_build: false,
             port: 0,
             commands: PathBuf::new(),
             kinds: Vec::new(),
@@ -762,6 +815,18 @@ pub mod tests {
         );
         let opt = parse(&["192.0.2.1", "--host-name", "avr"]).expect("valid");
         assert_eq!(opt.host_name.as_deref(), Some("avr"));
+    }
+
+    #[test]
+    fn no_build_option() {
+        assert!(!parse(&["192.0.2.1"]).expect("valid").no_build);
+        assert!(parse(&["192.0.2.1", "--no-build"]).expect("valid").no_build);
+        assert!(
+            parse(&["192.0.2.1", "--driver", "/bin/driver"])
+                .expect("valid")
+                .no_build
+        );
+        assert_eq!(["build", "--release", "--locked"], BUILD_ARGS);
     }
 
     #[test]

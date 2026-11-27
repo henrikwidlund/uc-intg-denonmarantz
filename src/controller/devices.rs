@@ -113,6 +113,14 @@ impl Device {
     }
 }
 
+/// The configuration of all devices, in [`DeviceConfig::cmp_list_order`]. A free function, so
+/// that the caller can use other fields of the controller while it holds the list.
+pub(super) fn sorted_configs(devices: &HashMap<Arc<str>, Device>) -> Vec<&DeviceConfig> {
+    let mut configs: Vec<&DeviceConfig> = devices.values().map(|d| &d.cfg).collect();
+    configs.sort_unstable_by(|a, b| a.cmp_list_order(b));
+    configs
+}
+
 impl Controller {
     /// Start the actor of a device.
     pub(super) fn add_device(&mut self, cfg: DeviceConfig, ctx: &Context<Self>) {
@@ -164,20 +172,9 @@ impl Controller {
         Some(device.cfg)
     }
 
-    /// The configuration of all devices, in [`DeviceConfig::cmp_list_order`].
-    pub(super) fn sorted_configs(&self) -> Vec<DeviceConfig> {
-        let mut devices: Vec<DeviceConfig> = self.devices.values().map(|d| d.cfg.clone()).collect();
-        devices.sort_unstable_by(|a, b| a.cmp_list_order(b));
-        devices
-    }
-
-    /// Save the configuration of all devices without waiting for the disk. Counts the write in
-    /// [`Controller::config_writes`].
+    /// Save the configuration of all devices without waiting for the disk.
     pub(super) fn queue_devices(&mut self) -> Result<(), ServiceError> {
-        let mut devices: Vec<&DeviceConfig> = self.devices.values().map(|d| &d.cfg).collect();
-        devices.sort_unstable_by(|a, b| a.cmp_list_order(b));
-        self.store.queue_devices(&devices)?;
-        self.config_writes = self.config_writes.wrapping_add(1);
+        self.store.queue_devices(&sorted_configs(&self.devices))?;
         Ok(())
     }
 
@@ -187,14 +184,12 @@ impl Controller {
         &self,
         entity_type: Option<EntityType>,
     ) -> Vec<AvailableIntgEntity> {
-        let mut devices: Vec<&Device> = self.devices.values().collect();
-        devices.sort_unstable_by(|a, b| a.cfg.cmp_list_order(&b.cfg));
-        devices
+        sorted_configs(&self.devices)
             .into_iter()
-            .flat_map(|d| {
-                EntityKind::all(&d.cfg)
+            .flat_map(|cfg| {
+                EntityKind::all(cfg)
                     .filter(|k| entity_type.is_none_or(|t| k.entity_type() == t))
-                    .map(|k| entities::definition(&d.cfg, k))
+                    .map(|k| entities::definition(cfg, k))
             })
             .collect()
     }
@@ -816,10 +811,9 @@ mod tests {
                     .insert(id, map(json!({ "state": "ON" })));
             }
         }
-        let keys: Vec<String> = controller
-            .sorted_configs()
+        let keys: Vec<&str> = sorted_configs(&controller.devices)
             .into_iter()
-            .map(|c| c.id)
+            .map(DeviceConfig::key)
             .collect();
         let sorted = ["C", "A", "B", "D", "E", "F", "G"];
         assert_eq!(sorted.to_vec(), keys);

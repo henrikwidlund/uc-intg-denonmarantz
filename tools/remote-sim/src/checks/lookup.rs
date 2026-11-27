@@ -97,7 +97,7 @@ async fn search_part(ctx: &mut Ctx, config: &Value, address: &str, option: Optio
 
 /// Send the current dimmer option again while the driver still connects. The answer must be OK
 /// and come in less than 10 s.
-async fn command_during_connect(ctx: &mut Ctx, from: usize, option: Option<&str>) -> Check {
+async fn command_during_connect(ctx: &mut Ctx, from: u64, option: Option<&str>) -> Check {
     let option = option.ok_or_else(|| Fail::skip("no dimmer option"))?;
     if log_after(ctx, from).await.contains(CONNECTED_LINE) {
         return Err(Fail::skip("the connect ended before the command"));
@@ -120,7 +120,7 @@ async fn command_during_connect(ctx: &mut Ctx, from: usize, option: Option<&str>
 
 /// Stop the driver, write `config` and start the driver again with a new Remote. Gives the log
 /// size before the start.
-async fn start(ctx: &mut Ctx, config: Value) -> Result<usize, Fail> {
+async fn start(ctx: &mut Ctx, config: Value) -> Result<u64, Fail> {
     ctx.driver.stop().await;
     tokio::fs::write(ctx.driver.config_file(), config.to_string()).await?;
     let from = log_size(ctx).await;
@@ -133,7 +133,7 @@ async fn start(ctx: &mut Ctx, config: Value) -> Result<usize, Fail> {
 /// `address` again and the host name must be `host`. Gives the connect time from the log.
 async fn connected(
     ctx: &mut Ctx,
-    from: usize,
+    from: u64,
     address: &str,
     host: Option<&str>,
 ) -> Result<u64, Fail> {

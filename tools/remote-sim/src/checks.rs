@@ -757,9 +757,29 @@ pub async fn setup_first(ctx: &mut Ctx) -> Check {
         "device page: {page}"
     );
     let dirac = field_value(&page, "is_dirac_supported").unwrap_or_default();
-    ctx.client.answer(json!({ "choice": address })).await?;
+    let choice = device_choice(&page, &address)
+        .ok_or_else(|| Fail::new(format!("no device {address} on the device page: {page}")))?;
+    ctx.client.answer(json!({ "choice": choice })).await?;
     ctx.client.setup_done(20).await?;
     Ok(format!("Dirac in the setup: {dirac}"))
+}
+
+/// The id of the receiver on the device page of the setup: the item with `address` as id, else the
+/// only item. For a host name, the driver lists the receiver by its IP address.
+fn device_choice(page: &Value, address: &str) -> Option<String> {
+    let items = page["settings"]
+        .as_array()?
+        .iter()
+        .find(|s| s["id"] == "choice")?["field"]["dropdown"]["items"]
+        .as_array()?;
+    let mut ids = items.iter().filter_map(|item| item["id"].as_str());
+    if let Some(id) = ids.clone().find(|id| *id == address) {
+        return Some(id.to_owned());
+    }
+    match (ids.next(), ids.next()) {
+        (Some(id), None) => Some(id.to_owned()),
+        _ => None,
+    }
 }
 
 /// An entity id has only ASCII letters, digits and `-`, `_` and `.`, and is not empty.
@@ -1044,9 +1064,22 @@ pub async fn standby(ctx: &mut Ctx) -> Check {
     let mp = ctx.mp();
     let before = connects(ctx).await;
     ctx.client.send_event("enter_standby").await?;
-    ctx.client.listen(3).await?;
-    let state = ctx.client.text(&mp, "state");
-    ensure!(state != "UNAVAILABLE", "state in standby: {state}");
+    let asleep = async {
+        ctx.client.listen(3).await?;
+        let state = ctx.client.text(&mp, "state");
+        ensure!(state != "UNAVAILABLE", "state in standby: {state}");
+        Ok(())
+    }
+    .await;
+    if let Err(e) = asleep {
+        // Wake the Remote up again, else the next checks run in standby.
+        let undo = async {
+            ctx.client.send_event("exit_standby").await?;
+            wait_status(ctx, "Connected", 8).await.map(|_| ())
+        }
+        .await;
+        return first_error(Err(e), undo);
+    }
     ctx.client.send_event("exit_standby").await?;
     let start = Instant::now();
     while connects(ctx).await == before {
@@ -3553,20 +3586,15 @@ fn debug_lines(log: &str) -> usize {
 }
 
 /// Size of the driver log in bytes. 0 if it cannot be read.
-async fn log_size(ctx: &Ctx) -> usize {
+async fn log_size(ctx: &Ctx) -> u64 {
     tokio::fs::metadata(&ctx.driver.log)
         .await
-        .map_or(0, |m| usize::try_from(m.len()).unwrap_or(usize::MAX))
+        .map_or(0, |m| m.len())
 }
 
-/// The log after byte `start`.
-async fn log_after(ctx: &Ctx, start: usize) -> String {
-    let mut text = ctx.driver.log_text().await;
-    if text.is_char_boundary(start) {
-        text.split_off(start)
-    } else {
-        String::new()
-    }
+/// The log after byte `start`. Only that part is read.
+async fn log_after(ctx: &Ctx, start: u64) -> String {
+    ctx.driver.log_from(start).await
 }
 
 /// Turn the debug log option on or off with "Save settings" in the configuration mode.
@@ -4343,7 +4371,8 @@ pub async fn select_sweep(ctx: &mut Ctx) -> Check {
         Ok((summary, verified))
     }
     .await;
-    let undo = sweep_back(ctx, &dirac_original, dynamic_eq.as_deref()).await;
+    let clean = result.is_ok() && problems.is_empty();
+    let undo = sweep_back(ctx, &dirac_original, dynamic_eq.as_deref(), clean).await;
     let (summary, verified) = first_error(result, undo).map_err(|e| {
         if problems.is_empty() {
             e
@@ -4369,14 +4398,21 @@ pub async fn select_sweep(ctx: &mut Ctx) -> Check {
     Ok(format!("{verified} verified. {}", summary.join(" | ")))
 }
 
-/// Set the Dirac filter back to `dirac`, then Dynamic EQ to the saved answer lines.
+/// Set the Dirac filter back to `dirac`, then Dynamic EQ to the saved answer lines. The Dirac
+/// filter is not sent if the sweep passed (`clean`) and the driver shows `dirac`: the driver and
+/// the receiver were then compared, if the receiver gives the filter. A refused or ignored Dirac
+/// filter counts as not set back.
 async fn sweep_back(
     ctx: &mut Ctx,
     dirac: &Value,
     dynamic_eq: Option<&[String]>,
+    clean: bool,
 ) -> Result<(), Fail> {
     let mut problems = Vec::new();
-    if *dirac != Value::Null && *dirac != json!("--") {
+    let shown = ctx
+        .client
+        .attr(&ctx.select("dirac_filter"), "current_option");
+    if *dirac != Value::Null && *dirac != json!("--") && !(clean && shown == Some(dirac)) {
         match sweep_one(ctx, "dirac_filter", dirac).await {
             Ok(Outcome::Refused(reason)) => {
                 problems.push(format!("dirac_filter back to {dirac}: refused: {reason}"));
@@ -4410,7 +4446,7 @@ async fn sweep_back(
 /// Set one option, wait for the select and its sensor, then compare with the receiver.
 async fn sweep_one(ctx: &mut Ctx, kind: &str, option: &Value) -> Result<Outcome, Fail> {
     let select = ctx.select(kind);
-    let log_start = ctx.driver.log_text().await.len();
+    let log_start = log_size(ctx).await;
     let (response, _) = ctx
         .client
         .command(
@@ -4430,12 +4466,9 @@ async fn sweep_one(ctx: &mut Ctx, kind: &str, option: &Value) -> Result<Outcome,
     // the reason.
     const IGNORED: &str = "select_option ignored: ";
     if response["code"] == 200
-        && let Some(reason) = ctx
-            .driver
-            .log_text()
+        && let Some(reason) = log_after(ctx, log_start)
             .await
-            .get(log_start..)
-            .and_then(|new| new.split_once(IGNORED))
+            .split_once(IGNORED)
             .and_then(|(_, rest)| rest.lines().next())
     {
         return Ok(Outcome::Refused(reason.to_owned()));
@@ -4536,27 +4569,50 @@ pub async fn settings_restore(ctx: &mut Ctx) -> Check {
         .into_iter()
         .find(|l| *l != sleep)
         .unwrap_or("SLP120");
-    avr.telnet_send(Zone::Main, Command::Raw(other)).await?;
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let changed = restore::read(avr, &["SLP?"]).await?;
-    // The timer counts down: a value near the set one is also a change.
-    ensure!(
-        changed.iter().any(|l| l != &sleep && l != "SLPOFF"),
-        "the sleep timer did not change to {other}: {changed:?}"
-    );
-    let mut missed = restore::write(avr, restore::QUERIES, &saved).await?;
+    let result = async {
+        avr.telnet_send(Zone::Main, Command::Raw(other)).await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let changed = restore::read(avr, &["SLP?"]).await?;
+        // The timer counts down: a value near the set one is also a change.
+        ensure!(
+            changed.iter().any(|l| l != &sleep && l != "SLPOFF"),
+            "the sleep timer did not change to {other}: {changed:?}"
+        );
+        restore::write(avr, restore::QUERIES, &saved).await
+    }
+    .await;
+    let mut missed = match result {
+        Ok(missed) => missed,
+        Err(e) => {
+            // A failed send can still reach the receiver, the receiver can take the new timer
+            // after the read, or the set back can stop early.
+            let undo = sleep_back(avr, &sleep).await;
+            return first_error(Err(e), undo);
+        }
+    };
+    // The write stopped because of the source. The sleep timer is the same for every source, so
+    // it is set back.
+    let undo = if matches!(missed, restore::Missed::NotSent(_)) {
+        sleep_back(avr, &sleep).await
+    } else {
+        Ok(())
+    };
     let sound = missed.take_sound_mode();
     let missed = missed.into_lines();
-    ensure!(
-        missed.is_empty(),
-        "not set back: {missed:?}{}. They stay in {}",
-        if sound.is_empty() {
-            String::new()
-        } else {
-            format!(", {sound:?}")
-        },
-        restore::FILE.display()
-    );
+    let body = if missed.is_empty() {
+        Ok(())
+    } else {
+        Err(Fail::new(format!(
+            "not set back: {missed:?}{}. They stay in {}",
+            if sound.is_empty() {
+                String::new()
+            } else {
+                format!(", {sound:?}")
+            },
+            restore::FILE.display()
+        )))
+    };
+    first_error(body, undo)?;
     restore::forget().await;
     ensure!(
         !restore::FILE.exists(),
@@ -4572,6 +4628,15 @@ pub async fn settings_restore(ctx: &mut Ctx) -> Check {
         "{} settings read, {sleep} -> {other} -> {sleep}, all set back{sound_note}",
         saved.len()
     ))
+}
+
+/// Set the sleep timer back to the saved line `sleep`.
+async fn sleep_back(avr: &denon_marantz::Avr, sleep: &str) -> Result<(), Fail> {
+    let missed = restore::write(avr, &["SLP?"], &[sleep.to_owned()])
+        .await?
+        .into_lines();
+    ensure!(missed.is_empty(), "sleep timer: {missed:?}");
+    Ok(())
 }
 
 /// Send every simple command of the remote entity, and check the entities against the receiver.
@@ -6164,6 +6229,34 @@ mod tests {
             json!({ "name": { "en": "X" } }),
         ];
         assert_eq!(vec!["sensor.a b", "?"], invalid_ids(&list));
+    }
+
+    #[test]
+    fn device_choice_takes_the_address_or_the_only_item() {
+        let page = |ids: &[&str]| {
+            let items: Vec<Value> = ids.iter().map(|id| json!({ "id": id })).collect();
+            json!({ "settings": [
+                { "id": "choice", "field": { "dropdown": { "value": ids.first(), "items": items } } }
+            ] })
+        };
+        let one = page(&["192.0.2.1"]);
+        assert_eq!(
+            Some("192.0.2.1".to_owned()),
+            device_choice(&one, "192.0.2.1")
+        );
+        assert_eq!(
+            Some("192.0.2.1".to_owned()),
+            device_choice(&one, "avr.local"),
+            "host name"
+        );
+        let two = page(&["192.0.2.1", "192.0.2.2"]);
+        assert_eq!(
+            Some("192.0.2.2".to_owned()),
+            device_choice(&two, "192.0.2.2")
+        );
+        assert_eq!(None, device_choice(&two, "avr.local"), "not known");
+        assert_eq!(None, device_choice(&page(&[]), "avr.local"));
+        assert_eq!(None, device_choice(&json!({}), "avr.local"));
     }
 
     #[test]

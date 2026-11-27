@@ -6,9 +6,9 @@
 
 use crate::config_store::{
     DEFAULT_SIGNAL_SECS, DeviceConfig, DriverSettings, Feature, MIN_SIGNAL_SECS, SaveWait,
-    backup_json, is_ip, parse_backup,
+    backup_json, is_ip, parse_backup, same_ids,
 };
-use crate::controller::devices::ConnectTrigger;
+use crate::controller::devices::{ConnectTrigger, sorted_configs};
 use crate::controller::handler::AbortDriverSetup;
 use crate::controller::{Controller, operation_mode};
 use crate::device::discovery;
@@ -19,7 +19,9 @@ use denon_marantz::{Avr, Error as AvrError, TunerInfo};
 use log::{debug, info, warn};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::Instant;
 use uc_api::intg::{DriverSetupChange, IntegrationSetup, SetupDriver};
 use uc_api::model::intg::{IntegrationSetupError, IntegrationSetupState, SetupChangeEventType};
 use uc_api::ws::{EventCategory, WsMessage};
@@ -30,6 +32,10 @@ use uc_api::ws::{EventCategory, WsMessage};
 const ACK_DELAY: Duration = Duration::from_millis(100);
 /// Highest time between signal reads in seconds.
 const MAX_SIGNAL_POLL_SECS: u16 = 3600;
+/// Longest time for the resolve of one entered host name and the identify of all its IP
+/// addresses. The resolve takes at most 3 s, and an address that cannot be reached fails after
+/// about 3 s of connect tries: this leaves time for two such addresses.
+const ENTERED_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Start the setup flow.
 #[derive(Debug, Message)]
@@ -96,16 +102,15 @@ impl Found {
         }
     }
 
-    /// A receiver that the user gave the address of. `host`: the entered host name.
+    /// A receiver that the user gave the address of.
     fn from_identified(
-        address: String,
-        host: Option<String>,
+        entered: Entered,
         id: &discovery::Identified,
         has_tuner: Option<bool>,
     ) -> Self {
         Self {
-            address,
-            host,
+            address: entered.address,
+            host: entered.host,
             name: id.name.clone(),
             model: id.model.clone(),
             serial: id.serial.clone(),
@@ -359,39 +364,82 @@ impl Entered {
         }
     }
 
-    /// The host name `host` with the first of its IP addresses where the receiver of `cfg` answers,
-    /// or a receiver that cannot be compared with it. If none answers, the first IP address. If the
-    /// name cannot be resolved, the name.
-    async fn resolve(host: String, cfg: DeviceConfig) -> Self {
-        let ips = resolve_name(&host).await;
-        let mut address = None;
-        for ip in &ips {
-            match discovery::identify(ip, None).await {
-                Ok(avr) => {
-                    let info = avr.info();
-                    let same = cfg
-                        .same_receiver(info.serial_number.as_deref(), info.mac_address.as_deref());
-                    if same != Some(false) {
-                        address = Some(ip.clone());
-                        break;
-                    }
-                    debug!("[{host}] another receiver answers at {ip}");
+    /// The host name `host` with the first of its IP addresses where the receiver with `ids`
+    /// answers, or a receiver that cannot be compared with it. If none answers within `limit`, the
+    /// first IP address. If the name cannot be resolved in that time, the name. `limit` includes
+    /// the resolve.
+    async fn resolve(host: String, ids: ReceiverIds, limit: Duration) -> Self {
+        let deadline = Instant::now() + limit;
+        let mut ips = Vec::new();
+        let answered = tokio::time::timeout_at(deadline, async {
+            ips = resolve_name(&host).await;
+            for (i, ip) in ips.iter().enumerate() {
+                match discovery::identify(ip, None).await {
+                    Ok(avr) if ids.same(avr.info()) != Some(false) => return Some(i),
+                    Ok(_) => debug!("[{host}] another receiver answers at {ip}"),
+                    Err(e) => debug!("[{host}] address {ip} failed: {e}"),
                 }
-                Err(e) => debug!("[{host}] address {ip} failed: {e}"),
             }
-        }
+            None
+        })
+        .await
+        .unwrap_or_else(|_| {
+            info!("[{host}] no answer within {limit:?}");
+            None
+        });
+        let address = match answered {
+            Some(i) => ips.swap_remove(i),
+            None if !ips.is_empty() => ips.swap_remove(0),
+            None => host.clone(),
+        };
         Self {
-            address: address
-                .or_else(|| ips.into_iter().next())
-                .unwrap_or_else(|| host.clone()),
+            address,
             host: Some(host),
         }
     }
 }
 
+/// The serial number and the MAC address of a configured receiver, to find it at an address.
+struct ReceiverIds {
+    serial: Option<String>,
+    mac: Option<String>,
+}
+
+impl ReceiverIds {
+    fn of(cfg: &DeviceConfig) -> Self {
+        Self {
+            serial: cfg.serial().map(str::to_owned),
+            mac: cfg.mac().map(str::to_owned),
+        }
+    }
+
+    /// Whether the receiver of `info` is this one. See [`same_ids`].
+    fn same(&self, info: &denon_marantz::Info) -> Option<bool> {
+        same_ids(
+            self.serial.as_deref(),
+            self.mac.as_deref(),
+            info.serial_number.as_deref(),
+            info.mac_address.as_deref(),
+        )
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The IP addresses of each host name in the tests on this thread. Empty: no name can be
+    /// resolved. `None`: the system resolves the names.
+    static TEST_RESOLVE: std::cell::RefCell<Option<Vec<String>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
 /// The IP addresses of a host name. Empty if it cannot be resolved within
 /// [`discovery::NETWORK_RETRY_TIMEOUT`].
 async fn resolve_name(host: &str) -> Vec<String> {
+    #[cfg(test)]
+    if let Some(ips) = TEST_RESOLVE.with(|slot| slot.borrow().clone()) {
+        return ips;
+    }
     match tokio::time::timeout(discovery::NETWORK_RETRY_TIMEOUT, discovery::resolve(host)).await {
         Ok(Ok(ips)) => {
             info!("[{host}] host name resolved to {ips:?}");
@@ -424,9 +472,25 @@ fn set_options(cfg: &mut DeviceConfig, address: Option<&Entered>, options: Optio
 
 /// Copy from the configured device `old` the fields that the setup does not read from the
 /// receiver: the id, the fields that the driver does not use, and the names and the form of the
-/// tuner presets that the receiver reported.
+/// tuner presets that the receiver reported. [`take_unused`] takes the same fields.
 fn keep_unused(cfg: &mut DeviceConfig, old: &DeviceConfig) {
+    keep_unused_values(cfg, old);
     cfg.id.clone_from(&old.id);
+    cfg.tuner_preset_names.clone_from(&old.tuner_preset_names);
+    cfg.network_favorite_names
+        .clone_from(&old.network_favorite_names);
+}
+
+/// The same as [`keep_unused`], but moves the id and the names out of `old`.
+fn take_unused(cfg: &mut DeviceConfig, old: DeviceConfig) {
+    keep_unused_values(cfg, &old);
+    cfg.id = old.id;
+    cfg.tuner_preset_names = old.tuner_preset_names;
+    cfg.network_favorite_names = old.network_favorite_names;
+}
+
+/// Copy the fields that [`keep_unused`] and [`take_unused`] copy by value.
+const fn keep_unused_values(cfg: &mut DeviceConfig, old: &DeviceConfig) {
     cfg.id_kind = old.id_kind;
     cfg.update_audyssey = old.update_audyssey;
     cfg.zone2 = old.zone2;
@@ -434,9 +498,6 @@ fn keep_unused(cfg: &mut DeviceConfig, old: &DeviceConfig) {
     cfg.timeout = old.timeout;
     cfg.volume_step = old.volume_step;
     cfg.tuner_presets_lettered = old.tuner_presets_lettered;
-    cfg.tuner_preset_names.clone_from(&old.tuner_preset_names);
-    cfg.network_favorite_names
-        .clone_from(&old.network_favorite_names);
 }
 
 impl Handler<SetupDriverMsg> for Controller {
@@ -679,19 +740,18 @@ impl Controller {
                 let address = address.filter(|a| a != device.cfg.shown_address());
                 match address {
                     Some(host) if !is_ip(&host) => {
-                        let cfg = device.cfg.clone();
-                        ctx.spawn(Entered::resolve(host, cfg).into_actor(self).map(
-                            move |entered, act, ctx| {
-                                if act.is_setup_flow(flow, &ws_id) {
-                                    let change = DeviceChange::Configure {
-                                        key,
-                                        address: Some(entered),
-                                        options,
-                                    };
-                                    act.apply_after_save(ws_id, change, ctx);
-                                }
-                            },
-                        ));
+                        let ids = ReceiverIds::of(&device.cfg);
+                        let resolve = Entered::resolve(host, ids, ENTERED_TIMEOUT);
+                        ctx.spawn(resolve.into_actor(self).map(move |entered, act, ctx| {
+                            if act.is_setup_flow(flow, &ws_id) {
+                                let change = DeviceChange::Configure {
+                                    key,
+                                    address: Some(entered),
+                                    options,
+                                };
+                                act.apply_after_save(ws_id, change, ctx);
+                            }
+                        }));
                     }
                     address => {
                         let change = DeviceChange::Configure {
@@ -877,6 +937,7 @@ impl Controller {
             "settings" => ConfigAction::Settings,
             "add" => ConfigAction::Add,
             "remove" if self.devices.contains_key(key) => ConfigAction::Remove(key.to_owned()),
+            "remove" => return Err(unknown_device()),
             "configure" => ConfigAction::Configure(Box::new(
                 self.devices
                     .get(key)
@@ -884,9 +945,8 @@ impl Controller {
                     .cfg
                     .clone(),
             )),
-            "remove" => return Err(unknown_device()),
             "backup" => ConfigAction::Backup(
-                backup_json(&self.sorted_configs())
+                backup_json(&sorted_configs(&self.devices))
                     .filter(|_| !self.devices.is_empty())
                     .ok_or_else(|| invalid("Nothing to back up".into()))?,
             ),
@@ -1029,8 +1089,10 @@ impl Controller {
     }
 
     /// Queue the write of `config.json` with the change. The devices in memory are not changed.
-    /// Gives the result of the write and [`Controller::config_writes`] after the write was
+    /// Gives the result of the write and [`ConfigStore::device_writes`] after the write was
     /// queued.
+    ///
+    /// [`ConfigStore::device_writes`]: crate::config_store::ConfigStore::device_writes
     fn save_change(
         &mut self,
         change: &DeviceChange,
@@ -1080,15 +1142,16 @@ impl Controller {
             warn!("Saving the configuration failed: {e}");
             IntegrationSetupError::Other
         })?;
-        self.config_writes = self.config_writes.wrapping_add(1);
-        Ok((save, self.config_writes))
+        Ok((save, self.store.device_writes()))
     }
 
     /// Change the devices in memory after `config.json` was written with the change. The change
     /// is applied to the configuration as it is now: device actors can change it during the
-    /// write. `writes` is [`Controller::config_writes`] after the write of the change was
+    /// write. `writes` is [`ConfigStore::device_writes`] after the write of the change was
     /// queued. If other writes were queued after it, or if the change failed, the file is written
     /// again from memory.
+    ///
+    /// [`ConfigStore::device_writes`]: crate::config_store::ConfigStore::device_writes
     fn apply_change(
         &mut self,
         ws_id: &str,
@@ -1122,7 +1185,7 @@ impl Controller {
                 }
             }
             DeviceChange::Add {
-                mut cfg,
+                cfg,
                 update,
                 replace,
             } => {
@@ -1134,10 +1197,10 @@ impl Controller {
                         self.remove_other_devices(cfg.key());
                     }
                     if let Some(device) = self.devices.get_mut(cfg.key()) {
+                        let old = std::mem::replace(&mut device.cfg, *cfg);
                         if update {
-                            keep_unused(&mut cfg, &device.cfg);
+                            take_unused(&mut device.cfg, old);
                         }
-                        device.cfg = *cfg;
                         device.send_config();
                     } else {
                         self.add_device(*cfg, ctx);
@@ -1149,7 +1212,7 @@ impl Controller {
         // Entities can come or go, for example when the connection mode changes. New devices
         // connect if a Remote uses them.
         self.purge_entities();
-        if result.is_err() || self.config_writes != writes {
+        if result.is_err() || self.store.device_writes() != writes {
             info!("[{ws_id}] writing the configuration again from memory");
             if let Err(e) = self.queue_devices() {
                 warn!("[{ws_id}] saving the configuration failed: {e}");
@@ -1196,11 +1259,11 @@ impl Controller {
     /// Remove all devices but the one with `key`, and the cached states of their entities. Memory
     /// only: the caller writes the file.
     fn remove_other_devices(&mut self, key: &str) {
-        let keys: Vec<String> = self
+        let keys: Vec<Arc<str>> = self
             .devices
             .keys()
             .filter(|k| ***k != *key)
-            .map(ToString::to_string)
+            .cloned()
             .collect();
         for key in &keys {
             self.remove_device(key);
@@ -1209,7 +1272,7 @@ impl Controller {
 
     /// Replace all devices with the devices of a backup. Memory only: the caller writes the file.
     fn restore_devices(&mut self, devices: Vec<DeviceConfig>, ctx: &Context<Self>) {
-        let keys: Vec<String> = self.devices.keys().map(ToString::to_string).collect();
+        let keys: Vec<Arc<str>> = self.devices.keys().cloned().collect();
         for key in &keys {
             self.remove_device(key);
         }
@@ -1229,7 +1292,7 @@ impl Controller {
             Some(SetupState::Discover) => Some(discover_page()),
             Some(SetupState::RestoreChoice) => Some(restore_choice_page(self.driver_settings)),
             Some(SetupState::Restore) => Some(restore_page()),
-            Some(SetupState::Backup) => backup_json(&self.sorted_configs())
+            Some(SetupState::Backup) => backup_json(&sorted_configs(&self.devices))
                 .as_deref()
                 .map(backup_page),
             Some(SetupState::ConfigMode) => Some(self.config_mode_page()),
@@ -1323,8 +1386,7 @@ impl Controller {
     }
 
     fn config_mode_page(&self) -> Value {
-        let mut devices: Vec<_> = self.devices.values().map(|d| &d.cfg).collect();
-        devices.sort_unstable_by(|a, b| a.cmp_list_order(b));
+        let devices = sorted_configs(&self.devices);
         let mut items: Vec<Value> = devices
             .iter()
             .map(|c| json!({ "id": c.id, "label": { "en": format!("{} ({} - {})", c.name, c.id, c.shown_address()) } }))
@@ -1487,12 +1549,12 @@ fn configure_page(cfg: &DeviceConfig) -> Value {
 /// The receivers at one address, or all that answer the search.
 async fn find_receivers(address: Option<String>) -> Result<Vec<Found>, AvrError> {
     if let Some(entered) = address {
-        let (avr, address, host) = identify_entered(entered).await?;
+        let EnteredAvr { avr, at } = identify_entered(entered, ENTERED_TIMEOUT).await?;
         let id = discovery::Identified::new(&avr).map_err(|reason| {
-            AvrError::InvalidRequest(format!("[{address}] not used: {reason}"))
+            AvrError::InvalidRequest(format!("[{}] not used: {reason}", at.address))
         })?;
         let tuner = detect_tuner(&avr).await;
-        return Ok(vec![Found::from_identified(address, host, &id, tuner)]);
+        return Ok(vec![Found::from_identified(at, &id, tuner)]);
     }
     let receivers = discovery::discover().await?;
     // The search does not say if the receiver has Dirac or a tuner: ask each one.
@@ -1504,30 +1566,70 @@ async fn find_receivers(address: Option<String>) -> Result<Vec<Found>, AvrError>
         .collect())
 }
 
+/// A receiver that answered at an entered address.
+struct EnteredAvr {
+    avr: Avr,
+    /// The address that answered, and the entered host name.
+    at: Entered,
+}
+
 /// Identify the receiver at an entered address. A host name is resolved: the first of its IP
 /// addresses that answers is used. If it cannot be resolved, the receiver is identified by the
-/// name. Gives the receiver, the address that answered and the host name.
-async fn identify_entered(entered: String) -> Result<(Avr, String, Option<String>), AvrError> {
+/// name. If no address answers, the error of the last one. A host name gets `limit` for all of
+/// it, the resolve included. After that, the error of the last address that failed, or a
+/// timeout.
+async fn identify_entered(entered: String, limit: Duration) -> Result<EnteredAvr, AvrError> {
     if is_ip(&entered) {
         let avr = discovery::identify(&entered, None).await?;
-        return Ok((avr, entered, None));
+        return Ok(EnteredAvr {
+            avr,
+            at: Entered::ip(entered),
+        });
     }
-    let ips = resolve_name(&entered).await;
+    let deadline = Instant::now() + limit;
     let mut last_error = None;
-    for ip in ips {
-        match discovery::identify(&ip, None).await {
-            Ok(avr) => return Ok((avr, ip, Some(entered))),
-            Err(e) => {
-                debug!("[{entered}] address {ip} failed: {e}");
-                last_error = Some(e);
+    let answered = tokio::time::timeout_at(deadline, async {
+        let ips = resolve_name(&entered).await;
+        if ips.is_empty() {
+            let result = discovery::identify(&entered, None).await;
+            return Some(result.map(|avr| (avr, entered.clone())));
+        }
+        for ip in ips {
+            match discovery::identify(&ip, None).await {
+                Ok(avr) => return Some(Ok((avr, ip))),
+                Err(e) => {
+                    debug!("[{entered}] address {ip} failed: {e}");
+                    last_error = Some(e);
+                }
             }
         }
+        None
+    })
+    .await;
+    let (avr, address) = match answered {
+        Ok(Some(result)) => result?,
+        Ok(None) => return Err(last_error.unwrap_or_else(|| no_answer(&entered, limit))),
+        Err(_) => {
+            info!("[{entered}] no answer within {limit:?}");
+            return Err(last_error.unwrap_or_else(|| no_answer(&entered, limit)));
+        }
+    };
+    Ok(EnteredAvr {
+        avr,
+        at: Entered {
+            address,
+            host: Some(entered),
+        },
+    })
+}
+
+/// The error of an entered host name that got no answer within `limit`.
+fn no_answer(entered: &str, limit: Duration) -> AvrError {
+    AvrError::Timeout {
+        request: format!("identify {entered}"),
+        limit,
+        sent: true,
     }
-    if let Some(e) = last_error {
-        return Err(e);
-    }
-    let avr = discovery::identify(&entered, None).await?;
-    Ok((avr, entered.clone(), Some(entered)))
 }
 
 /// Time to wait for the answer of a receiver to the Dirac question.
@@ -1822,7 +1924,8 @@ mod tests {
         use crate::config_store::DeviceConfig;
         use crate::config_store::backup_json;
         use crate::controller::handler::setup::{
-            DeviceChange, Entered, Options, SetDriverUserDataMsg, SetupDriverMsg,
+            DeviceChange, Entered, Options, ReceiverIds, SetDriverUserDataMsg, SetupDriverMsg,
+            TEST_RESOLVE, identify_entered,
         };
         use crate::controller::test_util::{
             DeviceAddr, FlushStore, Subscribed, SubscribesAll, TestRemote, config_file, connect,
@@ -2131,7 +2234,7 @@ mod tests {
             let controller = controller("restore-valid", None);
             let events = connect(&controller, "a").await;
             let devices: Vec<DeviceConfig> = serde_json::from_str(PYTHON_CONFIG).expect("devices");
-            let backup = backup_json(&devices).expect("backup");
+            let backup = backup_json(&devices.iter().collect::<Vec<_>>()).expect("backup");
             controller
                 .send(start_setup("a", false))
                 .await
@@ -2868,7 +2971,7 @@ mod tests {
             let events = connect(&controller, "a").await;
             let mut other = python_device();
             other.id = "OTHER0000001".into();
-            let backup = backup_json(&[other]).expect("backup");
+            let backup = backup_json(&[&other]).expect("backup");
             block_config_writes(name);
             controller
                 .send(start_setup("a", false))
@@ -3197,6 +3300,204 @@ mod tests {
             setup_fake(&controller, &events, true).await;
             wait_state(&events, "ERROR").await;
             assert_eq!(json!("NOT_FOUND"), last(&events)["error"]);
+        }
+
+        #[actix::test]
+        async fn a_failed_write_of_an_added_receiver_keeps_the_receivers() {
+            let _fake = fake_receiver().await;
+            let name = "add-write-fails";
+            let controller = controller(name, Some(PYTHON_CONFIG));
+            let events = connect(&controller, "a").await;
+            block_config_writes(name);
+            // A first setup: the added receiver would replace the configured one.
+            setup_fake(&controller, &events, false).await;
+            controller
+                .send(values(
+                    "a",
+                    &[("choice", FAKE_HOST), ("connection_mode", "use_http")],
+                ))
+                .await
+                .expect("send")
+                .expect("ok");
+            wait_state(&events, "ERROR").await;
+            assert_eq!(json!("OTHER"), last(&events)["error"]);
+            assert!(controller_cfg(&controller, "SERIAL0000001").await.is_some());
+            assert!(controller_cfg(&controller, "0123456789AB").await.is_none());
+            controller.send(FlushStore).await.expect("send");
+            let config = config_file(name);
+            assert_eq!(1, config.as_array().expect("list").len());
+            assert_eq!(json!("SERIAL0000001"), config[0]["id"]);
+        }
+
+        /// The host name of the tests that resolve names with [`resolve_to`].
+        const HOST_NAME: &str = "receiver.test";
+        /// The first IP address of [`HOST_NAME`].
+        const FIRST_IP: &str = "192.0.2.1";
+        /// The second IP address of [`HOST_NAME`].
+        const SECOND_IP: &str = "192.0.2.2";
+
+        /// Each host name resolves to these IP addresses on this thread. Empty: no name can be
+        /// resolved.
+        fn resolve_to(ips: &[&str]) {
+            let ips = ips.iter().map(|ip| (*ip).to_owned()).collect();
+            TEST_RESOLVE.with(|slot| *slot.borrow_mut() = Some(ips));
+        }
+
+        /// The receivers and the setup on this thread connect to the HTTP port `first` for
+        /// [`FIRST_IP`], and to `rest` for all other addresses. The search finds nothing.
+        fn ports_by_address(first: u16, rest: u16) {
+            let setup: crate::device::discovery::TestBuilder = std::rc::Rc::new(move |host, _| {
+                let port = if host == FIRST_IP { first } else { rest };
+                crate::test_support::test_builder(port, 1, denon_marantz::Avr::builder(FAKE_HOST))
+            });
+            crate::device::discovery::TEST_BUILDER.with(|slot| *slot.borrow_mut() = Some(setup));
+            crate::device::discovery::TEST_DISCOVERY
+                .with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+        }
+
+        /// Choose the receiver at `address` in HTTP mode, wait for the end of the setup and give
+        /// the saved receiver.
+        async fn choose_at(
+            controller: &Addr<Controller>,
+            events: &TestRemote,
+            name: &str,
+            address: &str,
+        ) -> Value {
+            controller
+                .send(values(
+                    "a",
+                    &[("choice", address), ("connection_mode", "use_http")],
+                ))
+                .await
+                .expect("send")
+                .expect("ok");
+            wait_state(events, "OK").await;
+            controller.send(FlushStore).await.expect("send");
+            config_file(name)[0].clone()
+        }
+
+        #[actix::test]
+        async fn the_options_skip_another_receiver_at_the_first_address_of_a_host_name() {
+            let receiver = crate::test_support::Fake::start(true).await;
+            let other = crate::test_support::Fake::start_with_info(
+                b"<Device_Info><CommApiVers>0301</CommApiVers><ModelName>AVC-X3700H</ModelName>\
+                <DeviceZones>2</DeviceZones><MacAddress>0123456789AC</MacAddress></Device_Info>",
+            )
+            .await;
+            ports_by_address(other.port(), receiver.port());
+            resolve_to(&[FIRST_IP, SECOND_IP]);
+            // The MAC address of `receiver`.
+            let config = PYTHON_CONFIG.replace(r#""name""#, r#""mac": "0123456789AB", "name""#);
+            let controller = controller("configure-other-first", Some(&config));
+            let events = connect(&controller, "a").await;
+            let (_, cfg) = configure_address(&controller, &events, HOST_NAME).await;
+            assert_eq!(
+                (SECOND_IP, Some(HOST_NAME)),
+                (cfg.address.as_str(), cfg.host.as_deref())
+            );
+        }
+
+        #[actix::test]
+        async fn a_host_name_that_cannot_be_resolved_is_added_by_the_name() {
+            let _fake = fake_receiver().await;
+            resolve_to(&[]);
+            let name = "add-name-not-resolved";
+            let controller = controller(name, None);
+            let events = connect(&controller, "a").await;
+            setup_fake_at(&controller, &events, false, HOST_NAME).await;
+            let page = last(&events);
+            let choice = &page["require_user_action"]["input"]["settings"][0]["field"]["dropdown"];
+            assert_eq!(json!(HOST_NAME), choice["value"]);
+            let device = choose_at(&controller, &events, name, HOST_NAME).await;
+            assert_eq!(json!(HOST_NAME), device["address"]);
+            assert_eq!(json!(HOST_NAME), device["host"]);
+        }
+
+        #[actix::test]
+        async fn a_host_name_is_added_with_the_first_address_that_answers() {
+            let receiver = crate::test_support::Fake::start(true).await;
+            // Nothing answers at the first address.
+            ports_by_address(1, receiver.port());
+            resolve_to(&[FIRST_IP, SECOND_IP]);
+            let name = "add-second-address";
+            let controller = controller(name, None);
+            let events = connect(&controller, "a").await;
+            setup_fake_at(&controller, &events, false, HOST_NAME).await;
+            let device = choose_at(&controller, &events, name, SECOND_IP).await;
+            assert_eq!(json!(SECOND_IP), device["address"]);
+            assert_eq!(json!(HOST_NAME), device["host"]);
+        }
+
+        /// A port of the loopback address that takes connections and never answers. Abort the
+        /// task to close it.
+        async fn silent_port() -> (u16, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind((FAKE_HOST, 0))
+                .await
+                .expect("bind");
+            let port = listener.local_addr().expect("address").port();
+            let task = tokio::spawn(async move {
+                #[expect(
+                    clippy::collection_is_never_read,
+                    reason = "keeps the connections open"
+                )]
+                let mut open = Vec::new();
+                while let Ok((socket, _)) = listener.accept().await {
+                    open.push(socket);
+                }
+            });
+            (port, task)
+        }
+
+        #[actix::test]
+        async fn the_addresses_of_a_host_name_get_one_time_limit() {
+            let (port, task) = silent_port().await;
+            ports_by_address(port, port);
+            resolve_to(&[FIRST_IP, SECOND_IP]);
+            // The identify of each address takes at least the request time of the tests (500 ms).
+            let limit = Duration::from_millis(200);
+            let Err(error) = identify_entered(HOST_NAME.into(), limit).await else {
+                panic!("no error");
+            };
+            assert!(error.is_timeout(), "{error}");
+            // The error of the limit, not of an address.
+            assert_eq!(
+                Some(format!("identify {HOST_NAME}").as_str()),
+                error.request()
+            );
+
+            // The first address fails at once and the second one has no answer: the error of
+            // the first address.
+            ports_by_address(1, port);
+            let Err(error) = identify_entered(HOST_NAME.into(), limit).await else {
+                panic!("no error");
+            };
+            assert_ne!(
+                Some(format!("identify {HOST_NAME}").as_str()),
+                error.request(),
+                "{error}"
+            );
+            ports_by_address(port, port);
+
+            // Three addresses: a limit for each address would take at least 1.5 s.
+            resolve_to(&[FIRST_IP, SECOND_IP, "192.0.2.3"]);
+            let ids = ReceiverIds {
+                serial: None,
+                mac: None,
+            };
+            let start = std::time::Instant::now();
+            let limit = Duration::from_millis(600);
+            let entered = Entered::resolve(HOST_NAME.into(), ids, limit).await;
+            // The same as when no address answers: the first one.
+            assert_eq!(
+                Entered {
+                    address: FIRST_IP.into(),
+                    host: Some(HOST_NAME.into()),
+                },
+                entered
+            );
+            let elapsed = start.elapsed();
+            assert!(elapsed < Duration::from_millis(1200), "{elapsed:?}");
+            task.abort();
         }
     }
 }

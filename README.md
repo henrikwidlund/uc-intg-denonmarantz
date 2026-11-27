@@ -148,17 +148,20 @@ Commands with a number are sent as raw text with the remote entity:
 - The setup accepts an IP address or a host name. For a host name, the driver saves the name (`host` in
   `config.json`) and its IP address (`address`). It connects to the IP address, so a normal connect does not
   look up the name. It uses the first IP address where the receiver answers. The setup waits at most 3 seconds
-  for the name. When you add a receiver and the setup cannot look up the name, it connects with the
-  name; if that fails, nothing is saved. When you change the address of a configured receiver, the setup saves
-  the first IP address if the receiver answers at none, and the name as the address if it cannot look up the
-  name. If `address` in `config.json` is a host name and `host` is not set, the driver moves the name to `host`
-  when it saves a new address.
+  for the name, and at most 10 seconds for the name and all its IP addresses together. When you add a receiver
+  and the setup cannot look up the name, it connects with the name; if that fails, nothing is saved. When you
+  add a receiver and no address answers in this time, nothing is saved. When you change the address of a
+  configured receiver, the setup saves the first IP address if the receiver answers at none in this time, and
+  the name as the address if it cannot look up the name. If `address` in `config.json` is a host name and
+  `host` is not set, the driver moves the name to `host` when it saves a new address.
 - After the Remote wakes up, the network of the Remote can be down for a short time. The driver tries again
   for up to 3 seconds. A connection to the receiver that does not open in 0.25 seconds is tried again. A start or
   lookup of the receiver that takes more than 3 times as long as the fastest of the last 5 starts (at least 0.2
   seconds) is started again, at most 4 times. There is no such limit for the first connect, or if that start took
   more than about 0.7 seconds. If telnet or HEOS cannot connect after wake-up, they are tried again every 0.05
   seconds for 3 seconds, then less often (HEOS only if the receiver has it).
+- When the telnet connection gets no data for 10 seconds, the driver asks the receiver for its power state. When
+  it gets no data for 20 seconds, the connection counts as lost and the driver connects again.
 - A command that comes while the first connect runs waits until it ends, within the 9 seconds below. It is not
   sent if the Remote goes to standby or the setup connects again during the wait. Commands that do not need the
   state of the receiver (power, volume, mute, cursor keys, back, info, raw text, and next, previous and stop on
@@ -440,9 +443,11 @@ WARN lines. A run in the background (for example with `&`) whose input is the te
 you bring it back with `fg`. Start such a run with `< /dev/null`: then no question is asked.
 
 ```shell
-cargo build --release
 cargo run --release --manifest-path tools/remote-sim/Cargo.toml -- <receiver address>
 ```
+
+Before it starts the driver, the tool builds it with `cargo build --release --locked` in the repository folder.
+If the build fails, the tool stops before it connects to the receiver.
 
 Options:
 
@@ -478,6 +483,7 @@ Options:
   and must then still get an answer to a request. The driver closes a connection after 40 s without a message,
   so only the answers to the pings of the driver keep it open.
 - `--host-name <name>`: the host name of the receiver for the `address_lookup` check.
+- `--no-build` does not build the driver: the tool starts the driver binary as it is. `--driver` does the same.
 - `--no-power` skips the power check. The other checks still switch the receiver on if it is off.
 - `--no-oracle` does not open the second connection. The values are then not compared with the receiver.
   Without the second connection the volume cannot be read from the receiver, so the checks do not switch the
@@ -495,8 +501,8 @@ Options:
   without `RUST_LOG`, because `RUST_LOG` overrides the debug log option of the setup. It sets
   `settings.json` back at the end.
   The trace shows the full telnet and HEOS lines only if the driver is built with
-  `cargo build --release --features sensitive-logs`. These lines can hold titles and account names: do not
-  share such a log.
+  `cargo build --release --features sensitive-logs`. Start the tool with `--no-build` then, else its own
+  build replaces that binary. These lines can hold titles and account names: do not share such a log.
 
 The results go to `test-results/remote-sim-results-<time>.md` in the repository folder. To check only the
 selects and the switches:

@@ -1856,6 +1856,118 @@ async fn another_receiver_at_the_stored_address_is_not_used() {
     assert!(!statuses().contains(&DeviceStatus::Connected));
 }
 
+/// The device information of another receiver: its MAC address is not the one of [`cfg`].
+const OTHER_INFO: &[u8] =
+    b"<Device_Info><CommApiVers>0301</CommApiVers><ModelName>AVC-X3700H</ModelName>\
+    <DeviceZones>2</DeviceZones><MacAddress>AABBCCDDEEFF</MacAddress></Device_Info>";
+
+/// The stored address of [`other_at_the_stored_address`]. Another receiver answers there.
+const OTHER_HOST: &str = "localhost";
+/// The address of the receiver of the configuration in [`other_at_the_stored_address`].
+const OWN_HOST: &str = "127.0.0.1";
+
+/// The actor and the fakes of [`other_at_the_stored_address`].
+struct OtherAtStored {
+    _actor: Addr<DenonActor>,
+    events: Arc<Mutex<Vec<DeviceEvent>>>,
+    other: (Fake, FakeTelnet),
+    own: (Fake, FakeTelnet),
+}
+
+/// An actor that connects without stored receiver values. Another receiver answers at the stored
+/// address [`OTHER_HOST`], the receiver of the configuration at [`OWN_HOST`]. `host` is the stored
+/// host name, `discovered` what the search finds.
+async fn other_at_the_stored_address(
+    host: Option<&str>,
+    discovered: Vec<DiscoveredReceiver>,
+) -> OtherAtStored {
+    let other = (
+        Fake::start_with_info(OTHER_INFO).await,
+        FakeTelnet::start(answers_all).await,
+    );
+    let own = (
+        Fake::start(true).await,
+        FakeTelnet::start(answers_all).await,
+    );
+    let other_ports = (other.0.port(), other.1.port);
+    let own_ports = (own.0.port(), own.1.port);
+    let setup: TestBuilder = Rc::new(move |host, builder| {
+        let (http, telnet) = if host == OTHER_HOST {
+            other_ports
+        } else {
+            own_ports
+        };
+        test_builder(http, telnet, builder)
+    });
+    TEST_BUILDER.with(|slot| *slot.borrow_mut() = Some(setup));
+    TEST_DISCOVERY.with(|slot| *slot.borrow_mut() = Some(discovered));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let collector = Collector(events.clone()).start();
+    let cfg = DeviceConfig {
+        address: OTHER_HOST.into(),
+        host: host.map(Into::into),
+        ..cfg()
+    };
+    let actor = DenonActor::new("SERIAL0000001".into(), cfg, collector.recipient())
+        .with_retry_delay(QUICK)
+        .start();
+    actor.send(Connect).await.expect("connect");
+    OtherAtStored {
+        _actor: actor,
+        events,
+        other,
+        own,
+    }
+}
+
+/// The actor connects to the receiver of the configuration at [`OWN_HOST`] and not to the other
+/// one.
+async fn connects_to_the_own_receiver(rig: &OtherAtStored) {
+    until("the new address", 10, || {
+        configs(&rig.events).iter().any(|c| c.address == OWN_HOST)
+    })
+    .await;
+    until("the connection", 5, || rig.own.1.connections() >= 1).await;
+    assert!(
+        rig.other.0.description_reads() >= 1,
+        "the stored address is tried"
+    );
+    assert_eq!(
+        0,
+        rig.other.1.connections(),
+        "the other receiver is not used"
+    );
+    assert_eq!(0, status_count(&rig.events, DeviceStatus::Error));
+}
+
+#[actix::test]
+async fn another_receiver_at_the_stored_address_makes_the_host_name_be_tried() {
+    let rig = other_at_the_stored_address(Some(OWN_HOST), Vec::new()).await;
+    connects_to_the_own_receiver(&rig).await;
+}
+
+#[actix::test]
+async fn another_receiver_at_the_stored_address_makes_the_receiver_be_searched() {
+    let found = DiscoveredReceiver {
+        host: OWN_HOST.into(),
+        brand: Brand::Denon,
+        manufacturer: "Denon".into(),
+        model_name: None,
+        friendly_name: None,
+        serial_number: None,
+        mac_address: Some(FAKE_MAC.into()),
+        type_proof: TypeProof::Read,
+    };
+    let rig = other_at_the_stored_address(None, vec![found]).await;
+    connects_to_the_own_receiver(&rig).await;
+    // The stored address was a host name: it is kept.
+    let saved = configs(&rig.events)
+        .into_iter()
+        .find(|c| c.address == OWN_HOST)
+        .expect("saved");
+    assert_eq!(Some(OTHER_HOST), saved.host.as_deref());
+}
+
 #[actix::test]
 async fn repeat_and_shuffle_go_to_heos_until_their_deadline() {
     let heos = FakeHeos::start("127.0.0.1", HeosItem::song()).await;
@@ -2603,7 +2715,7 @@ async fn a_command_waits_until_a_long_connect_ends() {
         .expect("send")
         .expect("mute toggle");
     assert!(
-        start.elapsed() > Duration::from_secs(3),
+        start.elapsed() > discovery::NETWORK_RETRY_TIMEOUT,
         "{:?}",
         start.elapsed()
     );
@@ -2611,6 +2723,63 @@ async fn a_command_waits_until_a_long_connect_ends() {
     until("the command", 5, || mute_lines(&rig) >= 1).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(1, mute_lines(&rig));
+}
+
+/// A rig whose first connect has no stored receiver values and takes longer than
+/// [`discovery::NETWORK_RETRY_TIMEOUT`].
+async fn slow_first_connect_rig() -> Rig {
+    let http = Fake::start(true).await;
+    // The identify and the start each read once: about 4 s.
+    http.set_read_delay(Duration::from_secs(2));
+    rig_on_timeout(http, |_| cfg(), answers_all, QUICK, Duration::from_secs(8)).await
+}
+
+#[actix::test]
+async fn a_command_waits_longer_than_the_retry_time_for_the_first_connect() {
+    let rig = slow_first_connect_rig().await;
+    let start = Instant::now();
+    rig.actor
+        .send(media_command("mute_toggle"))
+        .await
+        .expect("send")
+        .expect("mute toggle");
+    assert!(
+        start.elapsed() > discovery::NETWORK_RETRY_TIMEOUT,
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(1, status_count(&rig.events, DeviceStatus::Connected));
+    until("the command", 5, || mute_lines(&rig) >= 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(1, mute_lines(&rig));
+}
+
+#[actix::test]
+async fn a_remote_run_waits_longer_than_the_retry_time_for_the_first_connect() {
+    let rig = slow_first_connect_rig().await;
+    let start = Instant::now();
+    let params = serde_json::json!({ "sequence": ["cursor_up"], "repeat": 3 });
+    let run = Command::new(
+        EntityKind::Remote,
+        "send_cmd_sequence".into(),
+        params.as_object().cloned(),
+    );
+    rig.actor.send(run).await.expect("send").expect("run");
+    until("connected", 15, || {
+        status_count(&rig.events, DeviceStatus::Connected) >= 1
+    })
+    .await;
+    // The steps need the connection: the run waited this long.
+    assert!(
+        start.elapsed() > discovery::NETWORK_RETRY_TIMEOUT,
+        "{:?}",
+        start.elapsed()
+    );
+    let sent =
+        || rig.telnet.count("MNCUP") + rig.http.commands().iter().filter(|c| *c == "MNCUP").count();
+    until("the steps", 5, || sent() >= 3).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(3, sent());
 }
 
 #[actix::test]

@@ -7,6 +7,7 @@
 
 use crate::oracle::Oracle;
 use crate::{Fail, Options, checks};
+use denon_marantz::proto::Power;
 use denon_marantz::proto::telnet::EventZone;
 use denon_marantz::{Ask, Avr, Command, Zone};
 use std::path::PathBuf;
@@ -110,7 +111,11 @@ pub async fn read(avr: &Avr, queries: &[&str]) -> Result<Vec<String>, Fail> {
         if !for_main_zone(event.zone) {
             continue;
         }
-        let line = format!("{}{}", event.event.code(), event.parameter);
+        let mut line = format!("{}{}", event.event.code(), event.parameter);
+        if line.starts_with(SOURCE) {
+            // Like the library: spaces after the source code are not part of it.
+            line.truncate(line.trim_end().len());
+        }
         let Some(query) = position(&line).map(|i| QUERIES[i]) else {
             continue;
         };
@@ -153,17 +158,22 @@ fn position(line: &str) -> Option<usize> {
 }
 
 /// Lines that set a value. `CVEND` ends the list of channel levels, and `MSQUICK` is a quick
-/// select memory: both are not settings.
+/// select memory: both are not settings. A source line without a code sets nothing.
 fn is_saved(line: &str) -> bool {
-    position(line).is_some() && line != "CVEND" && !line.starts_with("MSQUICK")
+    position(line).is_some()
+        && line != "CVEND"
+        && !line.starts_with("MSQUICK")
+        && line
+            .strip_prefix(SOURCE)
+            .is_none_or(|code| source_code(code).is_some())
 }
 
 /// Send the saved lines that differ from the receiver, read with `queries`. Lines that did not come
 /// back are sent once more. A source and a speaker preset that differ are sent first, each alone,
 /// and the receiver is read again after each. Nothing is sent, or nothing more, if the source
 /// differs and the main zone is not on, if the receiver did not take the source or does not report
-/// it later, or if another source than a marked one (see [`mark_source`]) is selected or there is
-/// more than one marked line. Then all lines without the marked ones are returned as
+/// it later, or if another source than a marked one (see [`mark_source`]) is selected or the marked
+/// lines do not hold exactly one code. Then all lines without the marked ones are returned as
 /// [`Missed::NotSent`]. Else returns as [`Missed::Lines`] the lines that the receiver did not take:
 /// they have a different value when read again.
 pub async fn write(avr: &Avr, queries: &[&str], lines: &[String]) -> Result<Missed, Fail> {
@@ -190,9 +200,7 @@ pub async fn write(avr: &Avr, queries: &[&str], lines: &[String]) -> Result<Miss
             .find(|line| line.starts_with(prefix) && !taken(&now, line))
         {
             // A source command can switch the zone on, at a volume that nothing lowers here.
-            if prefix == SOURCE
-                && avr.snapshot().zone(Zone::Main).power != Some(denon_marantz::proto::Power::On)
-            {
+            if prefix == SOURCE && avr.snapshot().zone(Zone::Main).power != Some(Power::On) {
                 return Ok(Missed::NotSent(lines.to_vec()));
             }
             send(avr, std::slice::from_ref(line)).await?;
@@ -399,10 +407,11 @@ pub fn mark_source(lines: &mut [String]) {
 }
 
 /// The receiver has `line`. A source line counts only if the receiver gave exactly one source: with
-/// two, the source changed during the read.
+/// two, the source changed during the read. A source line without a code sets nothing, so it
+/// counts as taken.
 fn taken(now: &[String], line: &str) -> bool {
     match line.strip_prefix(SOURCE) {
-        Some(code) => single_code(now, SOURCE) == Some(code),
+        Some(code) => source_code(code).is_none_or(|code| single_code(now, SOURCE) == Some(code)),
         None => now.iter().any(|l| l == line),
     }
 }
@@ -418,16 +427,24 @@ pub fn ensure_source(lines: &[String]) -> Result<(), Fail> {
     Ok(())
 }
 
-/// The source of the saved lines. `None` if there is no source line, or more than one: the source
-/// changed during the read, and none of them is known to be the start source.
+/// The source of the saved lines. `None` if no line has a source code, or more than one does: the
+/// source changed during the read, and none of them is known to be the start source.
 pub fn saved_source(lines: &[String]) -> Option<&str> {
     single_code(lines, SOURCE)
 }
 
-/// The code of the only line that starts with `prefix`. `None` if there is no such line, or more
-/// than one.
+/// The source code after `SI`, without spaces at the end, like the library reads it. `None` for a
+/// blank code.
+fn source_code(code: &str) -> Option<&str> {
+    Some(code.trim_end()).filter(|code| !code.is_empty())
+}
+
+/// The source code of the only line that starts with `prefix`. `None` if there is no such line, or
+/// more than one. Lines with a blank code are left out.
 fn single_code<'a>(lines: &'a [String], prefix: &str) -> Option<&'a str> {
-    let mut codes = lines.iter().filter_map(|l| l.strip_prefix(prefix));
+    let mut codes = lines
+        .iter()
+        .filter_map(|l| l.strip_prefix(prefix).and_then(source_code));
     match (codes.next(), codes.next()) {
         (Some(code), None) => Some(code),
         _ => None,
@@ -516,7 +533,7 @@ pub async fn after_early_stop(opt: &Options) -> Option<String> {
 }
 
 /// Why the saved source is not the source now and cannot be set back. `None` if the lines have no
-/// source, if it is the source now, or if it can be set back. A marked source (see
+/// source line, if it is the source now, or if it can be set back. A marked source (see
 /// [`mark_source`]) is never set back. Some settings are kept for each source, so without the
 /// saved source no setting is sent.
 async fn source_refused(oracle: &Oracle, opt: &Options, lines: &[String]) -> Option<String> {
@@ -534,16 +551,14 @@ async fn source_refused(oracle: &Oracle, opt: &Options, lines: &[String]) -> Opt
             Some(code) => Some(format!(
                 "the start source {code} is not selected, and this file does not set it back"
             )),
-            None => Some("more than one saved source".to_owned()),
+            None => Some("no single saved source".to_owned()),
         };
     }
     match saved_source(lines) {
         Some(code) if zone.source.as_deref() == Some(code) => None,
-        None => Some("more than one saved source".to_owned()),
+        None => Some("no single saved source".to_owned()),
         // A source command can switch the zone on, at a volume that nothing lowers here.
-        Some(_) if zone.power != Some(denon_marantz::proto::Power::On) => {
-            Some("the main zone is not on".to_owned())
-        }
+        Some(_) if zone.power != Some(Power::On) => Some("the main zone is not on".to_owned()),
         Some(code) => checks::source_set_back(oracle, opt, code).await,
     }
 }
@@ -596,6 +611,27 @@ mod tests {
         assert!(!taken(&two, "SITV"), "changed during the read");
         assert!(taken(&two, "MSSTEREO"));
         assert!(taken(&lines(&["SITV"]), "SITV"));
+    }
+
+    #[test]
+    fn source_codes_are_trimmed_and_blank_codes_are_ignored() {
+        let lines = |l: &[&str]| l.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(Some("TV"), saved_source(&lines(&["SITV  ", "MSSTEREO"])));
+        assert_eq!(Some("TV"), saved_source(&lines(&["SITV", "SI", "SI  "])));
+        assert_eq!(None, saved_source(&lines(&["SI", "MSSTEREO"])));
+        assert_eq!(None, saved_source(&lines(&["SI "])));
+        assert_eq!(
+            Some("BD"),
+            single_code(&lines(&["#SIBD ", "#SI"]), MARKED_SOURCE)
+        );
+        assert!(taken(&lines(&["SITV "]), "SITV"));
+        assert!(taken(&lines(&["SITV"]), "SITV "));
+        assert!(taken(&lines(&["SITV", "SI"]), "SITV"), "blank code");
+        assert!(taken(&lines(&["SIBD"]), "SI "), "sets nothing");
+        assert!(!taken(&lines(&["SIBD"]), "SITV "));
+        assert!(!is_saved("SI"));
+        assert!(!is_saved("SI  "));
+        assert!(is_saved("SITV"));
     }
 
     #[test]

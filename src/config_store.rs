@@ -17,7 +17,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv6Addr};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
@@ -306,10 +306,12 @@ impl DeviceConfig {
         &self.id
     }
 
-    /// The order of the receivers in lists and in the configuration file: by name, then by key.
+    /// The order of the receivers in lists and in the configuration file: by name, ignoring upper
+    /// and lower case, then by the exact name, then by key.
     pub fn cmp_list_order(&self, other: &Self) -> std::cmp::Ordering {
-        self.name
-            .cmp(&other.name)
+        lowercase(&self.name)
+            .cmp(lowercase(&other.name))
+            .then_with(|| self.name.cmp(&other.name))
             .then_with(|| self.key().cmp(other.key()))
     }
 
@@ -329,16 +331,9 @@ impl DeviceConfig {
         }
     }
 
-    /// Whether a receiver with this serial number and MAC address is this one. The MAC address is
-    /// compared if both are known, else the serial number. `None` if neither can be compared.
+    /// Whether a receiver with this serial number and MAC address is this one. See [`same_ids`].
     pub fn same_receiver(&self, serial: Option<&str>, mac: Option<&str>) -> Option<bool> {
-        if let (Some(a), Some(b)) = (self.mac().and_then(parse_mac), mac.and_then(parse_mac)) {
-            return Some(a == b);
-        }
-        if let (Some(a), Some(b)) = (self.serial(), serial) {
-            return Some(a == b);
-        }
-        None
+        same_ids(self.serial(), self.mac(), serial, mac)
     }
 
     /// The address for the user: the host name if there is one, else `address`.
@@ -674,13 +669,36 @@ pub const fn missing_union(a: MissingSources, b: MissingSources) -> MissingSourc
     }
 }
 
+/// The characters of `text` in lower case.
+fn lowercase(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.chars().flat_map(char::to_lowercase)
+}
+
+/// Whether two receivers are the same: `a` with its serial number and MAC address, and `b` with
+/// its own. The MAC addresses are compared if both are known, else the serial numbers. `None` if
+/// neither can be compared.
+pub fn same_ids(
+    a_serial: Option<&str>,
+    a_mac: Option<&str>,
+    b_serial: Option<&str>,
+    b_mac: Option<&str>,
+) -> Option<bool> {
+    if let (Some(a), Some(b)) = (a_mac.and_then(parse_mac), b_mac.and_then(parse_mac)) {
+        return Some(a == b);
+    }
+    if let (Some(a), Some(b)) = (a_serial, b_serial) {
+        return Some(a == b);
+    }
+    None
+}
+
 /// Version of the backup format.
 const BACKUP_VERSION: u8 = 1;
 
 #[derive(Serialize)]
 struct BackupRef<'a> {
     version: u8,
-    devices: &'a [DeviceConfig],
+    devices: &'a [&'a DeviceConfig],
 }
 
 #[derive(Deserialize)]
@@ -690,7 +708,7 @@ struct Backup {
 }
 
 /// Serialize the devices for a backup.
-pub fn backup_json(devices: &[DeviceConfig]) -> Option<String> {
+pub fn backup_json(devices: &[&DeviceConfig]) -> Option<String> {
     serde_json::to_string(&BackupRef {
         version: BACKUP_VERSION,
         devices,
@@ -733,18 +751,27 @@ pub fn load_settings(dir: &Path) -> DriverSettings {
 }
 
 /// Reads and writes the configuration files.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ConfigStore {
     dir: PathBuf,
-    writer: Arc<Writer>,
+    writer: Writer,
+    /// See [`Self::device_writes`].
+    device_writes: u64,
 }
 
 impl ConfigStore {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
             dir: dir.into(),
-            writer: Arc::new(Writer::new()),
+            writer: Writer::new(),
+            device_writes: 0,
         }
+    }
+
+    /// The number of queued writes of `config.json`. It wraps around at the end of its range. A
+    /// caller compares it to find writes that were queued after its own.
+    pub const fn device_writes(&self) -> u64 {
+        self.device_writes
     }
 
     /// Wait until all queued writes are done. For tests.
@@ -790,8 +817,9 @@ impl ConfigStore {
     }
 
     /// Queue the save of the configured devices. The write runs on the writer thread: the caller
-    /// does not wait for the disk, and gets the result from the returned [`SaveWait`].
-    pub fn save_devices(&self, devices: &[&DeviceConfig]) -> io::Result<SaveWait> {
+    /// does not wait for the disk, and gets the result from the returned [`SaveWait`]. Counts the
+    /// write in [`Self::device_writes`].
+    pub fn save_devices(&mut self, devices: &[&DeviceConfig]) -> io::Result<SaveWait> {
         let data = serde_json::to_vec_pretty(&devices).map_err(io::Error::other)?;
         let (tx, rx) = oneshot::channel();
         self.writer.send(Job::Write {
@@ -800,14 +828,18 @@ impl ConfigStore {
             private: true,
             done: Some(tx),
         });
+        self.device_writes = self.device_writes.wrapping_add(1);
         info!("Saving the configuration with {} device(s)", devices.len());
         Ok(SaveWait(rx))
     }
 
     /// Queue the save of the configured devices and return at once. A write error is only
-    /// logged. Use it where no caller waits for the result.
-    pub fn queue_devices(&self, devices: &[&DeviceConfig]) -> io::Result<()> {
-        self.write_json(self.dir.join(CONFIG_FILE), devices, true)
+    /// logged. Use it where no caller waits for the result. Counts the write in
+    /// [`Self::device_writes`].
+    pub fn queue_devices(&mut self, devices: &[&DeviceConfig]) -> io::Result<()> {
+        self.write_json(self.dir.join(CONFIG_FILE), devices, true)?;
+        self.device_writes = self.device_writes.wrapping_add(1);
+        Ok(())
     }
 
     /// Queue the save of the driver settings. A write error is only logged.
@@ -1588,7 +1620,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("uc-intg-denonmarantz-test-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("dir");
-        let store = ConfigStore::new(&dir);
+        let mut store = ConfigStore::new(&dir);
         assert_eq!(Vec::<DeviceConfig>::new(), store.load_devices());
 
         // A file left from a failed write must not keep its mode.
@@ -1607,6 +1639,7 @@ mod tests {
         store.queue_devices(&[&devices[0]]).expect("queue");
         store.writer.flush();
         assert_eq!(devices, store.load_devices());
+        assert_eq!(3, store.device_writes());
 
         #[cfg(unix)]
         {
@@ -1624,13 +1657,59 @@ mod tests {
     #[test]
     fn backup_round_trip() {
         let devices = vec![device()];
-        let text = backup_json(&devices).expect("backup");
+        let text = backup_json(&[&devices[0]]).expect("backup");
         assert_eq!(Some(devices), parse_backup(&format!("  {text}\n")));
     }
 
     #[test]
+    fn the_list_order_ignores_the_case_of_the_name() {
+        let named = |name: &str, id: &str| DeviceConfig {
+            name: name.into(),
+            id: id.into(),
+            ..device()
+        };
+        let mut devices = [
+            named("living room", "B"),
+            named("ärm", "A"),
+            named("Kitchen", "A"),
+            named("Living Room", "C"),
+            named("living room", "A"),
+            named("Äpple", "A"),
+        ];
+        devices.sort_unstable_by(DeviceConfig::cmp_list_order);
+        let order: Vec<(&str, &str)> = devices.iter().map(|d| (d.name.as_str(), d.key())).collect();
+        assert_eq!(
+            vec![
+                ("Kitchen", "A"),
+                // The same name without case: the exact name, then the key.
+                ("Living Room", "C"),
+                ("living room", "A"),
+                ("living room", "B"),
+                ("Äpple", "A"),
+                ("ärm", "A"),
+            ],
+            order
+        );
+    }
+
+    #[test]
+    fn the_same_receiver_is_found_by_the_ids() {
+        let mac = Some("01:23:45:67:89:AB");
+        assert_eq!(
+            Some(true),
+            same_ids(Some("A"), mac, Some("B"), Some("0123456789ab"))
+        );
+        assert_eq!(
+            Some(false),
+            same_ids(Some("A"), mac, Some("A"), Some("0123456789AC"))
+        );
+        assert_eq!(Some(true), same_ids(Some("A"), mac, Some("A"), None));
+        assert_eq!(None, same_ids(None, mac, Some("A"), None));
+    }
+
+    #[test]
     fn invalid_backups_are_rejected() {
-        let valid = backup_json(&[device()]).expect("backup");
+        let valid = backup_json(&[&device()]).expect("backup");
         assert_eq!(None, parse_backup(""));
         assert_eq!(None, parse_backup("{broken"));
         assert_eq!(None, parse_backup(&valid[..valid.len() - 2]));

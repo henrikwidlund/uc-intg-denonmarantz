@@ -4,6 +4,7 @@
 //! The driver as a child process. mDNS is off, so the driver needs no root rights.
 
 use crate::Fail;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -39,6 +40,13 @@ impl Driver {
     /// sets the debug log.
     pub async fn start_with(&mut self, rust_log: bool) -> Result<(), Fail> {
         self.stop().await;
+        // Another process on the port would look like a started driver.
+        if TcpStream::connect(("127.0.0.1", self.port)).await.is_ok() {
+            return Err(Fail::new(format!(
+                "port {} is used by another process. Stop it or use --port",
+                self.port
+            )));
+        }
         // The child process needs a file of the standard library.
         let log = tokio::fs::OpenOptions::new()
             .create(true)
@@ -70,10 +78,8 @@ impl Driver {
             .map_err(|e| Fail::new(format!("cannot start {}: {e}", self.bin.display())))?;
         self.child = Some(child);
         let deadline = Instant::now() + Duration::from_secs(10);
-        while TcpStream::connect(("127.0.0.1", self.port)).await.is_err() {
-            if Instant::now() > deadline {
-                return Err(Fail::new("the driver does not listen after 10 s"));
-            }
+        loop {
+            // The process check comes first: a port that answers counts only while the driver runs.
             if let Some(status) = self
                 .child
                 .as_mut()
@@ -81,9 +87,14 @@ impl Driver {
             {
                 return Err(Fail::new(format!("the driver ended at start: {status}")));
             }
+            if TcpStream::connect(("127.0.0.1", self.port)).await.is_ok() {
+                return Ok(());
+            }
+            if Instant::now() > deadline {
+                return Err(Fail::new("the driver does not listen after 10 s"));
+            }
             sleep(Duration::from_millis(50)).await;
         }
-        Ok(())
     }
 
     pub async fn stop(&mut self) {
@@ -102,11 +113,35 @@ impl Driver {
         self.dir.join("config.json")
     }
 
+    /// The whole driver log. Empty if it cannot be read.
     pub async fn log_text(&self) -> String {
-        tokio::fs::read_to_string(&self.log)
-            .await
-            .unwrap_or_default()
+        self.log_from(0).await
     }
+
+    /// The driver log after byte `start`. Empty if it cannot be read. Bytes that are not UTF-8,
+    /// for example a character cut at `start` or at the end of a write, become U+FFFD.
+    pub async fn log_from(&self, start: u64) -> String {
+        let path = self.log.clone();
+        let read = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+            let mut file = std::fs::File::open(path)?;
+            let size = file.metadata()?.len().saturating_sub(start);
+            let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+            if start > 0 {
+                file.seek(SeekFrom::Start(start))?;
+            }
+            file.read_to_end(&mut bytes)?;
+            Ok(bytes)
+        });
+        match read.await {
+            Ok(Ok(bytes)) => lossy(bytes),
+            _ => String::new(),
+        }
+    }
+}
+
+/// `bytes` as text. Bytes that are not UTF-8 become U+FFFD. Valid text is not copied.
+fn lossy(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 /// Log filter of the driver. Checks read its info and debug lines. A `RUST_LOG` of the caller is
@@ -123,6 +158,44 @@ fn log_filter(caller: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_used_port_is_not_taken_for_a_started_driver() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = std::env::temp_dir().join(format!("remote-sim-port-test-{}", std::process::id()));
+        let mut driver = Driver::new(Path::new("none"), &dir, port);
+        let error = driver.start_with(true).await.expect_err("port used");
+        assert!(
+            error.to_string().contains("is used by another process"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn log_bytes_that_are_not_utf8_are_replaced() {
+        assert_eq!("ab", lossy(b"ab".to_vec()));
+        // A two-byte character cut after its first byte.
+        assert_eq!("a\u{fffd}", lossy(b"a\xc3".to_vec()));
+        assert_eq!("\u{fffd}b", lossy(b"\xa4b".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn the_log_is_read_from_an_offset() {
+        let dir = std::env::temp_dir().join(format!("remote-sim-log-test-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let driver = Driver::new(Path::new("none"), &dir, 0);
+        assert_eq!("", driver.log_text().await, "no file");
+        tokio::fs::write(&driver.log, "ab\u{e4}cd").await.unwrap();
+        assert_eq!("ab\u{e4}cd", driver.log_text().await);
+        assert_eq!("cd", driver.log_from(4).await);
+        assert_eq!("\u{fffd}cd", driver.log_from(3).await, "cut character");
+        assert_eq!("", driver.log_from(100).await, "after the end");
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
+    }
 
     #[test]
     fn caller_filter_is_added_after_the_default() {

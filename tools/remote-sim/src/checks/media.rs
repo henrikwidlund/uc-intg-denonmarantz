@@ -102,7 +102,7 @@ fn tuner_source(rule: &SourceRule<'_>, old: &str, list: &[String]) -> Result<Str
         return Err("the receiver has no TUNER source".to_owned());
     };
     if !rule.code_ok("TUNER") {
-        return Err("no tuner source may be selected".to_owned());
+        return Err("the TUNER source may not be selected: it is in --avoid-sources, no --avoid-sources is given, it is not in use or has no name, or the driver shows no tuner".to_owned());
     }
     list.iter()
         .find(|l| label_fits(info, l) && rule.label_ok(l))
@@ -537,7 +537,7 @@ mod tests {
         };
         assert_eq!(
             tuner_source(&no_tuner, "Apple TV", &names),
-            Err("no tuner source may be selected".to_owned())
+            Err("the TUNER source may not be selected: it is in --avoid-sources, no --avoid-sources is given, it is not in use or has no name, or the driver shows no tuner".to_owned())
         );
         let avoided = options(&["oppo", "tuner"]);
         let avoid_rule = SourceRule {
