@@ -4,7 +4,6 @@
 //! Find receivers on the network and connect to them.
 
 use crate::config_store::{self, DeviceConfig, Feature};
-use denon_marantz::proto::source::playing_kind;
 use denon_marantz::proto::{NetworkAudioCommand, PlayingKind, Power};
 use denon_marantz::{
     Ask, Avr, AvrBuilder, Brand, Command, DiscoveredReceiver, Error, HttpConfig, Info, InfoCheck,
@@ -839,7 +838,7 @@ impl Names {
         if state.zone(Zone::Main).power != Some(Power::On) {
             return None;
         }
-        match main_playing_kind(state)? {
+        match state.main_playing_kind()? {
             PlayingKind::Tuner if reads.tuner_presets => Some(Self::TunerPresets),
             PlayingKind::NetAudio if reads.favorites => Some(Self::NetworkFavorites),
             _ => None,
@@ -933,20 +932,6 @@ impl Names {
         }
         Some(merged)
     }
-}
-
-/// What the source of the main zone plays, from its name or the code of a renamed source.
-pub fn main_playing_kind(state: &State) -> Option<PlayingKind> {
-    let source = state.zone(Zone::Main).source.as_deref()?;
-    playing_kind(source).or_else(|| {
-        state
-            .device()
-            .sources
-            .as_slice()
-            .iter()
-            .find(|info| info.name.as_deref() == Some(source))
-            .and_then(|info| playing_kind(&info.code))
-    })
 }
 
 /// What the configuration keeps of the receiver.

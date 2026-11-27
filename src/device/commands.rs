@@ -374,9 +374,7 @@ fn read<T>(avr: &Avr, f: impl FnOnce(&State) -> T) -> T {
 
 /// The main zone plays the HD Radio tuner.
 fn on_hd_radio(avr: &Avr) -> bool {
-    read(avr, |s| {
-        discovery::main_playing_kind(s) == Some(PlayingKind::HdRadio)
-    })
+    read(avr, |s| s.main_playing_kind() == Some(PlayingKind::HdRadio))
 }
 
 /// Run a simple command with this state. The typed call of the library checks the state and the

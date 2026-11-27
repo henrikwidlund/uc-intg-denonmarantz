@@ -38,7 +38,7 @@ const EMIT_DELAY: Duration = Duration::from_millis(50);
 const NAMES_SAVE_DELAY: Duration = Duration::from_secs(1);
 /// A new speaker preset or Dirac filter changes values that the receiver does not send again.
 /// They are read after the burst of events is over.
-const RELOAD_DELAY: Duration = Duration::from_millis(1500);
+pub(super) const RELOAD_DELAY: Duration = Duration::from_millis(1500);
 /// Reads over HTTP that fail in a row, while telnet is down, before the receiver is searched
 /// again.
 const POLL_FAILURES_BEFORE_RECONNECT: u32 = 3;

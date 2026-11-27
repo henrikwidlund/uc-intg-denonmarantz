@@ -22,7 +22,7 @@ dhat-heap = ["dep:dhat"]
 
 [dependencies]
 uc_api = { git = "https://github.com/unfoldedcircle/api-model-rs", rev = "336beb1" }
-denon-marantz = { git = "https://github.com/henrikwidlund/rusty-denon-marantz", rev = "2993c738d1fc731ad5fe3a88a960d16e4c6d6c2b", features = ["mdns", "serde", "heos"] }
+denon-marantz = { git = "https://github.com/henrikwidlund/rusty-denon-marantz", rev = "00d7987c3436ff7b35a2ec63e062487adc0bd726", features = ["mdns", "serde", "heos"] }
 
 # WebSocket server
 actix = "0.13"

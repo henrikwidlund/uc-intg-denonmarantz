@@ -10,8 +10,9 @@ use super::{
 use crate::config_store::{
     CommApiVersion, DeviceConfig, ReceiverGeneration, read_with_quick_selects,
 };
-use denon_marantz::State;
+use denon_marantz::proto::appcommand::Field;
 use denon_marantz::proto::telnet::Message;
+use denon_marantz::{State, Zone};
 use serde_json::json;
 use serde_json::{Map, Value};
 
@@ -260,6 +261,16 @@ fn the_tuner_shows_the_frequency_and_the_band() {
 }
 
 #[test]
+fn a_renamed_tuner_shows_the_frequency() {
+    let cfg = cfg();
+    let mut state = state(&["PWON", "TFAN008750"]);
+    state.apply_renamed_source("TUNER", Some("Radio"));
+    state.apply_field(Zone::Main, Field::InputFunc, Some("Radio"));
+    let player = attrs(&view(&state, &cfg), EntityKind::MediaPlayer);
+    assert_eq!(json!("87.50 MHz"), player["media_title"]);
+}
+
+#[test]
 fn a_paused_player_shows_paused() {
     let cfg = cfg();
     let state = state(&["PWON", "SINET", "NSE0Now Playing", "NSE1A Title"]);
@@ -327,6 +338,12 @@ async fn heos_shows_a_station_as_radio_with_the_station_as_album() {
     assert_eq!(Value::Null, player_attrs["media_position_updated_at"]);
     assert_eq!(json!("OFF"), player_attrs["repeat"]);
     assert_eq!(json!(false), player_attrs["shuffle"]);
+
+    // A renamed network source still shows HEOS.
+    let mut renamed = self::state(&["PWON"]);
+    renamed.apply_renamed_source("NET", Some("Music"));
+    renamed.apply_field(Zone::Main, Field::InputFunc, Some("Music"));
+    assert_eq!(json!("A Stream"), shown(&renamed)["media_title"]);
 
     // Another source: no HEOS, no position.
     let other = shown(&self::state(&["PWON", "SIDVD"]));

@@ -46,9 +46,9 @@ dependencies = [
 
 [[package]]
 name = "actix-http"
-version = "3.22.0"
+version = "3.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50f98f47b03911915aa3f0b856749aa3d3915033afabb295ab6ac5ff3b8bd5c1"
+checksum = "ef789744a2e6e678dd2dee90b2aecc084022709378f28d9d0eee6d7d299e36b8"
 dependencies = [
  "actix-codec",
  "actix-service",
@@ -343,9 +343,9 @@ checksum = "776dfebd015e2d8732c684a2c71003674ccb49457b539b9e82151ba38e96dd7c"
 
 [[package]]
 name = "bytestring"
-version = "1.6.0"
+version = "1.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca79160522b4aed4a69bab673bee78d3884d44240c78c96cb04b7557d532b4dc"
+checksum = "07acef387a61fe24ed2ee3924f1fe89ac9f4b862dfd72b110109133158d7f9f8"
 dependencies = [
  "bytes",
 ]
@@ -364,9 +364,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.11.3"
+version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02f0e023adb368345ce0ca6cdfc0f24a06554468d0e8503e14a0841de79bfa69"
+checksum = "95e45cf2980b2d467be49a9ed942c9179b701063a7ca3d037de7ee9bd67f8d66"
 dependencies = [
  "find-msvc-tools",
  "shlex",
@@ -555,7 +555,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=2993c738d1fc731ad5fe3a88a960d16e4c6d6c2b#2993c738d1fc731ad5fe3a88a960d16e4c6d6c2b"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=00d7987c3436ff7b35a2ec63e062487adc0bd726#00d7987c3436ff7b35a2ec63e062487adc0bd726"
 dependencies = [
  "bytes",
  "denon-marantz-discovery",
@@ -577,7 +577,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz-discovery"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=2993c738d1fc731ad5fe3a88a960d16e4c6d6c2b#2993c738d1fc731ad5fe3a88a960d16e4c6d6c2b"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=00d7987c3436ff7b35a2ec63e062487adc0bd726#00d7987c3436ff7b35a2ec63e062487adc0bd726"
 dependencies = [
  "http 1.5.0",
 ]
@@ -585,7 +585,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz-heos"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=2993c738d1fc731ad5fe3a88a960d16e4c6d6c2b#2993c738d1fc731ad5fe3a88a960d16e4c6d6c2b"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=00d7987c3436ff7b35a2ec63e062487adc0bd726#00d7987c3436ff7b35a2ec63e062487adc0bd726"
 dependencies = [
  "denon-marantz-heos-proto",
  "denon-marantz-shared",
@@ -598,7 +598,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz-heos-proto"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=2993c738d1fc731ad5fe3a88a960d16e4c6d6c2b#2993c738d1fc731ad5fe3a88a960d16e4c6d6c2b"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=00d7987c3436ff7b35a2ec63e062487adc0bd726#00d7987c3436ff7b35a2ec63e062487adc0bd726"
 dependencies = [
  "serde",
  "serde_json",
@@ -608,7 +608,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz-proto"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=2993c738d1fc731ad5fe3a88a960d16e4c6d6c2b#2993c738d1fc731ad5fe3a88a960d16e4c6d6c2b"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=00d7987c3436ff7b35a2ec63e062487adc0bd726#00d7987c3436ff7b35a2ec63e062487adc0bd726"
 dependencies = [
  "quick-xml",
  "serde",
@@ -618,7 +618,7 @@ dependencies = [
 [[package]]
 name = "denon-marantz-shared"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=2993c738d1fc731ad5fe3a88a960d16e4c6d6c2b#2993c738d1fc731ad5fe3a88a960d16e4c6d6c2b"
+source = "git+https://github.com/henrikwidlund/rusty-denon-marantz?rev=00d7987c3436ff7b35a2ec63e062487adc0bd726#00d7987c3436ff7b35a2ec63e062487adc0bd726"
 dependencies = [
  "socket2",
  "thiserror",
@@ -739,9 +739,9 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "find-msvc-tools"
-version = "0.1.15"
+version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
+checksum = "3e44f110d1777dc6559a51e7d45083945ded4f1bf3305494350f693b6d20b9c8"
 
 [[package]]
 name = "flume"
@@ -971,9 +971,9 @@ dependencies = [
 
 [[package]]
 name = "hyper"
-version = "1.12.0"
+version = "1.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c3e324da4c95177d6291d4c8730197c0d1822f8a9766814a4a44fa5ab797c9c"
+checksum = "229c6ff5584df4c6becbfe00567128bac768c8cd32ebc8a8366bd81ed072e8f3"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -1206,12 +1206,12 @@ dependencies = [
 
 [[package]]
 name = "jiff"
-version = "1.0.2"
+version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5e77cbfb9fff4798e283c2d69dff39fc2c45e7da017e5ce95b654e46ea41236"
+checksum = "107f2e89536b6818514025f6787b0d94d819e54fe3b40365275fc753de485b3f"
 dependencies = [
- "jiff-core 1.0.1",
- "jiff-static 1.0.2",
+ "jiff-core 1.0.2",
+ "jiff-static 1.0.3",
  "jiff-tzdb-platform 1.0.0",
  "log",
  "portable-atomic",
@@ -1231,9 +1231,9 @@ dependencies = [
 
 [[package]]
 name = "jiff-core"
-version = "1.0.1"
+version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6b46a105a9874634dd96231021526bf24ca04955a5998c59a9c7666e634b7b8"
+checksum = "d44c923edf2bf456a982253f1a9ee1f6e89e421dffd0065d9b9a581da0def58f"
 dependencies = [
  "log",
 ]
@@ -1252,11 +1252,11 @@ dependencies = [
 
 [[package]]
 name = "jiff-static"
-version = "1.0.2"
+version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9067a0b23e5be3147d56b2dcf652b18e6b1364caca93fb157653b6fbcab23a9"
+checksum = "4996f71e569e3a3e32b925c28ef8f0027dc30bb1d594b33eeda409eea185f5c8"
 dependencies = [
- "jiff-core 1.0.1",
+ "jiff-core 1.0.2",
  "proc-macro2",
  "quote",
  "syn 3.0.10",
@@ -1844,7 +1844,7 @@ dependencies = [
  "indexmap 1.9.3",
  "indexmap 2.14.2",
  "jiff 0.2.46",
- "jiff 1.0.2",
+ "jiff 1.0.3",
  "schemars 0.9.0",
  "schemars 1.2.3",
  "serde_core",
@@ -2153,9 +2153,9 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "1.2.2+spec-1.1.0"
+version = "1.2.3+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5426cb1b964690d913f6c5c1a1ae0b42f428ec506bb4d452876d7a209c9bca3b"
+checksum = "26b1f26e9485c1fa43ee89fe76e9f3fb9e2e52bb227f8594b4d687496b83d073"
 dependencies = [
  "indexmap 2.14.2",
  "serde_core",
@@ -2177,9 +2177,9 @@ dependencies = [
 
 [[package]]
 name = "toml_parser"
-version = "1.1.6+spec-1.1.0"
+version = "1.1.7+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6769c452d71ba30696c6b37770c439a9cc9110f47f7d5cdbeda79840ef5ea31"
+checksum = "0bb28d6e049a9766c3bd91a8326e6179f5b132dec87906bb97018ef7a2f3431a"
 dependencies = [
  "winnow",
 ]
@@ -2284,7 +2284,7 @@ dependencies = [
  "dhat",
  "futures",
  "hostname",
- "jiff 1.0.2",
+ "jiff 1.0.3",
  "log",
  "mdns-sd",
  "rust-fsm",

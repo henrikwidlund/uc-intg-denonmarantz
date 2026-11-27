@@ -10,7 +10,6 @@ use crate::errors::ServiceError;
 use denon_marantz::heos::{MediaType, NowPlaying, PlayState, PlayerState, RepeatMode};
 use denon_marantz::proto::PlayingKind;
 use denon_marantz::proto::Power;
-use denon_marantz::proto::source::{is_playing_source, playing_kind};
 use denon_marantz::{State, ValueRange, Zone};
 use serde_json::{Map, Value, json};
 use std::str::FromStr;
@@ -214,7 +213,7 @@ pub fn attributes(v: &View<'_>, out: &mut Map<String, Value>) {
     // As in the Python integration: a source that does not play media shows its name as the title.
     // The tuner shows the frequency, the band and the station when there is no other text.
     let now = &device.now_playing;
-    let playing_source = zone.source.as_deref().is_some_and(is_playing_source);
+    let playing_source = v.state.main_playing_kind().is_some();
     let title = if playing_source {
         now.title.clone().or_else(|| sensor::tuner_text(device))
     } else {
@@ -271,12 +270,7 @@ fn heos_player<'a>(v: &View<'a>) -> Option<&'a PlayerState> {
 /// The main zone plays network audio and HEOS plays, is paused or has an item. Then the media
 /// player shows HEOS, and play, pause, stop, next and previous go to HEOS.
 pub fn uses_heos(state: &State, player: &PlayerState) -> bool {
-    let net_audio = state
-        .zone(Zone::Main)
-        .source
-        .as_deref()
-        .is_some_and(|s| playing_kind(s) == Some(PlayingKind::NetAudio));
-    net_audio
+    state.main_playing_kind() == Some(PlayingKind::NetAudio)
         && (matches!(player.play_state, Some(PlayState::Play | PlayState::Pause))
             || player.current_media().is_some_and(|m| !m.is_empty()))
 }

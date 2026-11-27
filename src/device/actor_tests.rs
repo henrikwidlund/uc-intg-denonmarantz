@@ -6,7 +6,8 @@
 //! sends events or closes the connection.
 
 use super::actor::{
-    CurrentAvr, HoldCommandLock, Refreshing, Resend, read_differently, send_again, send_command,
+    CurrentAvr, HoldCommandLock, RELOAD_DELAY, Refreshing, Resend, read_differently, send_again,
+    send_command,
 };
 use super::commands;
 use super::discovery::{
@@ -487,7 +488,9 @@ async fn the_same_signal_time_in_another_form_does_not_connect_again() {
 async fn a_new_source_reads_only_the_digital_codec_again() {
     let rig = rig(answers_all, QUICK).await;
     after_the_extra_values(&rig).await;
-    let (codec, monitor) = (rig.telnet.count("DC?"), rig.telnet.count("VSMONI ?"));
+    // The source of the start also reads the codec again, after a wait.
+    let codec = stable_count(&rig, "DC?", RELOAD_DELAY + Duration::from_millis(300)).await;
+    let monitor = rig.telnet.count("VSMONI ?");
     rig.telnet.send("SIGAME");
     // The read comes after a short wait, so that a burst of events is read once.
     until("the second read", 5, || rig.telnet.count("DC?") > codec).await;
@@ -533,11 +536,16 @@ async fn a_dynamic_eq_change_reads_only_the_reference_level() {
 /// change for a while.
 async fn dynamic_eq_queries_after_the_start(rig: &Rig) -> usize {
     until("the first query", 5, || rig.telnet.count("PSDYNEQ ?") >= 1).await;
-    let mut last = rig.telnet.count("PSDYNEQ ?");
+    stable_count(rig, "PSDYNEQ ?", Duration::from_millis(1200)).await
+}
+
+/// The number of times that `line` was received, once it has not changed for `quiet`.
+async fn stable_count(rig: &Rig, line: &str, quiet: Duration) -> usize {
+    let mut last = rig.telnet.count(line);
     let mut since = Instant::now();
-    while since.elapsed() < Duration::from_millis(1200) {
+    while since.elapsed() < quiet {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let now = rig.telnet.count("PSDYNEQ ?");
+        let now = rig.telnet.count(line);
         if now != last {
             last = now;
             since = Instant::now();
@@ -803,20 +811,17 @@ async fn channel_up_and_down_use_the_presets_of_the_source() {
     let rig = rig(answers_all, QUICK).await;
     after_the_extra_values(&rig).await;
     rig.telnet.send("PWON");
-    // A new source reads the digital codec again: then the state has the source.
-    let set_source = async |line: &str| {
-        let codec = rig.telnet.count("DC?");
+    // The library asks for the values of the tuner after it applied the new source.
+    let set_source = async |line: &str, query: &str| {
+        let asked = rig.telnet.count(query);
         rig.telnet.send(line);
-        until("the read after the source", 5, || {
-            rig.telnet.count("DC?") > codec
-        })
-        .await;
+        until(query, 5, || rig.telnet.count(query) > asked).await;
     };
     let channel = async |cmd_id: &str| {
         let command = Command::new(EntityKind::MediaPlayer, cmd_id.into(), None);
         rig.actor.send(command).await.expect("send").expect("run");
     };
-    set_source("SIHDRADIO").await;
+    set_source("SIHDRADIO", "TPHD?").await;
     channel("channel_up").await;
     channel("channel_down").await;
     until("the HD Radio presets", 5, || {
@@ -824,7 +829,7 @@ async fn channel_up_and_down_use_the_presets_of_the_source() {
     })
     .await;
     assert_eq!(0, rig.telnet.count("TPANUP") + rig.telnet.count("TPANDOWN"));
-    set_source("SITUNER").await;
+    set_source("SITUNER", "TPAN?").await;
     channel("channel_up").await;
     channel("channel_down").await;
     until("the tuner presets", 5, || {
