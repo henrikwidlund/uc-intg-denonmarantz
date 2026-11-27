@@ -936,7 +936,7 @@ impl Names {
 }
 
 /// What the source of the main zone plays, from its name or the code of a renamed source.
-fn main_playing_kind(state: &State) -> Option<PlayingKind> {
+pub fn main_playing_kind(state: &State) -> Option<PlayingKind> {
     let source = state.zone(Zone::Main).source.as_deref()?;
     playing_kind(source).or_else(|| {
         state

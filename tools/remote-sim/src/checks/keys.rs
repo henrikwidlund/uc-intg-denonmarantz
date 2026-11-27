@@ -270,9 +270,8 @@ fn tuner_now(oracle: &Oracle) -> (Option<u8>, Option<TunerFrequency>) {
 
 /// Why channel up and down are not sent, or `None` if they may be: the driver must show the tuner
 /// entities (`tuner`), the source must be the analog tuner (`code`) and the tuner must be on a
-/// preset (`preset`). Else channel down does not come back to the start frequency. The driver
-/// sends the presets of the analog tuner, so on the HD Radio source they could select the analog
-/// tuner.
+/// preset (`preset`). Else channel down does not come back to the start frequency. The check
+/// compares only the presets of the analog tuner.
 fn channel_skip(tuner: bool, code: Option<&str>, preset: Option<u8>) -> Option<String> {
     if !tuner {
         return Some("the driver shows no tuner entities".to_owned());
@@ -690,7 +689,7 @@ mod tests {
         assert!(channel_skip(true, Some("NET"), Some(1)).is_some());
         assert!(channel_skip(true, Some("TUNER"), None).is_some());
         assert_eq!(channel_skip(true, Some("TUNER"), Some(3)), None);
-        // The driver sends the presets of the analog tuner.
+        // The check compares only the presets of the analog tuner.
         assert!(channel_skip(true, Some("HDRADIO"), Some(3)).is_some());
     }
 

@@ -11,8 +11,8 @@ use crate::entities::{
 };
 use crate::errors::ServiceError;
 use denon_marantz::heos::PlayState;
-use denon_marantz::proto::Power;
 use denon_marantz::proto::telnet::Message;
+use denon_marantz::proto::{PlayingKind, Power};
 use denon_marantz::{Avr, Command, RemoteKey, State, Zone};
 use serde_json::{Map, Value};
 use std::sync::Mutex;
@@ -139,12 +139,13 @@ fn action_without_state(cfg: &DeviceConfig, action: &Action) -> bool {
         | Action::Back
         | Action::ContextMenu
         | Action::Info
-        | Action::ChannelUp
-        | Action::ChannelDown
         | Action::Raw(_) => true,
         Action::Next | Action::Previous | Action::Stop => !cfg.may_have_heos(),
-        // The typed calls check the state, and toggles send the other value.
+        // The typed calls check the state, and toggles send the other value. Channel up and down
+        // read the source: the HD Radio tuner has its own presets.
         Action::Simple(_)
+        | Action::ChannelUp
+        | Action::ChannelDown
         | Action::Toggle
         | Action::PlayPause
         | Action::MuteToggle
@@ -371,6 +372,13 @@ fn read<T>(avr: &Avr, f: impl FnOnce(&State) -> T) -> T {
     f(&avr.state().borrow())
 }
 
+/// The main zone plays the HD Radio tuner.
+fn on_hd_radio(avr: &Avr) -> bool {
+    read(avr, |s| {
+        discovery::main_playing_kind(s) == Some(PlayingKind::HdRadio)
+    })
+}
+
 /// Run a simple command with this state. The typed call of the library checks the state and the
 /// range. A command without one is sent as the text of the table.
 async fn simple_run(
@@ -461,6 +469,8 @@ async fn action_run(
         }
         Action::ContextMenu => send(avr, Command::Options).await?,
         Action::Info => send(avr, Command::Info).await?,
+        Action::ChannelUp if on_hd_radio(avr) => avr.tuner().hd_preset_up().await?,
+        Action::ChannelDown if on_hd_radio(avr) => avr.tuner().hd_preset_down().await?,
         Action::ChannelUp => avr.tuner().preset_up().await?,
         Action::ChannelDown => avr.tuner().preset_down().await?,
         Action::SelectSource(name) => {
@@ -545,6 +555,8 @@ mod tests {
             "mute_toggle",
             "menu",
             "DIMMER_BRIGHT",
+            "channel_up",
+            "channel_down",
         ] {
             assert!(!media(cmd, false), "{cmd}");
         }

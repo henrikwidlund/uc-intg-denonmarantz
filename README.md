@@ -160,8 +160,9 @@ Commands with a number are sent as raw text with the remote entity:
   seconds for 3 seconds, then less often (HEOS only if the receiver has it).
 - A command that comes while the first connect runs waits until it ends, within the 9 seconds below. It is not
   sent if the Remote goes to standby or the setup connects again during the wait. Commands that do not need the
-  state of the receiver (power, volume, mute, cursor keys, back, info, channel up and down, raw text, and next,
-  previous and stop on receivers without HEOS) are sent when the receiver is known, before the start ends.
+  state of the receiver (power, volume, mute, cursor keys, back, info, raw text, and next, previous and stop on
+  receivers without HEOS) are sent when the receiver is known, before the start ends. Channel up and down read
+  the source: on the HD Radio source they go to the HD Radio presets.
   Commands keep their order: a command after one that waits also waits. A command whose connection cannot be
   opened is tried again for up to 3 seconds; a command sent before the start ends stops when the Remote goes to
   standby or wakes up again. If the receiver is not connected and no connect runs, a command fails at once.

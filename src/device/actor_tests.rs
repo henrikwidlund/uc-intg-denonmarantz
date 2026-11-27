@@ -799,6 +799,43 @@ async fn a_repeated_toggle_switches_each_time() {
 }
 
 #[actix::test]
+async fn channel_up_and_down_use_the_presets_of_the_source() {
+    let rig = rig(answers_all, QUICK).await;
+    after_the_extra_values(&rig).await;
+    rig.telnet.send("PWON");
+    // A new source reads the digital codec again: then the state has the source.
+    let set_source = async |line: &str| {
+        let codec = rig.telnet.count("DC?");
+        rig.telnet.send(line);
+        until("the read after the source", 5, || {
+            rig.telnet.count("DC?") > codec
+        })
+        .await;
+    };
+    let channel = async |cmd_id: &str| {
+        let command = Command::new(EntityKind::MediaPlayer, cmd_id.into(), None);
+        rig.actor.send(command).await.expect("send").expect("run");
+    };
+    set_source("SIHDRADIO").await;
+    channel("channel_up").await;
+    channel("channel_down").await;
+    until("the HD Radio presets", 5, || {
+        rig.telnet.count("TPHDUP") == 1 && rig.telnet.count("TPHDDOWN") == 1
+    })
+    .await;
+    assert_eq!(0, rig.telnet.count("TPANUP") + rig.telnet.count("TPANDOWN"));
+    set_source("SITUNER").await;
+    channel("channel_up").await;
+    channel("channel_down").await;
+    until("the tuner presets", 5, || {
+        rig.telnet.count("TPANUP") == 1 && rig.telnet.count("TPANDOWN") == 1
+    })
+    .await;
+    assert_eq!(1, rig.telnet.count("TPHDUP"));
+    assert_eq!(1, rig.telnet.count("TPHDDOWN"));
+}
+
+#[actix::test]
 async fn stop_send_is_answered_while_the_receiver_is_not_connected() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let collector = Collector(events).start();
