@@ -2097,7 +2097,9 @@ async fn restore_sound(ctx: &mut Ctx, old: &str, list: &[String], force: bool) -
         return Ok(());
     }
     let Some(name) = list.iter().find(|m| m.eq_ignore_ascii_case(old)) else {
-        return Err(Fail::new(format!("the old mode {old} is not in the list")));
+        return Err(Fail::new(format!(
+            "the old mode {old} is not in the list {list:?}"
+        )));
     };
     select_sound(ctx, name).await?;
     ctx.client
