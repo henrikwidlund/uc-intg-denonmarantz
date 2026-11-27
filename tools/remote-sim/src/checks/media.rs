@@ -35,7 +35,8 @@ const MEDIA_SECS: u64 = 10;
 /// of the receiver, else the frequency; the artist of the receiver, else the band), and the owner
 /// checks what Bluetooth shows. The step fails if a part fails, and skips only if all parts skip.
 pub async fn media_info(ctx: &mut Ctx) -> Check {
-    // Both parts select a source or play one, so both need the source rule.
+    // The tuner part selects a source and both parts set the start source back, so both need the
+    // source rule.
     if ctx.opt.avoid_sources.is_empty() || ctx.oracle.is_none() {
         return Err(Fail::skip(
             "no --avoid-sources or no second connection: no source is selected",
@@ -240,15 +241,15 @@ fn tuner_mismatch(title: &str, artist: &str, expected: (&str, &str)) -> Option<S
 }
 
 /// The owner plays music from a phone over Bluetooth and says if the media player shows it.
-/// The `BT` source must pass the source rule. At the end a receiver volume above the start volume
-/// is set back, then the source is set back, then the owner stops the music. A skipped set back of
-/// the source makes the part skip if nothing failed.
+/// The source rule does not apply to the `BT` source: the owner selects it. At the end a receiver
+/// volume above the start volume is set back, then the source is set back, then the owner stops
+/// the music. A skipped set back of the source makes the part skip if nothing failed.
 async fn bluetooth_part(ctx: &mut Ctx) -> Check {
     if !terminal() {
         return Err(Fail::skip(not_answered(Answer::Skip, false)));
     }
-    let sources = read_sources(ctx).await.map_err(Fail::skip)?;
-    bt_allowed(&source_rule(ctx, &sources)).map_err(Fail::skip)?;
+    // The input levels must pass `levels_ok`: a higher level makes the source louder.
+    read_sources(ctx).await.map_err(Fail::skip)?;
     let Some(start) = receiver_volume(ctx).await? else {
         return Err(Fail::skip(
             "no second connection: the receiver volume is not known",
@@ -316,17 +317,6 @@ fn with_volume(result: Check, volume: Result<(), Fail>) -> Check {
         (Ok(note), Err(v)) => Err(Fail::new(format!("{note}; {v}"))),
         (Err(e), Err(v)) => Err(Fail::new(format!("{e}; {v}"))),
     }
-}
-
-/// Why the `BT` source may not be selected by the rule `rule`, or `Ok` if it may.
-fn bt_allowed(rule: &SourceRule<'_>) -> Result<(), String> {
-    if rule.info("BT").is_none() {
-        return Err("the receiver has no BT source".to_owned());
-    }
-    if !rule.code_ok("BT") {
-        return Err("the BT source may not be selected".to_owned());
-    }
-    Ok(())
 }
 
 /// Add the answer `stop` of the prompt to stop the music to `result`. An error of the prompt is
@@ -664,48 +654,6 @@ mod tests {
         assert_eq!(not_answered(Answer::Skip, false), "no terminal");
         assert_eq!(not_answered(Answer::Skip, true), "skipped by the owner");
         assert_eq!(not_answered(Answer::NoInput, true), "the input ended");
-    }
-
-    #[test]
-    fn bt_follows_the_source_rule() {
-        let opt = options(&["oppo"]);
-        let sources = [source("BT", "Bluetooth"), source("BD", "OPPO")];
-        let rule = SourceRule {
-            opt: &opt,
-            sources: &sources,
-            tuner: false,
-        };
-        assert_eq!(bt_allowed(&rule), Ok(()));
-        let avoided = options(&["blue"]);
-        let avoid_rule = SourceRule {
-            opt: &avoided,
-            ..rule
-        };
-        assert_eq!(
-            bt_allowed(&avoid_rule),
-            Err("the BT source may not be selected".to_owned())
-        );
-        let mut unused = source("BT", "Bluetooth");
-        unused.in_use = Some(false);
-        let unused = [unused];
-        let unused_rule = SourceRule {
-            sources: &unused,
-            ..rule
-        };
-        assert_eq!(
-            bt_allowed(&unused_rule),
-            Err("the BT source may not be selected".to_owned()),
-            "not in use"
-        );
-        let without = [source("BD", "OPPO")];
-        let no_bt = SourceRule {
-            sources: &without,
-            ..rule
-        };
-        assert_eq!(
-            bt_allowed(&no_bt),
-            Err("the receiver has no BT source".to_owned())
-        );
     }
 
     #[test]

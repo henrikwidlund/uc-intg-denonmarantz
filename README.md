@@ -365,8 +365,9 @@ More checks:
 - `heos` compares the media player with a second HEOS connection, and pauses and plays once if the item can
   pause. If HEOS plays nothing on the main zone, it asks you to start HEOS Music. The question is not asked,
   and the check is skipped, if one of these is true: no terminal, no `--avoid-sources`, no second connection,
-  the HEOS source (`NET`) may not be selected (see `--avoid-sources`), the start source cannot be set back, or
-  the volume is above -40 dB. Once HEOS plays, a volume above -40 dB is lowered to -40 dB and the check fails.
+  the input levels are above 0 dB or not known, the start source cannot be set back, or the volume is above
+  -40 dB. You select the HEOS source (`NET`), so `--avoid-sources` does not apply to it. Once HEOS plays, a
+  volume above -40 dB is lowered to -40 dB and the check fails.
   After this question the check always ends like this, also after a failure: it pauses HEOS if it plays (or
   stops it if the item cannot pause), and sets the start source back (see the source set back below).
 - `media_info` (after `heos`) is skipped without `--avoid-sources` or the second connection. It is also skipped if
@@ -378,10 +379,11 @@ More checks:
     only in telnet mode), a tuner source and the start source may be selected and are in the source list, and
     the volume is at or below -40 dB. If the tuner is the start source, no source is selected.
   - Bluetooth: it asks you to play music from a phone over Bluetooth, then shows the media info and asks if it is
-    right. The part runs only with a terminal, a `BT` source that may be selected and a volume of the receiver and
-    the driver at or below -40 dB. If the volume is above -40 dB when Bluetooth starts, it is lowered to -40 dB and
-    the part fails. Before the question and at the end, a receiver volume above the volume at the start is set
-    back, and the part fails. At the end this comes first.
+    right. The part runs only with a terminal, input levels at or below 0 dB and a volume of the receiver and the
+    driver at or below -40 dB. You select the `BT` source, so `--avoid-sources` does not apply to it. If the
+    volume is above -40 dB when Bluetooth starts, it is lowered to -40 dB and the part fails. Before the question
+    and at the end, a receiver volume above the volume at the start is set back, and the part fails. At the end
+    this comes first.
     Then the start source is set back (see the source set back below), and it asks you to stop the music on the
     phone.
 - `media_keys` (after `remote_commands`) sends the navigation and playback keys of the media player, never a

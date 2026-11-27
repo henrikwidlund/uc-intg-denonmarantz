@@ -5388,11 +5388,11 @@ const HEOS_START_SECS: u64 = 10;
 /// Music, then read the player again and wait for its play state. `started` gets `pid` and the
 /// start source before the question. Skips if there is no terminal, without `--avoid-sources` or
 /// without the second connection, if [`ensure_on`] skips, if the volume is above [`MAX_VOLUME`] or
-/// not known, if [`read_sources`] or [`heos_source_ok`] does not allow [`HEOS_SOURCE`], if
-/// [`start_source_ok`] says that the start source cannot be set back, or if the owner does not
-/// answer. Fails if [`ensure_on`] fails, if the volume or the prompt cannot be read, if HEOS
-/// does not play [`HEOS_START_SECS`] after the answer, or if the volume is above [`MAX_VOLUME`]
-/// once HEOS plays (it is lowered with [`cap_volume`]).
+/// not known, if [`read_sources`] fails, if [`start_source_ok`] says that the start source cannot
+/// be set back, or if the owner does not answer. The source rule does not apply to
+/// [`HEOS_SOURCE`]: the owner selects it. Fails if [`ensure_on`] fails, if the volume or the
+/// prompt cannot be read, if HEOS does not play [`HEOS_START_SECS`] after the answer, or if the
+/// volume is above [`MAX_VOLUME`] once HEOS plays (it is lowered with [`cap_volume`]).
 async fn start_heos(
     ctx: &mut Ctx,
     heos: &denon_marantz_heos::Heos,
@@ -5425,10 +5425,9 @@ async fn start_heos(
         .map_err(|e| if e.skip { not_playing(e.msg) } else { e })?;
     let receiver = receiver_volume(ctx).await?;
     let volume = sound_volume(highest(receiver, driver_volume(ctx).await?)).map_err(not_playing)?;
-    // HEOS Music selects its source: the source rule of a source change applies.
+    // The input levels must pass `levels_ok`: a higher level makes the source louder.
     let sources = read_sources(ctx).await.map_err(not_playing)?;
     let rule = source_rule(ctx, &sources);
-    heos_source_ok(&rule).map_err(not_playing)?;
     // The start source is set back at the end, so it must be one that may be selected.
     let mp = ctx.mp();
     let source = ctx.client.text(&mp, "source");
@@ -5473,16 +5472,6 @@ async fn start_heos(
 
 /// The telnet code of the source that HEOS Music selects.
 const HEOS_SOURCE: &str = "NET";
-
-/// Why the owner may not start HEOS Music, which selects [`HEOS_SOURCE`], or `Ok` if the source
-/// rule `rule` allows that source.
-fn heos_source_ok(rule: &SourceRule<'_>) -> Result<(), String> {
-    if rule.code_ok(HEOS_SOURCE) {
-        Ok(())
-    } else {
-        Err(format!("the HEOS source {HEOS_SOURCE} may not be selected"))
-    }
-}
 
 /// Pause the HEOS player `pid` if it plays, or stop it if the item cannot pause (for example a
 /// station). The player is read again first: the last play event can still be on its way.
@@ -5755,63 +5744,10 @@ mod tests {
         // Two sources with the same name: only the code can tell them apart.
         assert!(now_ok(&rule, None, "Same").is_err());
         assert_eq!(now_ok(&rule, Some("GAME"), "Same"), Ok(()));
-    }
-
-    #[test]
-    fn heos_source_follows_the_source_rule() {
-        let opt = options(&["oppo"]);
-        let sources = [source("NET", Some("HEOS Music"), None)];
-        let rule = SourceRule {
-            opt: &opt,
-            sources: &sources,
-            tuner: false,
-        };
-        assert_eq!(heos_source_ok(&rule), Ok(()));
-        let avoid = options(&["heos"]);
-        assert!(
-            heos_source_ok(&SourceRule {
-                opt: &avoid,
-                ..rule
-            })
-            .is_err()
-        );
-        let mut hidden = source("NET", Some("HEOS Music"), None);
-        hidden.in_use = Some(false);
-        let hidden = [hidden];
-        assert!(
-            heos_source_ok(&SourceRule {
-                sources: &hidden,
-                ..rule
-            })
-            .is_err()
-        );
-        let renamed = [SourceInfo {
-            default_name: Some("HEOS Music".to_owned()),
-            ..source("NET", Some("Stream"), None)
-        }];
+        // A code that the receiver does not list.
         assert_eq!(
-            heos_source_ok(&SourceRule {
-                sources: &renamed,
-                ..rule
-            }),
-            Ok(())
-        );
-        assert!(
-            heos_source_ok(&SourceRule {
-                opt: &avoid,
-                sources: &renamed,
-                ..rule
-            })
-            .is_err(),
-            "the default name counts"
-        );
-        assert!(
-            heos_source_ok(&SourceRule {
-                sources: &[],
-                ..rule
-            })
-            .is_err(),
-            "the receiver did not report the source"
+            now_ok(&rule, Some("NET"), "HEOS Music"),
+            Err("the source NET may not be changed".to_owned())
         );
     }
 
