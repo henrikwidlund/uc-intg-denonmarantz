@@ -209,6 +209,7 @@ impl Fake {
             device_info,
             description_reads: AtomicUsize::new(0),
             read_delay_ms: AtomicU64::new(0),
+            command_delay_ms: AtomicU64::new(0),
             audyssey_answers: AtomicUsize::new(0),
             main_source: Mutex::new("MPLAY"),
         });
@@ -275,6 +276,13 @@ impl Fake {
         self.pages.read_delay_ms.store(ms, Ordering::SeqCst);
     }
 
+    /// The receiver waits this long before it answers a command. The command is recorded after the
+    /// wait, also when the client is gone.
+    pub fn set_command_delay(&self, delay: Duration) {
+        let ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+        self.pages.command_delay_ms.store(ms, Ordering::SeqCst);
+    }
+
     /// The receiver answers reads of the state with this main-zone source. It is `MPLAY` at the
     /// start.
     pub fn set_main_source(&self, source: &'static str) {
@@ -299,7 +307,8 @@ impl Fake {
         self.pages.audyssey_answers.load(Ordering::SeqCst)
     }
 
-    /// The commands that the receiver got, as they are in the path: a space is `%20`.
+    /// The commands that the receiver got, as they are in the path: a space is `%20`. A command
+    /// that waits for [`Fake::set_command_delay`] is not in the list yet.
     pub fn commands(&self) -> Vec<String> {
         self.commands.lock().expect("lock").clone()
     }
@@ -343,6 +352,8 @@ struct Pages {
     description_reads: AtomicUsize,
     /// Wait before the answer to a read of the state, in milliseconds.
     read_delay_ms: AtomicU64,
+    /// Wait before the answer to a command, in milliseconds.
+    command_delay_ms: AtomicU64,
     /// How often an `AppCommand0300` request was answered.
     audyssey_answers: AtomicUsize,
     /// The main-zone source in the answer to a read of the state.
@@ -384,6 +395,10 @@ async fn serve(
                 Some(pages.description.clone())
             }
             ("GET", path) if path.starts_with(COMMAND) => {
+                let delay = pages.command_delay_ms.load(Ordering::SeqCst);
+                if delay > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
                 commands
                     .lock()
                     .expect("lock")

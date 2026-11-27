@@ -180,6 +180,12 @@ pub struct Refreshing;
 #[rtype(result = "()")]
 pub struct HoldCommandLock(pub Duration);
 
+/// Asks if the command lock is free, for the tests.
+#[cfg(test)]
+#[derive(Message)]
+#[rtype(result = "bool")]
+pub struct CommandLockFree;
+
 /// Asks for [`WantState`], for the tests.
 #[cfg(test)]
 #[derive(Message)]
@@ -2267,6 +2273,15 @@ impl Handler<CurrentAvr> for DenonActor {
 
     fn handle(&mut self, _: CurrentAvr, _: &mut Self::Context) -> Self::Result {
         self.avr.as_ref().map(Arc::downgrade)
+    }
+}
+
+#[cfg(test)]
+impl Handler<CommandLockFree> for DenonActor {
+    type Result = bool;
+
+    fn handle(&mut self, _: CommandLockFree, _: &mut Self::Context) -> bool {
+        self.cmd_lock.try_lock().is_ok()
     }
 }
 

@@ -6,8 +6,8 @@
 //! sends events or closes the connection.
 
 use super::actor::{
-    CurrentAvr, HoldCommandLock, RELOAD_DELAY, Refreshing, Resend, read_differently, send_again,
-    send_command,
+    CommandLockFree, CurrentAvr, HoldCommandLock, RELOAD_DELAY, Refreshing, Resend,
+    read_differently, send_again, send_command,
 };
 use super::commands;
 use super::discovery::{
@@ -2883,6 +2883,54 @@ async fn a_command_dropped_by_a_closed_telnet_connection_is_sent_again_over_http
         "{:?}",
         rig.http.commands()
     );
+}
+
+/// The answer is a timeout at the deadline. The send is not stopped: it holds the command lock
+/// until it ends.
+#[actix::test]
+async fn a_late_send_ends_after_its_timeout_and_holds_the_command_lock_until_then() {
+    let setup = |_| DeviceConfig {
+        use_telnet: false,
+        ..cfg()
+    };
+    let http = Fake::start(true).await;
+    let rig = rig_on_timeout(http, setup, answers_all, QUICK, Duration::from_secs(5)).await;
+    until("connected", 5, || {
+        status_count(&rig.events, DeviceStatus::Connected) >= 1
+    })
+    .await;
+    rig.http.set_command_delay(Duration::from_secs(2));
+    let up = Command {
+        // The wait for the turn can last at most 500 ms: the deadline minus SEND_TIME.
+        deadline: tokio::time::Instant::now() + Duration::from_millis(1500),
+        ..media_command("volume_up")
+    };
+    let start = Instant::now();
+    assert_eq!(
+        Err(ServiceError::Timeout),
+        rig.actor.send(up).await.expect("send")
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        start.elapsed()
+    );
+    assert!(rig.http.commands().is_empty(), "{:?}", rig.http.commands());
+    let lock_free = || async { rig.actor.send(CommandLockFree).await.expect("send") };
+    assert!(!lock_free().await, "the late send holds the lock");
+    until("the late send", 5, || !rig.http.commands().is_empty()).await;
+    let end = Instant::now() + Duration::from_secs(2);
+    while !lock_free().await {
+        assert!(Instant::now() < end, "the lock is not free after the send");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    rig.http.set_command_delay(Duration::ZERO);
+    rig.actor
+        .send(media_command("volume_down"))
+        .await
+        .expect("send")
+        .expect("volume down");
+    assert_eq!(vec!["MVUP", "MVDOWN"], rig.http.commands());
 }
 
 #[actix::test]
