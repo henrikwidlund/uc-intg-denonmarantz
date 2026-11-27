@@ -186,12 +186,14 @@ impl WsConn {
                 "[{}] Error registering new WebSocket connection: {e}",
                 self.id
             );
-            let _ = session
-                .close(Some(CloseReason {
+            close(
+                session,
+                Some(CloseReason {
                     code: CloseCode::Error,
                     description: Some("internal error".into()),
-                }))
-                .await;
+                }),
+            )
+            .await;
             debug!("[{}] stopped", self.id);
             return;
         }
@@ -229,7 +231,14 @@ impl WsConn {
                         }
                         Some(Err(e)) => {
                             let reply = if let Some(reason) = buffered_close(&mut stream).await {
-                                debug!("[{}] Read error before the close frame: {e:?}", self.id);
+                                // An I/O error is the normal case, see `buffered_close`. Invalid
+                                // UTF-8 text is also an `Io` error, but is a protocol error. A too
+                                // large message is an `Io` error of kind `Other` and stays at debug.
+                                if matches!(&e, ProtocolError::Io(io) if io.kind() != std::io::ErrorKind::InvalidData) {
+                                    debug!("[{}] Read error before the close frame: {e:?}", self.id);
+                                } else {
+                                    info!("[{}] Read error before the close frame: {e:?}", self.id);
+                                }
                                 info!(
                                     "[{}] Remote closed connection. Reason: {reason:?}",
                                     self.id

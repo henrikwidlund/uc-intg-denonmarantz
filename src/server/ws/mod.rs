@@ -30,7 +30,7 @@ struct WsConn {
     /// [`Controller`] address for sending events and requests.
     controller_addr: Addr<Controller>,
     heartbeat: HeartbeatSettings,
-    /// Log every incoming message. Backup data is not logged.
+    /// Log every incoming text message. Backup data is not logged.
     msg_tracing_in: bool,
     /// Log every outgoing message. Backup data is not logged.
     msg_tracing_out: bool,

@@ -241,7 +241,7 @@ cargo run --release
 | `UC_INTEGRATION_HTTP_PORT` | `9090`            | WebSocket port.                                                 |
 | `UC_DISABLE_MDNS_PUBLISH`  | `false`           | Do not announce the driver with mDNS.                           |
 | `UC_SETUP_TIMEOUT`         | `3600`            | Setup timeout in seconds. `0` disables it.                      |
-| `UC_API_MSG_TRACING`       | off               | Log WebSocket messages: `all`, `in` or `out`. No backup data.   |
+| `UC_API_MSG_TRACING`       | off               | Log text messages: `all`, `in` or `out`. No backup data.        |
 | `RUST_LOG`                 | `info`            | Log level, for example `info,denon_marantz=debug`.              |
 
 The lines of `UC_API_MSG_TRACING` are debug lines. They show only with the debug log: the setup option or a
