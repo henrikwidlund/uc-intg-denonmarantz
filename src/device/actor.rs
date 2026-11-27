@@ -1351,7 +1351,8 @@ impl DenonActor {
         }));
     }
 
-    /// A new source, a power change, or a title that plays again ends the pause.
+    /// A new source, a change of the source list, a power change, or a title that plays again ends
+    /// the pause.
     fn clear_pause(&mut self, setting: Setting) {
         if !self.paused {
             return;
@@ -1883,10 +1884,11 @@ fn build_changes(
         .collect()
 }
 
-/// A new source or a power change ends a pause. So does a title that plays again.
+/// A new source, a change of the source list or a power change ends a pause. So does a title that
+/// plays again. A new source name can change what the source plays.
 const fn ends_pause(setting: Setting, playing: bool) -> bool {
     match setting {
-        Setting::Source | Setting::Power => true,
+        Setting::Source | Setting::Sources | Setting::Power => true,
         Setting::NowPlaying => playing,
         _ => false,
     }
@@ -1978,7 +1980,8 @@ impl Handler<Changed> for DenonActor {
                 Setting::Source | Setting::Power
                     if change.zone.is_none_or(|z| z == denon_marantz::Zone::Main) =>
                 {
-                    // The library sends a change only when the value changed.
+                    // The library sends a change only when the value changed, or for the
+                    // source, when its kind changed.
                     if let Some(avr) = &self.avr {
                         let main = denon_marantz::Zone::Main;
                         if change.setting == Setting::Power {
@@ -1997,6 +2000,8 @@ impl Handler<Changed> for DenonActor {
                     }
                     self.ask_names();
                 }
+                // A new name can change what the main source plays.
+                Setting::Sources => self.ask_names(),
                 _ => {}
             }
             self.schedule_emit_for(change.setting, ctx);
@@ -3087,8 +3092,9 @@ mod tests {
     }
 
     #[test]
-    fn a_new_source_or_a_power_change_ends_the_pause() {
+    fn a_new_source_a_source_list_change_or_a_power_change_end_the_pause() {
         assert!(ends_pause(Setting::Source, false));
+        assert!(ends_pause(Setting::Sources, false));
         assert!(ends_pause(Setting::Power, false));
     }
 

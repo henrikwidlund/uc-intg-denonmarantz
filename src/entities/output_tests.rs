@@ -271,6 +271,16 @@ fn a_renamed_tuner_shows_the_frequency() {
 }
 
 #[test]
+fn a_telnet_source_is_not_found_by_the_name_of_another_source() {
+    let cfg = cfg();
+    let mut state = state(&["PWON", "TFAN008750"]);
+    state.apply_renamed_source("TUNER", Some("CD"));
+    state.apply_message(&Message::parse("SICD").unwrap());
+    let player = attrs(&view(&state, &cfg), EntityKind::MediaPlayer);
+    assert_eq!(json!("CD"), player["media_title"]);
+}
+
+#[test]
 fn a_paused_player_shows_paused() {
     let cfg = cfg();
     let state = state(&["PWON", "SINET", "NSE0Now Playing", "NSE1A Title"]);
