@@ -3,6 +3,7 @@
 
 //! The media info of the tuner and of Bluetooth.
 
+use super::parts::{EMPTY, Part, combine};
 use super::prompt::{
     Answer, Ask, Raised, Watched, add_failure, ask_watched, end_watch, listen_watched, note_rise,
     owner_ask_watched, rise_back, rise_result, stop_fail, stops, terminal, watched,
@@ -18,9 +19,6 @@ use denon_marantz::Zone;
 use serde_json::{Value, json};
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
-
-/// Empty value of a sensor or a select of the driver.
-const EMPTY: &str = "--";
 
 /// What s + Enter means at the play prompt and at the question of the Bluetooth part.
 const SKIP_BLUETOOTH: &str = "skip the Bluetooth part";
@@ -73,46 +71,6 @@ pub async fn media_info(ctx: &mut Ctx) -> Check {
         Part::Skip(NO_START_SOURCE.to_owned())
     };
     combine(&[("tuner", tuner), ("Bluetooth", bluetooth)])
-}
-
-/// Result of a part of the step.
-#[derive(Debug, PartialEq)]
-enum Part {
-    Pass(String),
-    Skip(String),
-    Fail(String),
-}
-
-impl From<Check> for Part {
-    fn from(result: Check) -> Self {
-        match result {
-            Ok(note) => Self::Pass(note),
-            Err(f) if f.skip => Self::Skip(f.msg),
-            Err(f) => Self::Fail(f.msg),
-        }
-    }
-}
-
-/// One note for all parts. Fails if a part fails, skips only if all parts skip.
-fn combine(parts: &[(&str, Part)]) -> Check {
-    let mut note = String::new();
-    for (name, part) in parts {
-        if !note.is_empty() {
-            note.push_str("; ");
-        }
-        let _ = match part {
-            Part::Pass(msg) => write!(note, "{name}: {msg}"),
-            Part::Skip(msg) => write!(note, "{name} skipped: {msg}"),
-            Part::Fail(msg) => write!(note, "{name} failed: {msg}"),
-        };
-    }
-    if parts.iter().any(|(_, p)| matches!(p, Part::Fail(_))) {
-        Err(Fail::new(note))
-    } else if parts.iter().all(|(_, p)| matches!(p, Part::Skip(_))) {
-        Err(Fail::skip(note))
-    } else {
-        Ok(note)
-    }
 }
 
 /// The name in the driver list `list` of a tuner source that may be selected, or why there is
@@ -653,36 +611,6 @@ mod tests {
             Ok(note) => (true, false, note),
             Err(f) => (false, f.skip, f.msg),
         }
-    }
-
-    #[test]
-    fn parts_are_combined() {
-        let pass = || Part::Pass("ok".to_owned());
-        let skip = || Part::Skip("why".to_owned());
-        let fail = || Part::Fail("bad".to_owned());
-        assert_eq!(
-            outcome(combine(&[("a", pass()), ("b", skip())])),
-            (true, false, "a: ok; b skipped: why".to_owned())
-        );
-        assert_eq!(
-            outcome(combine(&[("a", skip()), ("b", skip())])),
-            (false, true, "a skipped: why; b skipped: why".to_owned())
-        );
-        assert_eq!(
-            outcome(combine(&[("a", skip()), ("b", fail())])),
-            (false, false, "a skipped: why; b failed: bad".to_owned())
-        );
-        assert_eq!(
-            outcome(combine(&[("a", fail()), ("b", pass())])),
-            (false, false, "a failed: bad; b: ok".to_owned())
-        );
-    }
-
-    #[test]
-    fn part_from_check() {
-        assert_eq!(Part::from(Ok("n".to_owned())), Part::Pass("n".to_owned()));
-        assert_eq!(Part::from(Err(Fail::skip("s"))), Part::Skip("s".to_owned()));
-        assert_eq!(Part::from(Err(Fail::new("f"))), Part::Fail("f".to_owned()));
     }
 
     #[test]

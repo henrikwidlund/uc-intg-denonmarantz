@@ -3,6 +3,7 @@
 
 //! The navigation and playback keys of the media player.
 
+use super::parts::{EMPTY, Part, combine};
 use super::prompt::{Watched, add_failure, stop_fail, watched};
 use super::{
     HEOS_SOURCE, HeosStart, add_back_note, ensure_on, heos_end, heos_now, heos_played_watched,
@@ -17,7 +18,6 @@ use denon_marantz_heos::{
     MediaType, NowPlaying, PlayState, PlayerId, PlayerState, QueueId, RepeatMode,
 };
 use serde_json::json;
-use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast::error::RecvError;
 
@@ -53,9 +53,6 @@ const MENU_SECS: u64 = 5;
 /// need more time.
 const MENU_OPEN_SECS: u64 = 15;
 
-/// Empty value of a sensor of the driver.
-const EMPTY: &str = "--";
-
 /// The line under the question of [`start_heos`] in [`track_part`].
 const TRACK_HINT: &str = "Play a queue of at least two songs, shuffle off, not the last song.";
 
@@ -88,46 +85,6 @@ pub async fn media_keys(ctx: &mut Ctx) -> Check {
         ("channel", channel),
         ("next and previous", track),
     ])
-}
-
-/// Result of a part of the step.
-#[derive(Debug, PartialEq)]
-enum Part {
-    Pass(String),
-    Skip(String),
-    Fail(String),
-}
-
-impl From<Check> for Part {
-    fn from(result: Check) -> Self {
-        match result {
-            Ok(note) => Self::Pass(note),
-            Err(f) if f.skip => Self::Skip(f.msg),
-            Err(f) => Self::Fail(f.msg),
-        }
-    }
-}
-
-/// One note for all parts. Fails if a part fails, skips only if all parts skip.
-fn combine(parts: &[(&str, Part)]) -> Check {
-    let mut note = String::new();
-    for (name, part) in parts {
-        if !note.is_empty() {
-            note.push_str("; ");
-        }
-        let _ = match part {
-            Part::Pass(msg) => write!(note, "{name}: {msg}"),
-            Part::Skip(msg) => write!(note, "{name} skipped: {msg}"),
-            Part::Fail(msg) => write!(note, "{name} failed: {msg}"),
-        };
-    }
-    if parts.iter().any(|(_, p)| matches!(p, Part::Fail(_))) {
-        Err(Fail::new(note))
-    } else if parts.iter().all(|(_, p)| matches!(p, Part::Skip(_))) {
-        Err(Fail::skip(note))
-    } else {
-        Ok(note)
-    }
 }
 
 /// Send a media player command without parameters.
@@ -915,25 +872,6 @@ mod tests {
             stop(false, false, Some(100)),
             Some((false, "")),
             "paused or stopped"
-        );
-    }
-
-    #[test]
-    fn combine_fails_skips_and_passes() {
-        let pass = || Part::Pass("ok".to_owned());
-        let skip = || Part::Skip("no".to_owned());
-        let fail = || Part::Fail("bad".to_owned());
-        assert_eq!(
-            Part::from(combine(&[("a", pass()), ("b", skip())])),
-            Part::Pass("a: ok; b skipped: no".to_owned())
-        );
-        assert_eq!(
-            Part::from(combine(&[("a", skip()), ("b", skip())])),
-            Part::Skip("a skipped: no; b skipped: no".to_owned())
-        );
-        assert_eq!(
-            Part::from(combine(&[("a", skip()), ("b", fail())])),
-            Part::Fail("a skipped: no; b failed: bad".to_owned())
         );
     }
 

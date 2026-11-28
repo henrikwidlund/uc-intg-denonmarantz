@@ -20,6 +20,7 @@ use tokio::time::sleep;
 mod keys;
 mod lookup;
 mod media;
+mod parts;
 mod prompt;
 mod signal;
 
