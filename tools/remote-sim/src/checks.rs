@@ -26,8 +26,12 @@ mod signal;
 pub use keys::media_keys;
 pub use lookup::address_lookup;
 pub use media::media_info;
-use prompt::{Answer, Ask, SKIP_CHECK, ask};
-pub use prompt::{stdin_lines, terminal};
+use prompt::{
+    Answer, Ask, ENDED_EARLY, NO_WATCH, Note, Raised, SKIP_CHECK, STOP_TEXT, Watched, add_failure,
+    ask, ask_watched, end_watch, listen_watched, note_rise, owner_ask_watched, rise_result,
+    sound_allowed, stop_fail, stops, watched, watched_any,
+};
+pub use prompt::{Rises, stdin_lines, stop_text_once, terminal};
 pub use signal::signal;
 
 /// The UI pages and the simple commands of the driver.
@@ -175,7 +179,8 @@ const NOT_REPORTED: [&str; 4] = [
 ];
 
 /// Values that come from the web pages of the receiver. HDR is not listed: with SDR it has no
-/// value, so it is always compared.
+/// value. HDR without a value is compared only when the receiver gives the signal on telnet, see
+/// [`compared_without_value`].
 const WEB_PAGE_VALUES: [&str; 10] = [
     "select.monitor_output",
     "sensor.monitor_output",
@@ -189,11 +194,26 @@ const WEB_PAGE_VALUES: [&str; 10] = [
     "sensor.pixel_depth_output",
 ];
 
-/// Values of selects and sensors that differ from the values of the receiver.
+/// The value `name` (for example `sensor.hdr_input`) is compared when the second connection has no
+/// value for it. A value of the web pages is not: a web page that failed gives no value. HDR has
+/// no value with SDR, so it is compared without a value only if `telnet_signal` is true: the
+/// receiver gives the signal on telnet (`Info::has_heos`). Without the signal on telnet, HDR comes
+/// only from a web page.
+fn compared_without_value(name: &str, telnet_signal: bool) -> bool {
+    if name.starts_with("sensor.hdr_") {
+        telnet_signal
+    } else {
+        !WEB_PAGE_VALUES.contains(&name)
+    }
+}
+
+/// Values of selects and sensors that differ from the values of the receiver. A value without a
+/// value on the second connection is compared only if [`compared_without_value`] says so.
 fn mismatches(ctx: &Ctx, offered: &BTreeSet<String>) -> Vec<String> {
     let Some(oracle) = &ctx.oracle else {
         return Vec::new();
     };
+    let telnet_signal = oracle.avr().info().has_heos();
     let state = oracle.state();
     let on = matches!(state.zone(Zone::Main).power, Some(Power::On));
     if !on || !is_on(&ctx.client.text(&ctx.mp(), "state")) {
@@ -217,7 +237,9 @@ fn mismatches(ctx: &Ctx, offered: &BTreeSet<String>) -> Vec<String> {
         let got = shown(ctx.client.attr(&id, attr));
         // The web pages of the receiver sometimes answer with an error. The second connection
         // then has no value: that is not a difference of the driver.
-        if (expected.is_none() && WEB_PAGE_VALUES.contains(&name)) || NOT_REPORTED.contains(&name) {
+        if (expected.is_none() && !compared_without_value(name, telnet_signal))
+            || NOT_REPORTED.contains(&name)
+        {
             continue;
         }
         // The driver hides the tuner entities on a receiver without a tuner.
@@ -321,8 +343,14 @@ async fn too_loud(ctx: &mut Ctx) -> Result<Option<String>, Fail> {
 /// Lower the volume to [`MAX_VOLUME`] if the higher of the receiver and the driver volume is above
 /// it: the owner or a phone can set the volume. `None` if it is not above or not known. `Some` with
 /// the values if it was above: the caller fails with this text. Only a receiver volume above the
-/// limit is lowered, see [`lower_volume`]. Error if it was not lowered.
-async fn cap_volume(ctx: &mut Ctx) -> Result<Option<String>, Fail> {
+/// limit is lowered, see [`lower_volume`]. If the receiver read says that the receiver is not above
+/// the limit, the driver can show an old, higher volume: the check waits up to
+/// [`DRIVER_VOLUME_SECS`] for the driver volume to drop to the limit, and gives `None` if it does.
+/// Sound can play meanwhile: with `watch`, the start volume of the caller, and a second connection,
+/// the wait is watched with [`watched_any`]. A rise while or right after the wait gives `Some` with
+/// its text if it was lowered, else an error. `None` as `watch` if the caller watches the volume
+/// already. Error if it was not lowered.
+async fn cap_volume(ctx: &mut Ctx, watch: Option<f64>) -> Result<Option<String>, Fail> {
     let receiver = receiver_volume(ctx).await?;
     let driver = driver_volume(ctx).await?;
     let Some(high) = highest(receiver, driver).filter(|v| *v > MAX_VOLUME) else {
@@ -335,14 +363,59 @@ async fn cap_volume(ctx: &mut Ctx) -> Result<Option<String>, Fail> {
         known(driver)
     );
     match lower_volume(ctx, None).await {
-        // The driver can show an old, higher volume.
-        Ok(()) if receiver.is_some_and(|r| r <= MAX_VOLUME) => Ok(Some(format!(
-            "{values}, nothing was sent: the receiver is not above the limit"
-        ))),
-        Ok(()) => Ok(Some(format!("{values}, it was lowered to {MAX_VOLUME}"))),
+        // The driver can show an old, higher volume. Without the second connection, `None` does
+        // not come from a receiver read.
+        Ok(None) => {
+            if receiver.is_some_and(|r| r <= MAX_VOLUME) {
+                let mp = ctx.mp();
+                let wait = async |ctx: &mut Ctx| {
+                    ctx.client
+                        .wait_attr(&mp, "volume", DRIVER_VOLUME_SECS, |v| {
+                            v.as_f64().is_some_and(|x| x <= MAX_VOLUME)
+                        })
+                        .await
+                        .map(|_| ())
+                };
+                let waited = match watch {
+                    Some(start) if ctx.oracle.is_some() => {
+                        watched_any(
+                            ctx,
+                            start,
+                            "while the check waited for the driver volume",
+                            wait,
+                        )
+                        .await
+                    }
+                    _ => wait(ctx).await.map(Watched::Done),
+                };
+                let rise = match waited {
+                    Ok(Watched::Done(())) => return Ok(None),
+                    Ok(Watched::Ended(rise) | Watched::After((), rise)) => rise,
+                    Err(e) => {
+                        return Ok(Some(format!(
+                            "{values}, nothing was sent: the receiver is not above the limit; \
+                             the wait for the driver volume ended: {e}"
+                        )));
+                    }
+                };
+                let text = format!("{values}; {}", rise.fail);
+                return if rise.lowered {
+                    Ok(Some(text))
+                } else {
+                    Err(Fail::new(text))
+                };
+            }
+            Ok(Some(format!(
+                "{values}, nothing was sent: the receiver is not above the limit"
+            )))
+        }
+        Ok(Some(sent)) => Ok(Some(format!("{values}, it was lowered to {sent}"))),
         Err(e) => Err(Fail::new(format!("{values}, not lowered: {e}"))),
     }
 }
+
+/// Seconds that [`cap_volume`] waits for the driver to drop an old, higher volume.
+const DRIVER_VOLUME_SECS: u64 = 5;
 
 /// Why nothing that makes sound may start at the volume `volume`, or `None` if it may.
 fn loud_volume(volume: Option<f64>) -> Option<String> {
@@ -356,6 +429,33 @@ fn sound_volume(volume: Option<f64>) -> Result<f64, String> {
         None => Err("the volume is not known".to_owned()),
         Some(v) if v <= MAX_VOLUME => Ok(v),
         Some(v) => Err(format!("the volume {v} is above the limit {MAX_VOLUME}")),
+    }
+}
+
+/// The start volume of a check that makes sound, from the `receiver` and the `driver` volume
+/// before it. Error with the reason to skip if the higher of the two is above [`MAX_VOLUME`], see
+/// [`sound_volume`], or without a receiver read: then the volume cannot be watched. The start
+/// volume is the receiver volume: the driver can show an old volume, for example after a power
+/// on. It is the limit for the set back of the source and for a rise of the receiver volume.
+fn start_volume(receiver: Option<f64>, driver: Option<f64>) -> Result<f64, String> {
+    sound_volume(highest(receiver, driver))?;
+    receiver.ok_or_else(|| NO_WATCH.to_owned())
+}
+
+/// The start volume of a check that changes a sound setting, from [`start_volume`]. Skips with its
+/// reason.
+async fn setting_start(ctx: &mut Ctx) -> Result<f64, Fail> {
+    let receiver = receiver_volume(ctx).await?;
+    start_volume(receiver, driver_volume(ctx).await?).map_err(Fail::skip)
+}
+
+/// The result of a wait `waited` of [`watched`] with its rise: a rise is a failure, also after
+/// an `Ok` result or a skip.
+fn with_rise<T>(waited: Result<Watched<T>, Fail>) -> Result<T, Fail> {
+    match end_watch(waited) {
+        (result, None) => result,
+        (Ok(_), Some(rise)) => Err(rise.fail),
+        (Err(e), Some(rise)) => Err(Fail::new(format!("{e}; {}", rise.fail))),
     }
 }
 
@@ -425,13 +525,17 @@ async fn power_on_volume(ctx: &mut Ctx) -> Result<String, Fail> {
     if v <= MAX_VOLUME {
         return Ok(String::new());
     }
-    lower_volume(ctx, None).await.map_err(|e| {
+    let sent = lower_volume(ctx, None).await.map_err(|e| {
         Fail::new(format!(
             "the volume after power on was {v} (limit {MAX_VOLUME}), not lowered: {e}"
         ))
     })?;
+    let done = sent.map_or_else(
+        || "nothing was sent: the receiver is not above the limit".to_owned(),
+        |sent| format!("it was lowered to {sent}"),
+    );
     Err(Fail::new(format!(
-        "the volume after power on was {v} (limit {MAX_VOLUME}), it was lowered"
+        "the volume after power on was {v} (limit {MAX_VOLUME}), {done}"
     )))
 }
 
@@ -604,8 +708,10 @@ fn join_errors(a: Result<(), Fail>, b: Result<(), Fail>) -> Result<(), Fail> {
 /// Lower the volume to [`unmute_limit`] if the receiver has a higher one. Only the volume of the
 /// receiver (second connection) decides if a volume is sent: the driver can show an old, higher
 /// volume, and the limit can be above the real volume. Without that connection nothing is sent,
-/// and a driver volume above the limit is an error.
-async fn lower_volume(ctx: &mut Ctx, before: Option<f64>) -> Result<(), Fail> {
+/// and a driver volume above the limit is an error. If the receiver is above the limit after the
+/// lowering, it is lowered once more and this is an error. Returns the volume that was sent, `None`
+/// if nothing was sent.
+async fn lower_volume(ctx: &mut Ctx, before: Option<f64>) -> Result<Option<f64>, Fail> {
     let mp = ctx.mp();
     let limit = unmute_limit(before);
     let Some(now) = receiver_volume(ctx).await? else {
@@ -616,19 +722,37 @@ async fn lower_volume(ctx: &mut Ctx, before: Option<f64>) -> Result<(), Fail> {
             shown <= limit,
             "volume {shown} above {limit}, not lowered: no second connection"
         );
-        return Ok(());
+        return Ok(None);
     };
     let Some(limit) = volume_to_send(now, limit) else {
-        return Ok(());
+        return Ok(None);
     };
-    set_volume(ctx, limit).await?;
+    let sent = set_volume(ctx, limit).await?;
     ctx.client
         .wait_attr(&mp, "volume", 6, |v| v.as_f64().is_some_and(|x| x <= limit))
         .await
         .map_err(|e| Fail::new(format!("volume not lowered to {limit}: {e}")))?;
     let after = receiver_volume(ctx).await?.unwrap_or(limit);
-    ensure!(after <= limit, "volume {after} after lowering to {limit}");
-    Ok(())
+    if after <= limit {
+        return Ok(Some(sent));
+    }
+    // The volume can go up again during the wait, which is not watched: lower it once more at once.
+    // This is still an error.
+    let again = async {
+        set_volume(ctx, limit).await?;
+        let waited = ctx
+            .client
+            .wait_attr(&mp, "volume", 2, |v| v.as_f64().is_some_and(|x| x <= limit))
+            .await;
+        let again = receiver_volume(ctx).await?.unwrap_or(limit);
+        let waited = waited.err().map_or_else(String::new, |e| format!(" ({e})"));
+        Ok::<_, Fail>(format!("volume {again}{waited}"))
+    }
+    .await
+    .unwrap_or_else(|e| format!("failed: {e}"));
+    Err(Fail::new(format!(
+        "volume {after} after lowering to {limit}, lowered once more: {again}"
+    )))
 }
 
 /// Unmute, but first lower the volume with [`lower_volume`]. Unmutes only if the higher of the
@@ -1533,53 +1657,98 @@ pub async fn mute(ctx: &mut Ctx) -> Check {
     first_error(result, undo)
 }
 
+/// Select another source and set the start source back. The checks that work in standby run
+/// before [`ensure_on`], so that the receiver is not switched on only to skip. The start source,
+/// the web interface read of [`read_sources`] and the volume are checked after it: the driver
+/// shows no source in standby. A skip of [`source_start`] puts a receiver that was off (see
+/// [`was_off`]) back to standby with [`standby_again`]. Only this check and `heos` do that: they
+/// can skip right after they switched the receiver on. The other steps leave the power to
+/// `restore_power` at the end. While the new source plays and while the start source is set
+/// back, the receiver volume is watched with the start volume (see [`watched`] and
+/// [`restore_source`]): a rise is lowered and fails. If a rise was not lowered or a volume read
+/// failed, the check selects no source: the owner is asked with [`owner_source_back`]. Such a rise
+/// or failed read right after a set back that worked asks no owner: the source is back.
 pub async fn source(ctx: &mut Ctx) -> Check {
-    if ctx.opt.avoid_sources.is_empty() {
-        return Err(Fail::skip("no --avoid-sources: no source is selected"));
-    }
-    ensure_on(ctx).await?;
+    source_oracle(ctx).map_err(Fail::skip)?;
     let mp = ctx.mp();
-    let old = ctx.client.text(&mp, "source");
     let list = strings(ctx.client.attr(&mp, "source_list").unwrap_or(&Value::Null));
-    let sources = read_sources(ctx).await.map_err(Fail::skip)?;
-    let new = other_source(&source_rule(ctx, &sources), &old, &list).map_err(Fail::skip)?;
-    if let Some(why) = too_loud(ctx).await? {
-        return Err(Fail::skip(format!("{why}: no source is selected")));
+    if !has_two_sources(&list) {
+        return Err(Fail::skip(format!(
+            "the driver list has less than two sources ({list:?}): no source is selected"
+        )));
     }
-    let result = async {
-        let start = Instant::now();
-        ctx.client
-            .command_ok(
-                "media_player",
-                &mp,
-                "select_source",
-                json!({ "source": new }),
-            )
-            .await?;
-        ctx.client
-            .wait_text(&mp, "source", 8, &new)
-            .await
-            .map_err(|e| Fail::new(format!("{e}. Wanted: {new}, source list: {list:?}")))?;
-        let took = start.elapsed().as_millis();
-        ctx.client
-            .wait_text(&ctx.select("input_source"), "current_option", 4, &new)
-            .await?;
-        let title = match source_title(&sources, &new) {
-            Some(title) => {
-                ctx.client
-                    .wait_text(&mp, "media_title", 4, title)
-                    .await
-                    .map_err(|e| Fail::new(format!("title of {new}: {e}")))?;
-                "the title is the source name"
-            }
-            None => "the title is not checked: a playing source, or the name fits no single source",
-        };
-        Ok((took, title))
-    }
+    let was_off = was_off(ctx);
+    ensure_on(ctx).await?;
+    let SourceStart {
+        old,
+        list,
+        sources,
+        new,
+        volume,
+    } = match source_start(ctx).await {
+        Ok(start) => start,
+        Err(e) if e.skip && was_off => return Err(standby_again(ctx, e).await),
+        Err(e) => return Err(e),
+    };
+    // The new source can play: the receiver volume is watched until the source is set back.
+    let waited = watched(
+        ctx,
+        volume,
+        "while the check waited for the source",
+        async |ctx: &mut Ctx| {
+            let start = Instant::now();
+            ctx.client
+                .command_ok(
+                    "media_player",
+                    &mp,
+                    "select_source",
+                    json!({ "source": new }),
+                )
+                .await?;
+            ctx.client
+                .wait_text(&mp, "source", 8, &new)
+                .await
+                .map_err(|e| Fail::new(format!("{e}. Wanted: {new}, source list: {list:?}")))?;
+            let took = start.elapsed().as_millis();
+            ctx.client
+                .wait_text(&ctx.select("input_source"), "current_option", 4, &new)
+                .await?;
+            let title = match source_title(&sources, &new) {
+                Some(title) => {
+                    ctx.client
+                        .wait_text(&mp, "media_title", 4, title)
+                        .await
+                        .map_err(|e| Fail::new(format!("title of {new}: {e}")))?;
+                    "the title is the source name"
+                }
+                None => {
+                    "the title is not checked: a playing source, or the name fits no single source"
+                }
+            };
+            Ok((took, title))
+        },
+    )
     .await;
-    let back = restore_source(ctx, &old, 4).await;
-    let tries = back.as_ref().copied().unwrap_or_default();
-    let (took, title) = first_error(result, back.map(|_| ()))?;
+    let (result, rise) = end_watch(waited);
+    if stops(&rise) {
+        // The check selects no source: the owner sets it back.
+        let back = owner_source_back(ctx, &old, VOLUME_NOT_SAFE, volume).await;
+        let result = add_failure(result.map(|_| format!("{old} -> {new}")), rise_result(rise));
+        return add_set_back(result, back);
+    }
+    let (back, back_rise) = restore_source(ctx, &old, 4, volume).await;
+    let tries = match back {
+        Ok(tries) => tries,
+        Err(e) => {
+            let owner =
+                owner_source_back(ctx, &old, &format!("the set back failed: {e}"), volume).await;
+            let result = add_failure(result.map(|_| format!("{old} -> {new}")), rise_result(rise));
+            let result = add_failure(result, rise_result(back_rise));
+            return add_set_back(result, owner_result(Some(e.msg), owner));
+        }
+    };
+    let result = add_failure(result, rise_result(rise));
+    let (took, title) = add_failure(result, rise_result(back_rise))?;
     verify_all(ctx, 6).await?;
     let odd = if list.iter().any(|s| s == "Source") {
         ", the list has a `Source` entry"
@@ -1591,6 +1760,9 @@ pub async fn source(ctx: &mut Ctx) -> Check {
     ))
 }
 
+/// The time and the title of the source change in [`source`]: no note.
+impl Note for (u128, &str) {}
+
 /// The media title that the driver shows for the source with the name `label` of the driver list:
 /// the name, for a source that does not report what plays. The rule of the driver checks the telnet
 /// code. `None` for a source that reports what plays, or for a name that fits no source or more
@@ -1601,6 +1773,47 @@ fn source_title<'a>(sources: &[SourceInfo], label: &'a str) -> Option<&'a str> {
         (Some(info), None) if !is_playing_source(&info.code) => Some(label),
         _ => None,
     }
+}
+
+/// The driver list `list` has two sources: the start source and one more to select. The `Source`
+/// entry does not count, see [`other_source`].
+fn has_two_sources(list: &[String]) -> bool {
+    list.iter().filter(|s| *s != "Source").nth(1).is_some()
+}
+
+/// What [`source_start`] read after [`ensure_on`].
+struct SourceStart {
+    /// The start source that the driver shows.
+    old: String,
+    /// The source list of the driver.
+    list: Vec<String>,
+    /// The sources of the receiver.
+    sources: Vec<SourceInfo>,
+    /// The source to select.
+    new: String,
+    /// The start volume from [`start_volume`]: the limit for a rise while the new source plays and
+    /// for the set back.
+    volume: f64,
+}
+
+/// Read the start values of [`source`] after [`ensure_on`]. Skips if [`read_sources`] or
+/// [`other_source`] fails, or if [`start_volume`] finds the volume too high or not known.
+async fn source_start(ctx: &mut Ctx) -> Result<SourceStart, Fail> {
+    let mp = ctx.mp();
+    let old = ctx.client.text(&mp, "source");
+    let list = strings(ctx.client.attr(&mp, "source_list").unwrap_or(&Value::Null));
+    let sources = read_sources(ctx).await.map_err(Fail::skip)?;
+    let new = other_source(&source_rule(ctx, &sources), &old, &list).map_err(Fail::skip)?;
+    let receiver = receiver_volume(ctx).await?;
+    let volume = start_volume(receiver, driver_volume(ctx).await?)
+        .map_err(|why| Fail::skip(format!("{why}: no source is selected")))?;
+    Ok(SourceStart {
+        old,
+        list,
+        sources,
+        new,
+        volume,
+    })
 }
 
 /// A source of the driver list `list` to select for a check, or why there is none. The start
@@ -1618,27 +1831,47 @@ fn other_source(rule: &SourceRule<'_>, old: &str, list: &[String]) -> Result<Str
 }
 
 /// The sources of the receiver from the second connection, with the default and automatic names
-/// of the web interface. Error: why no source may be selected.
+/// of the web interface, after [`source_gate`]. Error: why no source may be selected.
 async fn read_sources(ctx: &Ctx) -> Result<Vec<SourceInfo>, String> {
-    let oracle = source_oracle(ctx)?;
-    oracle
-        .read_source_names()
+    let oracle = source_gate(&ctx.opt, ctx.oracle.as_ref())
         .await
         .map_err(|e| format!("{e}: no source is selected"))?;
-    let state = oracle.state();
-    levels_ok(&state.device().source_levels).map_err(|e| format!("{e}: no source is selected"))?;
-    Ok(state.device().sources.as_slice().to_vec())
+    Ok(oracle.state().device().sources.as_slice().to_vec())
 }
 
-/// The second connection that [`read_sources`] reads. Error: why no source may be selected, without
-/// `--avoid-sources` or without that connection.
+/// The second connection that [`read_sources`] reads. Error: why no source may be selected, see
+/// [`oracle_gate`].
 fn source_oracle(ctx: &Ctx) -> Result<&Oracle, String> {
-    if ctx.opt.avoid_sources.is_empty() {
-        return Err("no --avoid-sources: no source is selected".to_owned());
+    oracle_gate(&ctx.opt, ctx.oracle.as_ref()).map_err(|e| format!("{e}: no source is selected"))
+}
+
+/// The second connection `oracle` if sources may be selected with it. Error: why not, without
+/// `--avoid-sources`, without that connection, or with `--no-oracle`.
+fn oracle_gate<'a>(
+    opt: &crate::Options,
+    oracle: Option<&'a Oracle>,
+) -> Result<&'a Oracle, &'static str> {
+    if opt.avoid_sources.is_empty() {
+        return Err("no --avoid-sources");
     }
-    ctx.oracle
-        .as_ref()
-        .ok_or_else(|| "no second connection: no source is selected".to_owned())
+    let oracle = oracle.ok_or("no second connection")?;
+    if opt.no_oracle {
+        return Err("--no-oracle");
+    }
+    Ok(oracle)
+}
+
+/// The gates before a source is selected: [`oracle_gate`], then the source names and the input
+/// levels are read from the web interface, and the levels must pass [`levels_ok`]. Returns the
+/// second connection. Error: why no source may be selected.
+async fn source_gate<'a>(
+    opt: &crate::Options,
+    oracle: Option<&'a Oracle>,
+) -> Result<&'a Oracle, String> {
+    let oracle = oracle_gate(opt, oracle)?;
+    oracle.read_source_names().await.map_err(|e| e.msg)?;
+    levels_ok(&oracle.state().device().source_levels)?;
+    Ok(oracle)
 }
 
 /// Sources may be selected only while the receiver adds no level to the analog and the digital
@@ -1655,38 +1888,37 @@ fn levels_ok(levels: &SourceLevels) -> Result<(), String> {
 }
 
 /// Why the saved source `code` of an earlier run may not be set back, or `None` if it may: it and
-/// the current source must both pass the source rule of this run. The receiver may have a tuner:
+/// the current source must both pass the source rule of this run, after [`source_gate`]. The
+/// current source is checked with its code from [`select_code`]. The receiver may have a tuner:
 /// the setup has not run yet.
 pub async fn source_set_back(oracle: &Oracle, opt: &crate::Options, code: &str) -> Option<String> {
-    if opt.avoid_sources.is_empty() {
-        return Some("no --avoid-sources".to_owned());
-    }
-    if opt.no_oracle {
-        return Some("--no-oracle".to_owned());
-    }
-    if let Err(e) = oracle.read_source_names().await {
-        return Some(e.msg);
-    }
-    let state = oracle.state();
-    if let Err(e) = levels_ok(&state.device().source_levels) {
-        return Some(e);
-    }
+    let state = match source_gate(opt, Some(oracle)).await {
+        Ok(oracle) => oracle.state(),
+        Err(e) => return Some(e),
+    };
+    let sources = state.device().sources.as_slice();
     let rule = SourceRule {
         opt,
-        sources: state.device().sources.as_slice(),
+        sources,
         tuner: true,
     };
-    let current = state.zone(Zone::Main).source.clone();
+    let current = state.zone(Zone::Main).source.as_deref();
     if !rule.code_ok(code) {
         Some(format!("the saved source {code} may not be selected"))
-    } else if !current.as_deref().is_some_and(|c| rule.code_ok(c)) {
+    } else if !current.is_some_and(|c| rule.code_ok(select_code(sources, c))) {
         Some(format!(
             "the source {} may not be changed",
-            current.as_deref().unwrap_or("(unknown)")
+            current.unwrap_or("(unknown)")
         ))
     } else {
         None
     }
+}
+
+/// The code of the receiver source `source` that the driver select uses, see
+/// [`oracle::select_code`].
+fn select_code<'a>(sources: &[SourceInfo], source: &'a str) -> &'a str {
+    oracle::select_code(sources.iter().any(|s| s.code == source), source)
 }
 
 /// The source rule of the run for these sources.
@@ -1749,10 +1981,31 @@ fn label_fits(info: &SourceInfo, label: &str) -> bool {
         .any(|name| name == label || with_code == Some(name))
 }
 
+/// Select the old source again with [`select_again`]. The source can play, so the receiver volume
+/// is watched with [`watched`] while the set back runs: a volume above `start`, the volume before
+/// the sound, ends the set back and is lowered; [`watched`] reads the volume once more after it.
+/// Not run after a stop, see [`sound_allowed`]: the owner sets the source back then. Returns the
+/// result of the set back (the number of tries) and the rise.
+async fn restore_source(
+    ctx: &mut Ctx,
+    old: &str,
+    secs: u64,
+    start: f64,
+) -> (Result<u32, Fail>, Option<Raised>) {
+    let waited = watched(
+        ctx,
+        start,
+        "while the source was set back",
+        async |ctx: &mut Ctx| select_again(ctx, old, secs).await,
+    )
+    .await;
+    end_watch(waited)
+}
+
 /// Select the old source again. It is always sent: after an error the driver can show a source
 /// that is old. The receiver can ignore a source command that comes soon after another one, so
-/// the command is sent again after `secs` seconds.
-async fn restore_source(ctx: &mut Ctx, old: &str, secs: u64) -> Result<u32, Fail> {
+/// the command is sent again if [`wait_source`] with `secs` fails.
+async fn select_again(ctx: &mut Ctx, old: &str, secs: u64) -> Result<u32, Fail> {
     // A source command switches the receiver on: switch it on with the volume check first.
     // Without the second connection, `power_on` skips, so no source is sent.
     ctx.client.listen_ms(300).await?;
@@ -1760,6 +2013,7 @@ async fn restore_source(ctx: &mut Ctx, old: &str, secs: u64) -> Result<u32, Fail
         switch_on(ctx).await?;
     }
     let mp = ctx.mp();
+    let mut last = None;
     for tries in 1..=3 {
         ctx.client
             .command_ok(
@@ -1769,13 +2023,45 @@ async fn restore_source(ctx: &mut Ctx, old: &str, secs: u64) -> Result<u32, Fail
                 json!({ "source": old }),
             )
             .await?;
-        if ctx.client.wait_text(&mp, "source", secs, old).await.is_ok() {
-            return Ok(tries);
+        match wait_source(ctx, old, secs).await {
+            Ok(()) => return Ok(tries),
+            Err(e) => last = Some(e),
         }
     }
+    let last = last.map_or_else(String::new, |e| format!(", last: {e}"));
     Err(Fail::new(format!(
-        "the source did not go back to {old} in 3 tries"
+        "the source did not go back to {old} in 3 tries{last}"
     )))
+}
+
+/// Wait up to `secs` seconds until the driver shows the source `old`, then up to `secs` seconds
+/// more until the second connection has it too, see [`same_source`]. Without that connection, or
+/// while it does not know the source, only the driver counts.
+async fn wait_source(ctx: &mut Ctx, old: &str, secs: u64) -> Result<(), Fail> {
+    let mp = ctx.mp();
+    ctx.client.wait_text(&mp, "source", secs, old).await?;
+    if ctx.oracle.is_none() {
+        return Ok(());
+    }
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let receiver = receiver_source(ctx);
+        let now = receiver
+            .as_ref()
+            .map(|(code, info)| (code.as_str(), info.as_ref()));
+        if same_source(now, old, old) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(Fail::new(format!(
+                "the driver shows {old}, but the receiver has {:?} after {secs} s",
+                source_text(ctx)
+            )));
+        }
+        ctx.client
+            .listen_until(deadline.min(Instant::now() + Duration::from_millis(200)))
+            .await?;
+    }
 }
 
 /// Why the start source `old` of the driver list `list` cannot be set back, or `Ok` if it can.
@@ -1801,6 +2087,11 @@ const HTTP_POLL_SECS: u64 = 10;
 const DRIVER_SLACK_SECS: u64 = 5;
 /// Seconds that the driver may take to show a source that the owner selected.
 const OWNER_BACK_SECS: u64 = HTTP_POLL_SECS + DRIVER_SLACK_SECS;
+/// Why the check selects no source after a rise that was not lowered or a failed volume read.
+const VOLUME_NOT_SAFE: &str =
+    "the receiver volume was not lowered or could not be read, so the check selects no source";
+/// Why [`simple_commands`] selects no source after the volume check that follows its set back.
+const CAP_NOT_SAFE: &str = "the volume after the set back was above the limit or not known, so the check selects no source";
 
 /// The result of a set back of the source.
 #[derive(Debug, PartialEq)]
@@ -1825,7 +2116,8 @@ impl SetBack {
 fn add_set_back(result: Check, back: Result<SetBack, Fail>) -> Check {
     let back = match back {
         Ok(back) => back,
-        Err(e) => return add_back_note(result, Err::<&str, _>(e)),
+        // A failed set back joins the result as in `add_back_note`.
+        Err(e) => return first_error(result, Err(e)),
     };
     let result = if back.note.is_empty() {
         result
@@ -1838,15 +2130,21 @@ fn add_set_back(result: Check, back: Result<SetBack, Fail>) -> Check {
     }
 }
 
-/// The source of the main zone from the second connection: the telnet code and, if the receiver
-/// lists it, the info of that source. The second connection has a change at once; in HTTP mode
-/// the driver shows it only after its next poll. `None` without that connection or if the source
-/// is not known.
+/// The source of the main zone from the second connection, see [`state_source`]. The second
+/// connection has a change at once; in HTTP mode the driver shows it only after its next poll.
+/// `None` without that connection or if the source is not known.
 fn receiver_source(ctx: &Ctx) -> Option<(String, Option<SourceInfo>)> {
-    let state = ctx.oracle.as_ref()?.state();
-    let code = state.zone(Zone::Main).source.clone()?;
-    let info = state.device().sources.get(&code).cloned();
-    Some((code, info))
+    state_source(&ctx.oracle.as_ref()?.state())
+}
+
+/// The source of the main zone in `state`: the source as the library keeps it and, if the receiver
+/// lists its code from [`select_code`], the info of that source. `None` if the source is not known.
+fn state_source(state: &denon_marantz::State) -> Option<(String, Option<SourceInfo>)> {
+    let source = state.zone(Zone::Main).source.as_deref()?;
+    let sources = state.device().sources.as_slice();
+    let code = select_code(sources, source);
+    let info = sources.iter().find(|s| s.code == code).cloned();
+    Some((source.to_owned(), info))
 }
 
 /// The current source for a note: the name or the code from the second connection, else the
@@ -1883,10 +2181,48 @@ enum Back {
 }
 
 /// What [`source_back`] does with the start source `old` of the driver list `list`. The current
-/// source comes from [`receiver_source`], else from the driver. To select `old`, the higher of the
-/// receiver and the driver volume must pass [`back_volume_ok`] with `start_volume`, `old` must pass
-/// [`start_source_ok`], and the current source must pass [`now_ok`].
+/// source comes from [`receiver_source`], else from the driver. To select `old`, the volume must
+/// pass [`back_volume_ok`] with `start_volume`, `old` must pass [`start_source_ok`], and the
+/// current source must pass [`now_ok`]. The volume is the receiver volume, and the driver volume
+/// only without a receiver read: the driver can show an old volume. Sound can play while the
+/// sources are read from the web interface: the read is watched with [`watched_any`] and
+/// `start_volume`. A rise while or right after the read asks the owner, also when the receiver has
+/// the start source. A stop of the step (see [`sound_allowed`]) asks the owner too, unless the
+/// receiver has the start source. Returns the rule and that rise.
 async fn back_rule(
+    ctx: &mut Ctx,
+    old: &str,
+    list: &[String],
+    start_volume: f64,
+) -> (Result<Back, Fail>, Option<Raised>) {
+    let waited = watched_any(
+        ctx,
+        start_volume,
+        "while the check read the sources",
+        async |ctx: &mut Ctx| back_rule_read(ctx, old, list, start_volume).await,
+    )
+    .await;
+    match waited {
+        // With the start source, nothing is selected and the owner is not asked.
+        Ok(Watched::Done(rule)) if sound_allowed(ctx).is_err() && rule != Back::Same => {
+            (Ok(Back::Owner(VOLUME_NOT_SAFE.to_owned())), None)
+        }
+        Ok(Watched::Done(rule)) => (Ok(rule), None),
+        Ok(Watched::Ended(rise) | Watched::After(_, rise)) => {
+            let why = if rise.lowered {
+                "the receiver volume went above the start volume while or right after the check \
+                 read the sources"
+            } else {
+                VOLUME_NOT_SAFE
+            };
+            (Ok(Back::Owner(why.to_owned())), Some(rise))
+        }
+        Err(e) => (Err(e), None),
+    }
+}
+
+/// The reads and the rule of [`back_rule`]. The caller watches the volume.
+async fn back_rule_read(
     ctx: &mut Ctx,
     old: &str,
     list: &[String],
@@ -1902,9 +2238,11 @@ async fn back_rule(
         return Ok(Back::Same);
     }
     // A failed read is an error: `source_back` asks the owner and fails.
-    let volume = receiver_volume(ctx).await?;
-    let driver = driver_volume(ctx).await?;
-    if let Err(why) = back_volume_ok(highest(volume, driver), start_volume) {
+    let volume = match receiver_volume(ctx).await? {
+        Some(v) => Some(v),
+        None => driver_volume(ctx).await?,
+    };
+    if let Err(why) = back_volume_ok(volume, start_volume) {
         return Ok(Back::Owner(why));
     }
     let sources = match read_sources(ctx).await {
@@ -1912,7 +2250,9 @@ async fn back_rule(
         Err(why) => return Ok(Back::Owner(why)),
     };
     let rule = source_rule(ctx, &sources);
-    let code = receiver.as_ref().map(|(code, _)| code.as_str());
+    let code = receiver
+        .as_ref()
+        .map(|(code, _)| select_code(&sources, code));
     Ok(
         match start_source_ok(&rule, old, list).and_then(|()| now_ok(&rule, code, &label)) {
             Ok(()) => Back::Select,
@@ -1921,18 +2261,20 @@ async fn back_rule(
     )
 }
 
-/// The receiver has the start source `old`, a name from the driver list. `receiver` is the code and
-/// the info from [`receiver_source`], `label` the source that the driver shows; `label` counts
-/// only without `receiver`. The receiver source has the name that the driver shows: the user name,
+/// The receiver has the start source `old`, a name from the driver list. `receiver` is the source
+/// and the info from [`receiver_source`], `label` the source that the driver shows; `label` counts
+/// only without `receiver`. The source info has the name that the driver shows: the user name,
 /// else the code, with the code in parentheses when two sources have the same name. The default
-/// name does not count: the driver does not show it. If the receiver does not list the source,
-/// the display name as in `oracle::expected`. False if `old` is empty.
+/// name does not count: the driver does not show it. The info is the one of the code from
+/// [`select_code`], as the select mapping in `oracle::expected`. Without an info, the display name
+/// of the source. False if `old` is empty.
 fn same_source(receiver: Option<(&str, Option<&SourceInfo>)>, label: &str, old: &str) -> bool {
     if old.is_empty() {
         return false;
     }
     match receiver {
-        Some((code, Some(info))) => {
+        Some((_, Some(info))) => {
+            let code = info.code.as_str();
             let name = info.name.as_deref().unwrap_or(code);
             old == name
                 || old
@@ -1965,37 +2307,69 @@ fn now_ok(rule: &SourceRule<'_>, code: Option<&str>, label: &str) -> Result<(), 
 }
 
 /// Set the start source `old` of the driver list `list` back. `start_volume` is the volume at the
-/// start of the check. [`back_rule`] decides: nothing is sent if the receiver has `old`; the check
-/// selects `old` with [`restore_source`]; or the owner is asked with [`owner_source_back`], also
-/// if the rule could not be read or the select failed. A failed set back of the check is a
-/// failure.
+/// start of the check. With `owner`, the reason why the check selects no source (see
+/// [`VOLUME_NOT_SAFE`]), the owner is asked with [`owner_source_back`] at once, unless the receiver
+/// has `old`. Else [`back_rule`] decides: nothing is sent if the receiver has `old`; the check
+/// selects `old` with [`restore_source`]; or the owner is asked, also if the rule could not be read
+/// or the select failed. `start_volume` also goes to [`restore_source`] and [`owner_source_back`].
+/// A failed set back of the check is a failure, and so is a rise of the volume while [`back_rule`]
+/// reads the sources, or while or after the check sets the source back.
 async fn source_back(
     ctx: &mut Ctx,
     old: &str,
     list: &[String],
     start_volume: f64,
+    owner: Option<&str>,
 ) -> Result<SetBack, Fail> {
-    let (why, failed) = match back_rule(ctx, old, list, start_volume).await {
-        Ok(Back::Same) => {
-            return Ok(SetBack::note(
-                "the receiver has the start source".to_owned(),
-            ));
-        }
-        Ok(Back::Select) => match restore_source(ctx, old, 4).await {
-            Ok(tries) => {
-                return Ok(SetBack::note(format!(
-                    "source set back to {old} in {tries} tries"
-                )));
+    let (rule, mut rule_rise) = match owner {
+        // The owner is not asked if the receiver has the start source. Nothing is sent here.
+        Some(why) => {
+            let read = ctx.client.listen_ms(300).await;
+            let receiver = receiver_source(ctx);
+            let label = ctx.client.text(&ctx.mp(), "source");
+            let now = receiver
+                .as_ref()
+                .map(|(code, info)| (code.as_str(), info.as_ref()));
+            if read.is_ok() && same_source(now, &label, old) {
+                (Ok(Back::Same), None)
+            } else {
+                (Ok(Back::Owner(why.to_owned())), None)
             }
-            Err(e) => (format!("the set back failed: {e}"), Some(e.msg)),
+        }
+        None => back_rule(ctx, old, list, start_volume).await,
+    };
+    // The owner path joins the rise of the rule itself.
+    let rule_failure = match rule {
+        Ok(Back::Owner(_)) => Ok(()),
+        _ => rise_result(rule_rise.take()),
+    };
+    let (why, failed, rise) = match rule {
+        Ok(Back::Same) => {
+            let back = SetBack::note("the receiver has the start source".to_owned());
+            return add_failure(Ok(back), rule_failure);
+        }
+        Ok(Back::Select) => match restore_source(ctx, old, 4, start_volume).await {
+            (Ok(tries), rise) => {
+                let back = SetBack::note(format!("source set back to {old} in {tries} tries"));
+                return add_failure(add_failure(Ok(back), rule_failure), rise_result(rise));
+            }
+            (Err(e), rise) => (format!("the set back failed: {e}"), Some(e.msg), rise),
         },
-        Ok(Back::Owner(why)) => (why, None),
+        Ok(Back::Owner(why)) => (why, None, rule_rise),
         Err(e) => (
             format!("the check could not read the state: {e}"),
             Some(e.msg),
+            None,
         ),
     };
-    let owner = owner_source_back(ctx, old, &why).await;
+    let owner = owner_source_back(ctx, old, &why, start_volume).await;
+    let back = add_failure(owner_result(failed, owner), rule_failure);
+    add_failure(back, rise_result(rise))
+}
+
+/// The result of a set back by the owner, `owner`. `failed` is the error of a set back of the
+/// check before it: then the set back is a failure, also when the owner set the source back.
+fn owner_result(failed: Option<String>, owner: Result<SetBack, Fail>) -> Result<SetBack, Fail> {
     match (failed, owner) {
         (None, owner) => owner,
         // The note of a skip has `why`, which has the error.
@@ -2013,12 +2387,40 @@ async fn source_back(
     }
 }
 
-/// Ask the owner to set the start source `old` back, because the check does not: `why`. The
-/// answer s + Enter leaves the source as it is: the set back is skipped. Fails if the owner says
-/// that it is set back but the driver does not show `old` within [`OWNER_BACK_SECS`], or if the
-/// input ended.
-async fn owner_source_back(ctx: &mut Ctx, old: &str, why: &str) -> Result<SetBack, Fail> {
-    let mp = ctx.mp();
+impl Note for SetBack {
+    fn note(&self) -> &str {
+        &self.note
+    }
+}
+
+/// Ask the owner to set the start source `old` back, because the check does not: `why`. The answer
+/// s + Enter leaves the source as it is: the set back is skipped. The prompt is watched with
+/// [`owner_ask_watched`], also after a stop: a receiver volume above the start volume `start` ends
+/// the prompt, is lowered and fails. The wait of [`wait_source`] is watched with [`watched_any`]
+/// too. Right after the prompt and the wait, the watch reads the volume once more and sets a volume
+/// above `start` back: a rise or a failed read is a failure. Fails also if the owner says that it
+/// is set back but [`wait_source`] with [`OWNER_BACK_SECS`] fails (the driver or the second
+/// connection does not have `old`), or if the input ended. See [`owner_back`] for the rise apart.
+async fn owner_source_back(
+    ctx: &mut Ctx,
+    old: &str,
+    why: &str,
+    start: f64,
+) -> Result<SetBack, Fail> {
+    let (result, rise) = owner_back(ctx, old, why, start).await;
+    add_failure(result, rise_result(rise))
+}
+
+/// [`owner_source_back`] with the rise apart: the result without the rise, and the rise. An `Ok`
+/// result that is not skipped means that the source is back, also with a rise after the answer. A
+/// rise that ends the prompt or the wait of [`wait_source`] gives an error: then it is not known
+/// whether the source is back.
+async fn owner_back(
+    ctx: &mut Ctx,
+    old: &str,
+    why: &str,
+    start: f64,
+) -> (Result<SetBack, Fail>, Option<Raised>) {
     let target = if old.is_empty() {
         "the source it had before the check".to_owned()
     } else {
@@ -2026,29 +2428,59 @@ async fn owner_source_back(ctx: &mut Ctx, old: &str, why: &str) -> Result<SetBac
     };
     let text =
         format!("Set the source of the receiver back to {target}. The check does not: {why}.");
-    let answer = ask(
-        ctx,
-        Ask::Action(
-            "it is set back",
-            "leave the source as it is, the check or the part skips if nothing failed",
-        ),
-        &text,
-    )
-    .await?;
-    match answer {
+    let kind = Ask::Action(
+        "it is set back",
+        "leave the source as it is, the check or the part skips if nothing failed",
+    );
+    let (answer, mut rise) = match owner_ask_watched(ctx, kind, &text, None, start).await {
+        Ok(Watched::Done(answer)) => (answer, None),
+        Ok(Watched::After(answer, rise)) => (answer, Some(rise)),
+        Ok(Watched::Ended(rise)) => {
+            let e = Fail::new(format!("the source is not set back to {target}: {why}"));
+            return (Err(e), Some(rise));
+        }
+        Err(e) => return (Err(e), None),
+    };
+    let result = match answer {
         // Without a start source the check cannot know which source the owner selected.
         Answer::Done if old.is_empty() => Ok(SetBack::note(format!(
             "the owner set the source back, the receiver has {:?}",
             source_text(ctx)
         ))),
         Answer::Done => {
-            ctx.client
-                .wait_text(&mp, "source", OWNER_BACK_SECS, old)
-                .await
-                .map_err(|e| Fail::new(format!("the owner said it is set back, but: {e}")))?;
-            Ok(SetBack::note(format!(
-                "the owner set the source back to {old}"
-            )))
+            let waited = watched_any(
+                ctx,
+                start,
+                "while the check waited for the source",
+                async |ctx: &mut Ctx| wait_source(ctx, old, OWNER_BACK_SECS).await,
+            )
+            .await;
+            match waited {
+                Ok(Watched::Done(())) => Ok(SetBack::note(format!(
+                    "the owner set the source back to {old}"
+                ))),
+                Ok(Watched::After((), after)) => {
+                    rise = Some(match rise {
+                        Some(first) => join_rises(first, after),
+                        None => after,
+                    });
+                    Ok(SetBack::note(format!(
+                        "the owner set the source back to {old}"
+                    )))
+                }
+                Ok(Watched::Ended(after)) => {
+                    let e =
+                        Fail::new("the owner said it is set back, the wait for the source ended");
+                    let rise = match rise {
+                        Some(first) => join_rises(first, after),
+                        None => after,
+                    };
+                    return (Err(e), Some(rise));
+                }
+                Err(e) => Err(Fail::new(format!(
+                    "the owner said it is set back, but: {e}"
+                ))),
+            }
         }
         Answer::Skip => Ok(SetBack {
             note: format!(
@@ -2060,7 +2492,8 @@ async fn owner_source_back(ctx: &mut Ctx, old: &str, why: &str) -> Result<SetBac
         _ => Err(Fail::new(format!(
             "the source is not set back to {target}: {why}"
         ))),
-    }
+    };
+    (result, rise)
 }
 
 /// Prefer a plain mode that is not the current one.
@@ -2089,6 +2522,9 @@ async fn select_sound(ctx: &mut Ctx, mode: &str) -> Result<(), Fail> {
         .await
 }
 
+/// Select another sound mode and set it back. The receiver volume is watched with the start volume
+/// from [`start_volume`] while the mode changes and while it is set back, see [`watched`]: a rise
+/// is lowered and fails.
 pub async fn sound_mode(ctx: &mut Ctx) -> Check {
     ensure_on(ctx).await?;
     let mp = ctx.mp();
@@ -2110,24 +2546,40 @@ pub async fn sound_mode(ctx: &mut Ctx) -> Check {
         )));
     }
     let new = pick_sound_mode(&list, &old).ok_or_else(|| Fail::skip("no other sound mode"))?;
-    let result = async {
-        select_sound(ctx, &new).await?;
-        // The receiver can report the mode in other letter case than the list.
-        ctx.client
-            .wait_attr(&mp, "sound_mode", 10, |v| {
-                v.as_str().is_some_and(|m| m.eq_ignore_ascii_case(&new))
-            })
-            .await?;
-        let shown = ctx.client.text(&mp, "sound_mode");
-        ensure!(
-            ctx.client.text(&ctx.sensor("sound_mode"), "value") != "--",
-            "the sound mode sensor is empty"
-        );
-        verify_all(ctx, 6).await?;
-        Ok(shown)
-    }
+    // A sound mode can make the sound louder: the receiver volume is watched with the start volume.
+    let start = setting_start(ctx).await?;
+    let waited = watched(
+        ctx,
+        start,
+        "while the sound mode was changed",
+        async |ctx: &mut Ctx| {
+            select_sound(ctx, &new).await?;
+            // The receiver can report the mode in other letter case than the list.
+            ctx.client
+                .wait_attr(&mp, "sound_mode", 10, |v| {
+                    v.as_str().is_some_and(|m| m.eq_ignore_ascii_case(&new))
+                })
+                .await?;
+            let shown = ctx.client.text(&mp, "sound_mode");
+            ensure!(
+                ctx.client.text(&ctx.sensor("sound_mode"), "value") != "--",
+                "the sound mode sensor is empty"
+            );
+            verify_all(ctx, 6).await?;
+            Ok(shown)
+        },
+    )
     .await;
-    let undo = restore_sound(ctx, &old, &list, result.is_err()).await;
+    let result = with_rise(waited);
+    let undo = with_rise(
+        watched_any(
+            ctx,
+            start,
+            "while the sound mode was set back",
+            async |ctx: &mut Ctx| restore_sound(ctx, &old, &list, result.is_err()).await,
+        )
+        .await,
+    );
     let shown = first_error(result, undo)?;
     verify_all(ctx, 6).await?;
     Ok(format!("{old} -> {new} (receiver: {shown}), restored"))
@@ -2319,7 +2771,7 @@ async fn power_back(
     let volume = if !is_on(&ctx.client.text(&ctx.mp(), "state")) || receiver_off(ctx) {
         on_again(ctx, before).await
     } else {
-        lower_volume(ctx, before).await
+        lower_volume(ctx, before).await.map(|_| ())
     };
     // The mute step runs also after an error: an unmute goes through `unmute_safely`.
     let mute = set_muted(ctx, muted, before, force).await;
@@ -2333,6 +2785,20 @@ fn receiver_off(ctx: &Ctx) -> bool {
         .is_some_and(|oracle| oracle.state().zone(Zone::Main).power != Some(Power::On))
 }
 
+/// The receiver is off before a power on: the driver does not show it on, and the second
+/// connection says that the main zone is off or in standby. An unknown power does not count, and
+/// without the second connection the receiver is not off. A power off after a skip goes only to a
+/// receiver that was off.
+fn was_off(ctx: &Ctx) -> bool {
+    !is_on(&ctx.client.text(&ctx.mp(), "state"))
+        && ctx.oracle.as_ref().is_some_and(|oracle| {
+            matches!(
+                oracle.state().zone(Zone::Main).power,
+                Some(Power::Off | Power::Standby)
+            )
+        })
+}
+
 /// Switch the receiver on with [`power_on`], then lower the volume with [`lower_volume`]. The
 /// volume is lowered also after an error of [`power_on`], except after a skip.
 async fn on_again(ctx: &mut Ctx, before: Option<f64>) -> Result<(), Fail> {
@@ -2340,7 +2806,7 @@ async fn on_again(ctx: &mut Ctx, before: Option<f64>) -> Result<(), Fail> {
     if on.as_ref().is_err_and(|e| e.skip) {
         return on;
     }
-    let lowered = lower_volume(ctx, before).await;
+    let lowered = lower_volume(ctx, before).await.map(|_| ());
     join_errors(on, lowered)
 }
 
@@ -2560,12 +3026,19 @@ pub async fn http_mode(ctx: &mut Ctx) -> Check {
         // The source is set back also if the switch to telnet failed. The shown source is not
         // trusted then.
         let source = match &changes.source {
-            Some(source) => {
-                let source = source.clone();
+            Some((source, volume)) => {
+                let (source, volume) = (source.clone(), *volume);
+                let stop = changes.stop;
                 async {
                     ctx.client.listen_ms(300).await?;
                     if telnet.is_err() || ctx.client.text(&mp, "source") != source {
-                        restore_source(ctx, &source, 4).await?;
+                        if stop {
+                            // The check selects no source after a rise that was not lowered.
+                            let owner =
+                                owner_source_back(ctx, &source, VOLUME_NOT_SAFE, volume).await;
+                            return owner_not_skipped(owner);
+                        }
+                        return http_source_back(ctx, &source, volume).await;
                     }
                     Ok(())
                 }
@@ -2597,7 +3070,22 @@ pub async fn http_mode(ctx: &mut Ctx) -> Check {
             .ok()
             .or_else(|| ctx.client.attr(&mp, "sound_mode_list").cloned())
             .unwrap_or(Value::Null);
-        let sound = match restore_sound(ctx, &old_sound, &strings(&list), force).await {
+        // The sound mode change can change the sound: the receiver volume is watched with the start
+        // volume of `http_checks`. If it was not read, no sound mode was changed: nothing is sent.
+        let list = strings(&list);
+        let (sound, rise) = match changes.volume {
+            Some(limit) => end_watch(
+                watched_any(
+                    ctx,
+                    limit,
+                    "while the sound mode was set back",
+                    async |ctx: &mut Ctx| restore_sound(ctx, &old_sound, &list, force).await,
+                )
+                .await,
+            ),
+            None => (Ok(()), None),
+        };
+        let sound = match sound {
             Err(e) => {
                 let now = ctx.client.text(&mp, "sound_mode");
                 let receiver = receiver_sound(ctx);
@@ -2612,7 +3100,7 @@ pub async fn http_mode(ctx: &mut Ctx) -> Check {
             }
             ok => ok,
         };
-        join_errors(errors, sound)
+        join_errors(errors, add_failure(sound, rise_result(rise)))
     }
     .await;
     let note = first_error(result, undo)?;
@@ -2643,11 +3131,44 @@ fn receiver_sound(ctx: &Ctx) -> String {
         .unwrap_or_default()
 }
 
+/// Set the start source `old` back in the undo of [`http_mode`]. The check selects it with
+/// [`restore_source`] and the start volume `start`. If that fails, the owner is asked with
+/// [`owner_source_back`], the same as in [`source_back`]. A failed set back of the check is a
+/// failure, and so are a rise and a set back that the owner skipped.
+async fn http_source_back(ctx: &mut Ctx, old: &str, start: f64) -> Result<(), Fail> {
+    let (why, failed, rise) = match restore_source(ctx, old, 4, start).await {
+        (Ok(_), rise) => return rise_result(rise),
+        (Err(e), rise) => (format!("the set back failed: {e}"), Some(e.msg), rise),
+    };
+    let owner = owner_source_back(ctx, old, &why, start).await;
+    owner_not_skipped(add_failure(owner_result(failed, owner), rise_result(rise)))
+}
+
+/// The set back `back` of the owner in [`http_mode`], which does not skip: a source that the owner
+/// left as it is fails.
+fn owner_not_skipped(back: Result<SetBack, Fail>) -> Result<(), Fail> {
+    let back = back?;
+    if back.skipped {
+        return Err(Fail::new(back.note));
+    }
+    Ok(())
+}
+
 /// What [`http_checks`] changed, for [`http_mode`] to set back.
 #[derive(Default)]
 struct HttpChanges {
-    /// The source at the start. Set before a source change.
-    source: Option<String>,
+    /// The source at the start and the start volume from [`start_volume`]. Set before a source
+    /// change. `None` again when [`http_mode`] must not select the source: after a rise in the
+    /// source change or its set back that was not lowered or a failed volume read there, or after a
+    /// failed set back of [`http_checks`]. A stop in the sound mode change sets `stop` instead.
+    source: Option<(String, f64)>,
+    /// The start volume from [`start_volume`]. Set before a source change, or else before the sound
+    /// mode change, and kept when `source` is `None` again. The sound mode change and its set back
+    /// in [`http_mode`] are watched with it.
+    volume: Option<f64>,
+    /// A rise of the receiver volume in the sound mode change was not lowered, or a volume read
+    /// failed: [`http_mode`] selects no source and asks the owner, see [`VOLUME_NOT_SAFE`].
+    stop: bool,
     /// The signal time at the start, as the setup page shows it (see [`signal_secs`]). Set before a
     /// change of the signal time.
     signal_secs: Option<u16>,
@@ -2659,7 +3180,12 @@ struct HttpChanges {
 /// The checks in HTTP mode. The sound mode is changed only if `old_sound`, the mode shown with
 /// telnet, is known: [`http_mode`] sets it back. `changes` gets the values at the start before
 /// they are changed, for [`http_mode`] to set them back with the switch back to telnet, and the
-/// sound modes of the receiver before and after the change.
+/// sound modes of the receiver before and after the change. The source change and its set back
+/// are watched with the start volume as in [`source`]: a rise is lowered and fails. After a rise
+/// that was not lowered or a failed volume read during the source change, the owner sets the
+/// source back. The owner is also asked at once if the set back of the check fails. After a rise
+/// that was not lowered or a failed volume read during a set back that worked, the source is back
+/// and the owner is not asked.
 async fn http_checks(ctx: &mut Ctx, old_sound: &str, changes: &mut HttpChanges) -> Check {
     let mp = ctx.mp();
     let before = entity_ids(ctx).await?.len();
@@ -2681,7 +3207,10 @@ async fn http_checks(ctx: &mut Ctx, old_sound: &str, changes: &mut HttpChanges) 
         count("number."),
     )];
     note.extend(info_note);
-    note.push(signal_entities(ctx, &expected, changes).await?);
+    let (signal_note, fresh) = signal_entities(ctx, &expected, changes).await?;
+    note.push(signal_note);
+    // The signal time changes the entities: the dimmer and the bass use the last set.
+    let expected = fresh.unwrap_or(expected);
 
     // Receivers read with the status pages have no dimmer over HTTP.
     if expected.contains("select.dimmer") {
@@ -2712,28 +3241,67 @@ async fn http_checks(ctx: &mut Ctx, old_sound: &str, changes: &mut HttpChanges) 
         .await
         .and_then(|sources| other_source(&source_rule(ctx, &sources), &old, &list));
     let picked = match picked {
-        Ok(new) => too_loud(ctx).await?.map_or(Ok(new), Err),
+        Ok(new) => {
+            let receiver = receiver_volume(ctx).await?;
+            start_volume(receiver, driver_volume(ctx).await?).map(|volume| (new, volume))
+        }
         Err(why) => Err(why),
     };
     match picked {
-        Ok(new) => {
-            changes.source = Some(old.clone());
+        Ok((new, volume)) => {
+            changes.source = Some((old.clone(), volume));
+            changes.volume = Some(volume);
             let start = Instant::now();
-            let result = async {
-                ctx.client
-                    .command_ok(
-                        "media_player",
-                        &mp,
-                        "select_source",
-                        json!({ "source": new }),
-                    )
-                    .await?;
-                ctx.client.wait_text(&mp, "source", 12, &new).await
-            }
+            // The new source can play: the receiver volume is watched until it is set back.
+            let waited = watched(
+                ctx,
+                volume,
+                "while the check waited for the source",
+                async |ctx: &mut Ctx| {
+                    ctx.client
+                        .command_ok(
+                            "media_player",
+                            &mp,
+                            "select_source",
+                            json!({ "source": new }),
+                        )
+                        .await?;
+                    ctx.client.wait_text(&mp, "source", 12, &new).await
+                },
+            )
             .await;
             let took = start.elapsed().as_millis();
-            let back = restore_source(ctx, &old, 12).await.map(|_| ());
-            first_error(result, back)?;
+            let (result, rise) = end_watch(waited);
+            let (back, back_rise) = if stops(&rise) {
+                // The check selects no source: the owner sets it back, and `http_mode` does not.
+                changes.source = None;
+                let owner = owner_source_back(ctx, &old, VOLUME_NOT_SAFE, volume).await;
+                (owner_not_skipped(owner), None)
+            } else {
+                let (back, back_rise) = restore_source(ctx, &old, 12, volume).await;
+                // After a failed set back the owner sets the source back at once: the switch to
+                // telnet in `http_mode` is not watched. After a rise that was not lowered the
+                // source is back, but `http_mode` selects no source.
+                let back = match back {
+                    Err(e) => {
+                        changes.source = None;
+                        let why = format!("the set back failed: {e}");
+                        let owner = owner_source_back(ctx, &old, &why, volume).await;
+                        owner_not_skipped(owner_result(Some(e.msg), owner))
+                    }
+                    Ok(_) => {
+                        if stops(&back_rise) {
+                            changes.source = None;
+                        }
+                        Ok(())
+                    }
+                };
+                (back, back_rise)
+            };
+            add_failure(
+                first_error(add_failure(result, rise_result(rise)), back),
+                rise_result(back_rise),
+            )?;
             note.push(format!("source {took} ms"));
         }
         Err(why) => note.push(format!("source not changed: {why}")),
@@ -2758,35 +3326,73 @@ async fn http_checks(ctx: &mut Ctx, old_sound: &str, changes: &mut HttpChanges) 
     } else {
         "STEREO"
     };
+    // The sound mode change can change the sound: the receiver volume is watched with the start
+    // volume of the source change, or with one read here.
+    let volume = match changes.volume {
+        Some(volume) => volume,
+        None => {
+            let receiver = receiver_volume(ctx).await?;
+            match start_volume(receiver, driver_volume(ctx).await?) {
+                Ok(volume) => volume,
+                Err(why) => {
+                    note.push(format!("sound mode not changed: {why}"));
+                    return Ok(note.join(", "));
+                }
+            }
+        }
+    };
+    changes.volume = Some(volume);
     let receiver_before = receiver_sound(ctx);
     let start = Instant::now();
+    let waited = watched(
+        ctx,
+        volume,
+        "while the sound mode was changed",
+        async |ctx: &mut Ctx| change_sound(ctx, group, &old, &receiver_before).await,
+    )
+    .await;
+    let (sound, rise) = end_watch(waited);
+    changes.stop = stops(&rise);
+    // Without a mode before the change, or without a change, `sound` stays `None`, so a failed set
+    // back fails.
+    let sound = add_failure(sound.map(|s| s.unwrap_or_default()), rise_result(rise))?;
+    changes.sound = (!sound.is_empty()).then_some((receiver_before, sound));
+    note.push(format!("sound mode {} ms", start.elapsed().as_millis()));
+    note.push(format!("sound mode was {old} in HTTP mode"));
+    Ok(note.join(", "))
+}
+
+/// Select the sound mode group `group` in [`http_checks`] and wait until the driver shows another
+/// mode than `old`. Returns the new raw mode of the receiver (second connection), or `None` if
+/// `before` is empty or the receiver does not report another mode within 5 s: it can get the new
+/// mode later than the driver.
+async fn change_sound(
+    ctx: &mut Ctx,
+    group: &str,
+    old: &str,
+    before: &str,
+) -> Result<Option<String>, Fail> {
+    let mp = ctx.mp();
     select_sound(ctx, group).await?;
     ctx.client
         .wait_attr(&mp, "sound_mode", 15, |v| {
             v.as_str().is_some_and(|m| !m.is_empty() && m != old)
         })
         .await?;
-    // The second connection can get the new mode later than the driver. Without a mode before the
-    // change, or without a change, `sound` stays `None`, so a failed set back fails.
+    if before.is_empty() {
+        return Ok(None);
+    }
     let deadline = Instant::now() + Duration::from_secs(5);
-    let sound = if receiver_before.is_empty() {
-        None
-    } else {
-        loop {
-            let now = receiver_sound(ctx);
-            if !now.is_empty() && !now.eq_ignore_ascii_case(&receiver_before) {
-                break Some(now);
-            }
-            if Instant::now() >= deadline {
-                break None;
-            }
-            ctx.client.listen_ms(200).await?;
+    loop {
+        let now = receiver_sound(ctx);
+        if !now.is_empty() && !now.eq_ignore_ascii_case(before) {
+            return Ok(Some(now));
         }
-    };
-    changes.sound = sound.map(|after| (receiver_before, after));
-    note.push(format!("sound mode {} ms", start.elapsed().as_millis()));
-    note.push(format!("sound mode was {old} in HTTP mode"));
-    Ok(note.join(", "))
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        ctx.client.listen_ms(200).await?;
+    }
 }
 
 /// Check that the driver offers the entities of HTTP mode that [`http_entities`] expects for
@@ -2818,16 +3424,18 @@ async fn check_http_entities(
 /// signal pages, so their sensors go away. `start` is the expected set before the changes.
 /// `changes.signal_secs` gets the value at the start before the first change. It is `None` again
 /// if the setup page has no signal field.
+/// Returns the note and the expected set of the last change, `None` if no change was sent.
 async fn signal_entities(
     ctx: &mut Ctx,
     start: &BTreeSet<&'static str>,
     changes: &mut HttpChanges,
-) -> Result<String, Fail> {
+) -> Result<(String, Option<BTreeSet<&'static str>>), Fail> {
     let config = read_config(ctx).await?;
     let first = signal_secs(config_device(ctx, &config)?);
     let address = ctx.opt.address.clone();
     let mut note = format!("signal time {first} s");
     changes.signal_secs = Some(first);
+    let mut last = None;
     for secs in [0, DEFAULT_SIGNAL_SECS] {
         let values = SetupValues {
             telnet: Some(false),
@@ -2846,7 +3454,7 @@ async fn signal_entities(
                 note,
                 ", {secs} s not sent: the setup page has no signal_poll_secs field"
             );
-            return Ok(note);
+            return Ok((note, last));
         }
         let config = read_config(ctx).await?;
         let saved = signal_secs(config_device(ctx, &config)?);
@@ -2865,9 +3473,10 @@ async fn signal_entities(
             ", {secs} s: {} entities, gone {gone:?}, new {new:?}",
             expected.len()
         );
+        last = Some(expected);
     }
     wait_available(ctx, 20).await?;
-    Ok(note)
+    Ok((note, last))
 }
 
 /// Why the bass is not changed in HTTP mode, or `None` if it may be changed. `tone` is the state
@@ -2896,14 +3505,24 @@ fn dirac_off(receiver: Option<DiracFilter>, select: Option<&str>, supported: boo
     }
 }
 
+/// A number entity value in whole dB, for example the bass level. The driver can send it as a
+/// float, so it is rounded. `None` if it is not a finite number.
+fn whole_db(value: &Value) -> Option<i64> {
+    value
+        .as_f64()
+        .filter(|v| v.is_finite())
+        .map(|v| v.round() as i64)
+}
+
 /// The bass level one `step` lower than `value`, or `None` if that is below `min`.
 fn bass_lower(value: i64, step: i64, min: i64) -> Option<i64> {
     value.checked_sub(step).filter(|v| *v >= min)
 }
 
-/// In HTTP mode, lower the bass one step and set it back. The driver must show the new value in
-/// 2 s. Only with the tone control on and the Dirac filter off. The note also has what MultEQ and
-/// Dynamic EQ show. `expected` is the set of [`check_http_entities`].
+/// In HTTP mode, lower the bass one step and set it back. The driver must show the new value
+/// in 2 s. Only with the tone control on and the Dirac filter off. The change and the set back are
+/// watched with the start volume from [`start_volume`]; without it the bass is not changed. The
+/// note also has what MultEQ and Dynamic EQ show. `expected` is the set of [`check_http_entities`].
 async fn http_bass(ctx: &mut Ctx, expected: &BTreeSet<&'static str>) -> Result<String, Fail> {
     let key = ctx.key.clone();
     let shown = |kind: &str, attr: &str, ctx: &Ctx| {
@@ -2919,7 +3538,7 @@ async fn http_bass(ctx: &mut Ctx, expected: &BTreeSet<&'static str>) -> Result<S
     if expected.contains("number.bass") {
         let _ = ctx
             .client
-            .wait_attr(&bass, "value", 10, Value::is_i64)
+            .wait_attr(&bass, "value", 10, |v| whole_db(v).is_some())
             .await;
     }
     if expected.contains("switch.tone_control") {
@@ -2959,24 +3578,45 @@ async fn http_bass(ctx: &mut Ctx, expected: &BTreeSet<&'static str>) -> Result<S
         .as_f64()
         .map_or(1, |s| (s.round() as i64).max(1));
     let min = options["min"].as_f64().map_or(-6, |m| m.round() as i64);
-    let Some(start) = ctx.client.attr(&bass, "value").and_then(Value::as_i64) else {
+    let Some(start) = ctx.client.attr(&bass, "value").and_then(whole_db) else {
         return Ok(format!("bass has no value, {eq}"));
     };
     let Some(lower) = bass_lower(start, step, min) else {
         return Ok(format!("bass {start} dB is the lowest value, {eq}"));
     };
+    let volume = match setting_start(ctx).await {
+        Ok(volume) => volume,
+        Err(e) if e.skip => return Ok(format!("bass not changed: {e}, {eq}")),
+        Err(e) => return Err(e),
+    };
     let begin = Instant::now();
-    let result = async {
-        ctx.client
-            .command_ok("number", &bass, "set_value", json!({ "value": lower }))
-            .await?;
-        ctx.client
-            .wait_attr(&bass, "value", 2, |v| v.as_i64() == Some(lower))
-            .await?;
-        Ok(begin.elapsed().as_millis())
-    }
+    let waited = watched(
+        ctx,
+        volume,
+        "while the bass was changed",
+        async |ctx: &mut Ctx| {
+            ctx.client
+                .command_ok("number", &bass, "set_value", json!({ "value": lower }))
+                .await?;
+            ctx.client
+                .wait_attr(&bass, "value", 2, |v| whole_db(v) == Some(lower))
+                .await?;
+            Ok(begin.elapsed().as_millis())
+        },
+    )
     .await;
-    let back = tone_back(ctx, &tone_id, None, &bass, Some(start), result.is_err()).await;
+    let result = with_rise(waited);
+    let back = with_rise(
+        watched_any(
+            ctx,
+            volume,
+            "while the bass was set back",
+            async |ctx: &mut Ctx| {
+                tone_back(ctx, &tone_id, None, &bass, Some(start), result.is_err()).await
+            },
+        )
+        .await,
+    );
     let took = first_error(result, back)?;
     Ok(format!(
         "bass {start} -> {lower} dB in {took} ms, set back, {eq}"
@@ -3136,8 +3776,8 @@ const CLOSE_REASON: &str = "bye";
 /// Time without messages in [`ws_idle`]. The driver closes after 40 s without a message.
 const IDLE_SECS: u64 = 45;
 
-/// The driver answers the pings of a Remote. Another WebSocket connection pings every second for 5 s, and
-/// each pong must come within 1 s.
+/// The driver answers the pings of a Remote. Another WebSocket connection pings every second for
+/// 5 s, and each pong must come within 1 s.
 pub async fn ws_keepalive(ctx: &mut Ctx) -> Check {
     const SECOND: Duration = Duration::from_secs(1);
     let mut client = Client::connect(ctx.driver.port).await?;
@@ -3158,8 +3798,8 @@ pub async fn ws_keepalive(ctx: &mut Ctx) -> Check {
 }
 
 /// A Remote that sends nothing stays connected: the driver pings every 20 s and closes after 40 s
-/// without a message. Another WebSocket connection only reads for 45 s, so only its pongs (sent by the
-/// library) keep the connection open. Then it must still get an answer to a request.
+/// without a message. Another WebSocket connection only reads for 45 s, so only its pongs (sent by
+/// the library) keep the connection open. Then it must still get an answer to a request.
 pub async fn ws_idle(ctx: &mut Ctx) -> Check {
     let mut client = Client::connect(ctx.driver.port).await?;
     // The main connection is read too, so it answers the pings of the driver and stays open.
@@ -3173,8 +3813,8 @@ pub async fn ws_idle(ctx: &mut Ctx) -> Check {
     Ok(format!("open after {IDLE_SECS} s without messages"))
 }
 
-/// A Remote that closes the connection. Another WebSocket connection sends a close frame. The driver must
-/// answer with the same code and reason, log the close and end the session.
+/// A Remote that closes the connection. Another WebSocket connection sends a close frame. The
+/// driver must answer with the same code and reason, log the close and end the session.
 pub async fn ws_close(ctx: &mut Ctx) -> Check {
     let client = Client::connect(ctx.driver.port).await?;
     // The driver logs lines of a session with the peer address as `[id]`.
@@ -3981,20 +4621,17 @@ pub async fn broken_config(ctx: &mut Ctx) -> Check {
 
 /// Set the power and the mute state back to the start. A receiver that was off is switched off.
 /// A receiver that was on is switched on if it is off. With the second connection, the volume is
-/// lowered to the start volume (not above [`MAX_VOLUME`]) first, then the mute state is set back; an unmute goes through [`unmute_safely`] with the start
-/// volume. Does nothing without a device key (set by `entities`), and does not switch on without
-/// the start values (read by `states`) or without the second connection (see [`power_on`]).
+/// lowered to the start volume (not above [`MAX_VOLUME`]) first, then the mute state is set back;
+/// an unmute goes through [`unmute_safely`] with the start volume. Does nothing without a device
+/// key (set by `entities`), and does not switch on without the start values (read by `states`) or
+/// without the second connection (see [`power_on`]).
 pub async fn restore_power(ctx: &mut Ctx) -> Check {
     if ctx.key.is_empty() {
         return Ok("no device key, nothing to do".into());
     }
     let mp = ctx.mp();
     if !ctx.was_on {
-        ctx.client
-            .command_ok("media_player", &mp, "off", json!({}))
-            .await?;
-        ctx.client.wait_text(&mp, "state", 15, "OFF").await?;
-        sleep(Duration::from_millis(200)).await;
+        switch_off(ctx).await?;
         return Ok("the receiver is off again, like at the start".into());
     }
     let Some((muted, volume)) = ctx.start.as_ref().map(|s| (s.muted, s.volume)) else {
@@ -4016,7 +4653,7 @@ pub async fn restore_power(ctx: &mut Ctx) -> Check {
         }
         errors = on;
     } else if ctx.oracle.is_some() {
-        errors = lower_volume(ctx, volume).await;
+        errors = lower_volume(ctx, volume).await.map(|_| ());
     }
     // The driver or the second connection can show another mute state.
     let receiver_muted = ctx
@@ -4044,6 +4681,17 @@ pub async fn restore_power(ctx: &mut Ctx) -> Check {
         errors = join_errors(errors, mute);
     }
     errors.map(|()| notes.join(", "))
+}
+
+/// Switch the receiver off with the driver and wait until the driver shows `OFF`.
+async fn switch_off(ctx: &mut Ctx) -> Result<(), Fail> {
+    let mp = ctx.mp();
+    ctx.client
+        .command_ok("media_player", &mp, "off", json!({}))
+        .await?;
+    ctx.client.wait_text(&mp, "state", 15, "OFF").await?;
+    sleep(Duration::from_millis(200)).await;
+    Ok(())
 }
 
 /// Time in which [`restore_power`] starts new volume queries. Right after a
@@ -4314,7 +4962,9 @@ async fn sweep_select(
     Ok(Some(tally))
 }
 
-/// Select every option of the selects and check the entities after each change.
+/// Select every option of the selects and check the entities after each change. The sweep and the
+/// set back are watched with the start volume from [`start_volume`], see [`watched`]: a rise is
+/// lowered and fails. A rise that stops the sweep sets back each select with [`selects_back`].
 pub async fn select_sweep(ctx: &mut Ctx) -> Check {
     // Without the second connection, Dynamic EQ cannot be set back.
     if ctx.oracle.is_none() {
@@ -4333,70 +4983,90 @@ pub async fn select_sweep(ctx: &mut Ctx) -> Check {
         .unwrap_or(Value::Null);
     // The saved Dynamic EQ answer lines. `None` until they are read.
     let mut dynamic_eq: Option<Vec<String>> = None;
-    let result = async {
-        if dirac_original != json!("Off") && dirac_original != Value::Null {
-            sweep_one(ctx, "dirac_filter", &json!("Off")).await?;
-        }
-        // The reference level needs Dynamic EQ. It is set back at the end.
-        if let Some(oracle) = &ctx.oracle {
-            dynamic_eq = Some(restore::read(oracle.avr(), &["PSDYNEQ ?"]).await?);
-        }
-        let mut summary = Vec::new();
-        // Dynamic EQ is switched on only if its value was saved: else it cannot be set back.
-        if dynamic_eq
-            .as_ref()
-            .is_some_and(|lines| lines.iter().any(|l| l.starts_with("PSDYNEQ")))
-        {
-            let remote = ctx.remote();
-            ctx.client
-                .command_ok(
-                    "remote",
-                    &remote,
-                    "send_cmd",
-                    json!({ "command": "DYNAMIC_EQ_ON" }),
-                )
-                .await?;
-            ctx.client.listen(1).await?;
-        } else {
-            summary.push(
-                "Dynamic EQ not switched on: the receiver did not answer its query".to_owned(),
-            );
-        }
-        let mut verified = 0;
-        // The driver leaves out the selects of features that the receiver does not list.
-        let offered = entity_ids(ctx).await?;
-        for kind in [
-            "dimmer",
-            "eco_mode",
-            "reference_level_offset",
-            "dynamic_volume",
-            "monitor_output",
-            "speaker_preset",
-            "picture_mode",
-            "digital_codec",
-            "dirac_filter",
-        ] {
-            if !ctx.opt.kinds.is_empty() && !ctx.opt.kinds.iter().any(|k| k == kind) {
-                continue;
+    // The options before the sweep, to set back a select that a rise stopped in the middle.
+    let originals: Vec<(&str, Value)> = SWEEP_KINDS
+        .iter()
+        .map(|kind| {
+            let shown = ctx.client.attr(&ctx.select(kind), "current_option");
+            (*kind, shown.cloned().unwrap_or(Value::Null))
+        })
+        .collect();
+    // Speaker presets, Dynamic Volume and the reference level can make the sound louder.
+    let volume = setting_start(ctx).await?;
+    let waited = watched(
+        ctx,
+        volume,
+        "while the selects were changed",
+        async |ctx: &mut Ctx| {
+            if dirac_original != json!("Off") && dirac_original != Value::Null {
+                sweep_one(ctx, "dirac_filter", &json!("Off")).await?;
             }
-            if !offered.contains(&ctx.select(kind)) {
-                summary.push(format!("{kind}: not offered"));
-                continue;
+            // The reference level needs Dynamic EQ. It is set back at the end.
+            if let Some(oracle) = &ctx.oracle {
+                dynamic_eq = Some(restore::read(oracle.avr(), &["PSDYNEQ ?"]).await?);
             }
-            if let Some(tally) = sweep_select(ctx, kind, &mut problems).await? {
-                verified += tally.verified;
-                summary.push(format!("{kind}: {}", tally.describe()));
+            let mut summary = Vec::new();
+            // Dynamic EQ is switched on only if its value was saved: else it cannot be set back.
+            if dynamic_eq
+                .as_ref()
+                .is_some_and(|lines| lines.iter().any(|l| l.starts_with("PSDYNEQ")))
+            {
+                let remote = ctx.remote();
+                ctx.client
+                    .command_ok(
+                        "remote",
+                        &remote,
+                        "send_cmd",
+                        json!({ "command": "DYNAMIC_EQ_ON" }),
+                    )
+                    .await?;
+                ctx.client.listen(1).await?;
+            } else {
+                summary.push(
+                    "Dynamic EQ not switched on: the receiver did not answer its query".to_owned(),
+                );
             }
-        }
-        Ok((summary, verified))
-    }
+            let mut verified = 0;
+            // The driver leaves out the selects of features that the receiver does not list.
+            let offered = entity_ids(ctx).await?;
+            for kind in SWEEP_KINDS {
+                if !ctx.opt.kinds.is_empty() && !ctx.opt.kinds.iter().any(|k| k == kind) {
+                    continue;
+                }
+                if !offered.contains(&ctx.select(kind)) {
+                    summary.push(format!("{kind}: not offered"));
+                    continue;
+                }
+                if let Some(tally) = sweep_select(ctx, kind, &mut problems).await? {
+                    verified += tally.verified;
+                    summary.push(format!("{kind}: {}", tally.describe()));
+                }
+            }
+            Ok((summary, verified))
+        },
+    )
     .await;
+    let ended = matches!(waited, Ok(Watched::Ended(_)));
+    let result = with_rise(waited);
     let sweep = if result.is_ok() && problems.is_empty() {
         Sweep::Clean
     } else {
         Sweep::Failed
     };
-    let undo = sweep_back(ctx, &dirac_original, dynamic_eq.as_deref(), sweep).await;
+    let undo = with_rise(
+        watched_any(
+            ctx,
+            volume,
+            "while the selects were set back",
+            async |ctx: &mut Ctx| {
+                if ended {
+                    selects_back(ctx, &originals, &mut problems).await;
+                }
+                sweep_back(ctx, &dirac_original, dynamic_eq.as_deref(), sweep).await
+            },
+        )
+        .await,
+    );
     let (summary, verified) = first_error(result, undo).map_err(|e| {
         if problems.is_empty() {
             e
@@ -4420,6 +5090,47 @@ pub async fn select_sweep(ctx: &mut Ctx) -> Check {
         summary.join(" | ")
     );
     Ok(format!("{verified} verified. {}", summary.join(" | ")))
+}
+
+/// The selects of [`select_sweep`], in the order of the sweep.
+const SWEEP_KINDS: [&str; 9] = [
+    "dimmer",
+    "eco_mode",
+    "reference_level_offset",
+    "dynamic_volume",
+    "monitor_output",
+    "speaker_preset",
+    "picture_mode",
+    "digital_codec",
+    "dirac_filter",
+];
+
+/// Set each select of `originals` back to its option before the sweep if the driver shows another
+/// one, after a rise stopped [`select_sweep`] in the middle. The Dirac filter is left to
+/// [`sweep_back`]. Adds what went wrong to `problems`.
+async fn selects_back(ctx: &mut Ctx, originals: &[(&str, Value)], problems: &mut Vec<String>) {
+    for (kind, original) in originals {
+        let shown = ctx.client.attr(&ctx.select(kind), "current_option");
+        if *kind == "dirac_filter"
+            || original.is_null()
+            || original == "--"
+            || shown == Some(original)
+        {
+            continue;
+        }
+        match sweep_one(ctx, kind, original).await {
+            Ok(Outcome::Refused(reason)) => {
+                problems.push(format!("{kind} back to {original}: refused: {reason}"));
+            }
+            Ok(Outcome::Ignored) => {
+                problems.push(format!(
+                    "{kind} back to {original}: ignored by the receiver"
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => problems.push(format!("{kind} back to {original}: {e}")),
+        }
+    }
 }
 
 /// How the select sweep ended.
@@ -4467,9 +5178,14 @@ async fn sweep_back(
         }
     }
     if let (Some(oracle), Some(saved)) = (&ctx.oracle, dynamic_eq) {
-        match restore::write(oracle.avr(), &["PSDYNEQ ?"], saved)
-            .await
-            .map(restore::Missed::into_lines)
+        match restore::write(
+            oracle.avr(),
+            &["PSDYNEQ ?"],
+            saved,
+            restore::SourceSend::Never,
+        )
+        .await
+        .map(restore::Missed::into_lines)
         {
             Ok(missed) if missed.is_empty() => {}
             Ok(missed) => problems.push(format!("Dynamic EQ not set back: {missed:?}")),
@@ -4564,8 +5280,9 @@ async fn sweep_one(ctx: &mut Ctx, kind: &str, option: &Value) -> Result<Outcome,
 /// cannot be set back. The receiver answers the LFE level of the 7.1 input only while that input
 /// is used, so it cannot be set back either. A tuner preset goes to a stored frequency: preset up
 /// and down do not come back to the start frequency, and the sweep does not set the frequency
-/// back. `RESET` counts only as a whole part between `_`, so the speaker and Auro-Matic 3D presets
-/// are sent: [`restore::QUERIES`] sets them back.
+/// back. The tuner band, frequency and mode have no query that the set back uses, so they cannot
+/// be set back either. `RESET` counts only as a whole part between `_`, so the speaker and
+/// Auro-Matic 3D presets are sent: [`restore::QUERIES`] sets them back.
 fn skipped(name: &str) -> bool {
     name.split('_').any(|part| part == "RESET")
         || [
@@ -4573,6 +5290,9 @@ fn skipped(name: &str) -> bool {
             "QUICK_",
             "SMART_",
             "TUNER_PRESET",
+            "TUNER_BAND",
+            "TUNER_FREQUENCY",
+            "TUNER_MODE",
             "MEMORY",
             "VOLUME",
             "NETWORK_RESTART",
@@ -4586,16 +5306,27 @@ fn skipped(name: &str) -> bool {
 
 /// Check the save and restore of `simple_commands`: save the settings, change the sleep timer, set
 /// the settings back and check that they all came back. The sleep timer works on every input and
-/// does not change the sound.
+/// does not change the sound. The start volume comes from [`start_volume`] before the change: the
+/// check skips if it gives an error. The set back is watched with [`watched_any`] and the start
+/// volume, also right after it: a rise is lowered and fails. A volume above the limit or not known
+/// after it (see [`restore::cap_volume`]) fails too.
 pub async fn settings_restore(ctx: &mut Ctx) -> Check {
     ensure_on(ctx).await?;
-    let Some(oracle) = &ctx.oracle else {
+    // A copy that shares the connection: `watched_any` needs `ctx` while the set back uses it.
+    let Some(oracle) = ctx.oracle.clone() else {
         return Err(Fail::skip("needs the second connection"));
     };
     restore::ensure_nothing_left()?;
+    let receiver = receiver_volume(ctx).await?;
+    let start = start_volume(receiver, driver_volume(ctx).await?).map_err(Fail::skip)?;
     let avr = oracle.avr();
     let mut saved = restore::read(avr, restore::QUERIES).await?;
     restore::ensure_source(&saved)?;
+    if let Some(line) = saved.iter().find(|l| restore::sleep_counts(l)) {
+        return Err(Fail::skip(format!(
+            "the sleep timer counts down ({line}): it cannot be set back"
+        )));
+    }
     // The check does not change the source. A marked line is never sent, so a file left by a stop
     // never selects a source.
     restore::mark_source(&mut saved);
@@ -4609,9 +5340,7 @@ pub async fn settings_restore(ctx: &mut Ctx) -> Check {
         .into_iter()
         .find(|l| *l != sleep)
         .unwrap_or("SLP120");
-    // Set right before the set back, which can send lines and then fail.
-    let mut writing = false;
-    let result = async {
+    let changed = async {
         avr.telnet_send(Zone::Main, Command::Raw(other)).await?;
         tokio::time::sleep(Duration::from_secs(1)).await;
         let changed = restore::read(avr, &["SLP?"]).await?;
@@ -4620,96 +5349,150 @@ pub async fn settings_restore(ctx: &mut Ctx) -> Check {
             changed.iter().any(|l| l != &sleep && l != "SLPOFF"),
             "the sleep timer did not change to {other}: {changed:?}"
         );
-        writing = true;
-        restore::write(avr, restore::QUERIES, &saved).await
+        Ok(())
     }
     .await;
-    let mut missed = match result {
-        Ok(missed) => missed,
-        Err(e) => {
-            // A failed send can still reach the receiver, the receiver can take the new timer
-            // after the read, or the set back can stop early.
-            let undo = sleep_back(avr, &sleep).await;
-            // The check changes only the sleep timer. A set back that stopped while it sent can
-            // leave other settings changed, for example Dirac: the file stays.
-            if undo.is_ok() && !writing {
-                restore::forget().await;
-            }
-            let e = if writing {
-                Fail::new(format!(
-                    "{e}. The settings stay in {}",
-                    restore::FILE.display()
-                ))
-            } else {
-                e
-            };
-            return first_error(Err(e), undo);
+    // True if the set back ran, which can send lines and then fail.
+    let writing = changed.is_ok();
+    let (result, rise) = match changed {
+        Ok(()) => {
+            // The set back or the owner can change the volume, for example with a speaker preset.
+            let waited = watched_any(
+                ctx,
+                start,
+                "while the settings were set back",
+                async |_: &mut Ctx| {
+                    restore::write(avr, restore::QUERIES, &saved, restore::SourceSend::Never).await
+                },
+            )
+            .await;
+            end_watch(waited)
         }
+        Err(e) => (Err(e), None),
     };
-    // The write stopped because of the source. The sleep timer is the same for every source, so
-    // it is set back. The check changes no other setting, so then nothing is left to set back.
-    if matches!(missed, restore::Missed::NotSent(_)) {
-        return Err(match sleep_back(avr, &sleep).await {
-            Ok(()) => {
-                restore::forget().await;
-                Fail::new(
-                    "the set back stopped because of the source. The sleep timer was set back",
-                )
+    // The volume is read after the set back and only lowered, as after an early stop.
+    let volume = restore::cap_volume(&oracle).await;
+    let check = async {
+        let mut missed = match result {
+            Ok(missed) => missed,
+            Err(e) => {
+                // A failed send can still reach the receiver, the receiver can take the new timer
+                // after the read, or the set back can stop early.
+                let undo = sleep_back(avr, &sleep).await;
+                // The check changes only the sleep timer. A set back that stopped while it sent can
+                // leave other settings changed, for example Dirac: the file stays.
+                if undo.is_ok() && !writing {
+                    restore::forget().await;
+                }
+                let e = if writing {
+                    Fail::new(format!(
+                        "{e}. The settings stay in {}",
+                        restore::FILE.display()
+                    ))
+                } else {
+                    e
+                };
+                return first_error(Err(e), undo);
             }
-            Err(e) => Fail::new(format!(
-                "the set back stopped because of the source. Not set back: {e}. The settings stay in {}",
+        };
+        // The write stopped because of the source or the speaker preset. The sleep timer is the
+        // same for every source and preset, so it is set back. The check changes no other setting,
+        // so then nothing is left to set back.
+        if let restore::Missed::NotSent(_, why) = missed {
+            return Err(match sleep_back(avr, &sleep).await {
+                Ok(()) => {
+                    restore::forget().await;
+                    Fail::new(format!(
+                        "the set back stopped: {why}. The sleep timer was set back"
+                    ))
+                }
+                Err(e) => Fail::new(format!(
+                    "the set back stopped: {why}. Not set back: {e}. The settings stay in {}",
+                    restore::FILE.display()
+                )),
+            });
+        }
+        let sound = missed.take_sound_mode();
+        let missed = missed.into_lines();
+        let body = if missed.is_empty() {
+            Ok(())
+        } else {
+            Err(Fail::new(format!(
+                "not set back: {missed:?}{}. They stay in {}",
+                if sound.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {sound:?}")
+                },
                 restore::FILE.display()
-            )),
-        });
-    }
-    let sound = missed.take_sound_mode();
-    let missed = missed.into_lines();
-    let body = if missed.is_empty() {
-        Ok(())
-    } else {
-        Err(Fail::new(format!(
-            "not set back: {missed:?}{}. They stay in {}",
-            if sound.is_empty() {
-                String::new()
-            } else {
-                format!(", {sound:?}")
-            },
+            )))
+        };
+        body?;
+        restore::forget().await;
+        ensure!(
+            !restore::FILE.exists(),
+            "{} was not removed",
             restore::FILE.display()
-        )))
+        );
+        let sound_note = if sound.is_empty() {
+            String::new()
+        } else {
+            format!(", sound mode not taken: {sound:?}{}", restore::SOUND_NOTE)
+        };
+        Ok(format!(
+            "{} settings read, {sleep} -> {other} -> {sleep}, all set back{sound_note}",
+            saved.len()
+        ))
+    }
+    .await;
+    add_failure(add_cap(check, &volume), rise_result(rise))
+}
+
+/// Add the note `cap` of [`restore::cap_volume`] to the text of `check`. A note means that the
+/// volume was above the limit or not known: a failure, also after a skip. An empty note leaves
+/// `check` as it is.
+fn add_cap(check: Check, cap: &str) -> Check {
+    if cap.is_empty() {
+        return check;
+    }
+    let mut msg = match check {
+        Ok(text) => text,
+        Err(e) => e.msg,
     };
-    body?;
-    restore::forget().await;
-    ensure!(
-        !restore::FILE.exists(),
-        "{} was not removed",
-        restore::FILE.display()
-    );
-    let sound_note = if sound.is_empty() {
-        String::new()
-    } else {
-        format!(", sound mode not taken: {sound:?}{}", restore::SOUND_NOTE)
-    };
-    Ok(format!(
-        "{} settings read, {sleep} -> {other} -> {sleep}, all set back{sound_note}",
-        saved.len()
-    ))
+    msg.push_str(cap);
+    Err(Fail::new(msg))
 }
 
 /// Set the sleep timer back to the saved line `sleep`.
 async fn sleep_back(avr: &denon_marantz::Avr, sleep: &str) -> Result<(), Fail> {
-    let missed = restore::write(avr, &["SLP?"], &[sleep.to_owned()])
-        .await?
-        .into_lines();
+    let missed = restore::write(
+        avr,
+        &["SLP?"],
+        &[sleep.to_owned()],
+        restore::SourceSend::Never,
+    )
+    .await?
+    .into_lines();
     ensure!(missed.is_empty(), "sleep timer: {missed:?}");
     Ok(())
 }
 
-/// Send every simple command of the remote entity, and check the entities against the receiver.
-/// The settings that the commands change and the source are saved first and set back at the end,
-/// also when the check fails. The source is set back only if it may be selected.
+/// Send every simple command of the remote entity, and check the entities against the receiver. The
+/// settings that the commands change and the source are saved first and set back at the end, also
+/// when the check fails. The source is set back only if it may be selected and the source now may
+/// be changed. The set back is watched with [`watched_any`] and the start volume of
+/// [`send_simple_commands`] (the limit if it is not known), also right after it: a rise is lowered
+/// and fails. A volume above the limit or not known after it (see [`restore::cap_volume`]) fails
+/// too. If a rise was not lowered or a volume read failed in the commands, or no start volume is
+/// known, the set back selects no source. After such a rise in the commands or in the set back, the
+/// owner is asked with [`owner_source_back`] if the source changed. The owner is also asked if the
+/// source changed and the set back stopped early or failed, for example when the receiver lost the
+/// source in the set back, or when the volume after the set back was above the limit or not known
+/// (see [`CAP_NOT_SAFE`]).
 pub async fn simple_commands(ctx: &mut Ctx) -> Check {
     ensure_on(ctx).await?;
-    let Some(oracle) = &ctx.oracle else {
+    // A copy that shares the connection: `watched_any` needs `ctx` while the set back uses it.
+    let Some(oracle) = ctx.oracle.clone() else {
         return Err(Fail::skip(
             "needs the second connection: it saves the settings",
         ));
@@ -4717,26 +5500,121 @@ pub async fn simple_commands(ctx: &mut Ctx) -> Check {
     restore::ensure_nothing_left()?;
     let mut saved = restore::read(oracle.avr(), restore::QUERIES).await?;
     restore::ensure_source(&saved)?;
-    let start = restore::saved_source(&saved);
-    let plan = match read_sources(ctx).await {
-        Ok(sources) => SourcePlan::new(&source_rule(ctx, &sources), start),
-        Err(why) => SourcePlan::none(why),
+    restore::leave_out_counting_sleep(&mut saved);
+    let start_code = restore::saved_source(&saved).map(str::to_owned);
+    let start_label = ctx.client.text(&ctx.mp(), "source");
+    let (plan, sources) = match read_sources(ctx).await {
+        Ok(sources) => (
+            SourcePlan::new(&source_rule(ctx, &sources), start_code.as_deref()),
+            sources,
+        ),
+        Err(why) => (SourcePlan::none(why), Vec::new()),
     };
     // The file never holds a source that may not be selected: the next run would select it.
     if !plan.start_ok {
         restore::mark_source(&mut saved);
     }
     restore::save(&saved).await?;
-    let result = send_simple_commands(ctx, &plan).await;
-    let oracle = ctx
-        .oracle
-        .as_ref()
-        .ok_or_else(|| Fail::new("the second connection is gone"))?;
+    let (result, volume) = send_simple_commands(ctx, &plan).await;
+    // The plan checked the start source. As in `source_set_back`, the source now must pass the
+    // rule too, with its code from `select_code`.
+    let now_ok = oracle
+        .state()
+        .zone(Zone::Main)
+        .source
+        .as_deref()
+        .is_some_and(|now| plan.allows(select_code(&sources, now)));
+    // Without a start volume the set back is not watched against it: no source is selected.
+    let allowed = !volume.stop && sound_allowed(ctx).is_ok();
+    let source = if plan.start_ok && now_ok && allowed && volume.start.is_some() {
+        restore::SourceSend::Allowed
+    } else {
+        restore::SourceSend::Never
+    };
+    // Without a start volume no command was sent: the limit is the start volume.
+    let start = volume.start.unwrap_or(MAX_VOLUME);
     // The file stays if a setting did not come back: the next run sends them again. A sound mode
-    // that the receiver did not take does not keep the file.
-    let mut missed = restore::write(oracle.avr(), restore::QUERIES, &saved).await?;
+    // that the receiver did not take does not keep the file. The set back or the owner can change
+    // the volume, for example with a speaker preset.
+    let waited = watched_any(
+        ctx,
+        start,
+        "while the settings were set back",
+        async |_: &mut Ctx| restore::write(oracle.avr(), restore::QUERIES, &saved, source).await,
+    )
+    .await;
+    let (missed, rise) = end_watch(waited);
+    // The volume is read after the set back and only lowered, as after an early stop.
+    let cap = restore::cap_volume(&oracle).await;
+    // A set back that stopped early can leave another source.
+    let stopped = match &missed {
+        Ok(restore::Missed::NotSent(_, why)) => Some((*why).to_owned()),
+        Ok(restore::Missed::Lines(_)) => None,
+        Err(e) => Some(e.msg.clone()),
+    };
+    // A cap that lowered or could not check the volume sends the source set back to the owner too.
+    let why = if volume.stop || stops(&rise) {
+        Some(VOLUME_NOT_SAFE.to_owned())
+    } else if !cap.is_empty() {
+        Some(CAP_NOT_SAFE.to_owned())
+    } else {
+        stopped.map(|why| format!("the set back failed: {why}"))
+    };
+    let back = match why {
+        Some(why) => {
+            Some(simple_source_back(ctx, &start_label, start_code.as_deref(), start, &why).await)
+        }
+        None => None,
+    };
+    let check = match missed {
+        Ok(missed) => set_back_result(result, missed, &saved).await,
+        Err(e) => add_failure(
+            result,
+            Err(Fail::new(format!(
+                "{e}. The settings stay in {}",
+                restore::FILE.display()
+            ))),
+        ),
+    };
+    let check = add_cap(check, &cap);
+    let check = match back {
+        Some(back) => add_set_back(check, back),
+        None => check,
+    };
+    add_failure(check, rise_result(rise))
+}
+
+/// Set the start source back through the owner in [`simple_commands`], for the reason `why`: a rise
+/// that was not lowered or a failed volume read (see [`VOLUME_NOT_SAFE`]), a volume above the limit
+/// or not known after the set back (see [`CAP_NOT_SAFE`]), or a set back that stopped early.
+/// `label` is the source that the driver showed at the start, `code` the saved start source.
+/// Nothing is asked if the source did not change, see [`saved_source_changed`]. Without `code` the
+/// owner is asked.
+async fn simple_source_back(
+    ctx: &mut Ctx,
+    label: &str,
+    code: Option<&str>,
+    start: f64,
+    why: &str,
+) -> Result<SetBack, Fail> {
+    let now_label = ctx.client.text(&ctx.mp(), "source");
+    let now = main_source(ctx);
+    if code.is_some_and(|code| !saved_source_changed(&now_label, label, now.as_deref(), code)) {
+        return Ok(SetBack::note("the source did not change".to_owned()));
+    }
+    owner_source_back(ctx, label, why, start).await
+}
+
+/// The result of [`simple_commands`] from the result `result` of the commands and the lines
+/// `missed` that the set back of the `saved` lines did not set back. Removes [`restore::FILE`] if
+/// nothing is missed.
+async fn set_back_result(result: Check, mut missed: restore::Missed, saved: &[String]) -> Check {
     let sound = missed.take_sound_mode();
-    let sent = matches!(missed, restore::Missed::Lines(_));
+    let not_sent = match &missed {
+        restore::Missed::Lines(_) => None,
+        restore::Missed::NotSent(_, why) => Some(*why),
+    };
+    let sent = not_sent.is_none();
     let mut missed = missed.into_lines();
     if missed.is_empty() {
         restore::forget().await;
@@ -4762,10 +5640,13 @@ pub async fn simple_commands(ctx: &mut Ctx) -> Check {
             restore::SOUND_NOTE
         );
     }
+    if let Some(why) = not_sent {
+        let _ = write!(late_note, ". The set back stopped: {why}");
+    }
     match (result, missed.is_empty()) {
         (Ok(note), true) => Ok(format!(
             "{note}, {} settings set back{late_note}",
-            saved.len() - late.len() - sound.len()
+            restore::sent_count(saved).saturating_sub(late.len() + sound.len())
         )),
         (Ok(note), false) => Err(Fail::new(format!(
             "{note}. Settings not set back: {missed:?}{late_note}"
@@ -4789,7 +5670,29 @@ fn command_fields(line: &str) -> Option<(&str, &str, &str)> {
     Some((name, brand, parts.next().unwrap_or_default()))
 }
 
-async fn send_simple_commands(ctx: &mut Ctx, plan: &SourcePlan) -> Check {
+/// The volume state of [`send_simple_commands`].
+#[derive(Default)]
+struct CommandVolume {
+    /// The start volume: the receiver volume before the commands, not above [`MAX_VOLUME`].
+    /// `None` if it was not read: then no command was sent.
+    start: Option<f64>,
+    /// A volume read failed, or a volume above the limit was not lowered, also in a watched
+    /// compare (see [`watched_compare`]): the volume can still be above the start volume, so the
+    /// set back selects no source.
+    stop: bool,
+}
+
+/// Send the simple commands of the plan `plan` with [`send_commands`]. Returns the result and the
+/// volume state.
+async fn send_simple_commands(ctx: &mut Ctx, plan: &SourcePlan) -> (Check, CommandVolume) {
+    let mut volume = CommandVolume::default();
+    let result = send_commands(ctx, plan, &mut volume).await;
+    (result, volume)
+}
+
+/// The commands of [`send_simple_commands`]. `volume` gets the start volume and the stop flag. The
+/// compares after the source commands and the last compare run with [`watched_compare`].
+async fn send_commands(ctx: &mut Ctx, plan: &SourcePlan, volume: &mut CommandVolume) -> Check {
     let remote = ctx.remote();
     let list = entity_list(ctx).await?;
     let offered = strings(
@@ -4830,6 +5733,8 @@ async fn send_simple_commands(ctx: &mut Ctx, plan: &SourcePlan) -> Check {
     // Source and tuner commands go last: some settings are kept for each source, so the other
     // commands change the settings of the start source, which the set back compares.
     names.sort_by_key(|n| changes_source(n, &source_codes));
+    // `skipped` leaves out all tuner commands of the command table: the tuner rule matters only
+    // for a `TUNER_` command that it does not leave out.
     let tuner_offered = offered.iter().any(|o| o.starts_with("TUNER_"));
     let source_note = if plan.start_ok && (plan.tuner_ok || !tuner_offered) {
         format!(", {source_count} source commands")
@@ -4843,19 +5748,27 @@ async fn send_simple_commands(ctx: &mut Ctx, plan: &SourcePlan) -> Check {
     let mut refused: Vec<String> = Vec::new();
     // No command may leave the volume above the volume of the receiver at the start, or above
     // the limit. A start volume above the limit is lowered once.
+    // A failed read stops the sound: the volume is not known.
+    volume.stop = true;
     let start = receiver_volume(ctx)
         .await?
         .ok_or_else(|| Fail::new("no second connection"))?;
+    volume.start = Some(start.min(MAX_VOLUME));
     let mut start_note = String::new();
     if start > MAX_VOLUME {
-        lower_volume(ctx, None).await.map_err(|e| {
+        let sent = lower_volume(ctx, None).await.map_err(|e| {
             Fail::new(format!(
                 "the start volume {start} is above the limit {MAX_VOLUME}, not lowered: {e}"
             ))
         })?;
-        start_note = format!(". The start volume {start} was lowered to {MAX_VOLUME}");
+        start_note = sent.map_or_else(
+            || format!(". The start volume {start} was above {MAX_VOLUME}, nothing was sent: the receiver is not above it now"),
+            |sent| format!(". The start volume {start} was lowered to {sent}"),
+        );
     }
-    let baseline = Some(start.min(MAX_VOLUME));
+    volume.stop = false;
+    let watch_start = start.min(MAX_VOLUME);
+    let baseline = Some(watch_start);
     let limit = unmute_limit(baseline);
     // A speaker preset command was sent since the last compare.
     let mut preset_sent = false;
@@ -4905,28 +5818,87 @@ async fn send_simple_commands(ctx: &mut Ctx, plan: &SourcePlan) -> Check {
             ctx.oracle.as_ref().and_then(Oracle::volume),
         );
         if seen.is_some_and(|v| above_baseline(v, baseline)) {
-            let real = receiver_volume(ctx).await?;
+            volume.stop = true;
+            let real = match receiver_volume(ctx).await {
+                Ok(real) => real,
+                Err(e) => {
+                    let text = format!("{name}: the volume could not be read: {e}");
+                    note_rise(ctx, Raised::new(text.clone(), false));
+                    return Err(Fail::new(format!(
+                        "{text}. Earlier problems: {}",
+                        problems.join(" | ")
+                    )));
+                }
+            };
             if real.is_none_or(|v| above_baseline(v, baseline)) {
                 let real = real.map_or_else(|| "an unknown volume".to_owned(), |v| v.to_string());
-                lower_volume(ctx, baseline).await.map_err(|e| {
-                    Fail::new(format!(
-                        "{name}: the volume went to {real}, above {limit}, not lowered: {e}. Earlier problems: {}",
-                        problems.join(" | ")
-                    ))
-                })?;
-                problems.push(format!(
-                    "{name}: the volume went to {real}, above {limit}, it was lowered"
-                ));
+                let sent = match lower_volume(ctx, baseline).await {
+                    Ok(sent) => sent,
+                    Err(e) => {
+                        let text = format!(
+                            "{name}: the volume went to {real}, above {limit}, not lowered: {e}"
+                        );
+                        note_rise(ctx, Raised::new(text.clone(), false));
+                        return Err(Fail::new(format!(
+                            "{text}. Earlier problems: {}",
+                            problems.join(" | ")
+                        )));
+                    }
+                };
+                let done = sent.map_or_else(
+                    || "nothing was sent: the receiver is not above it now".to_owned(),
+                    |sent| format!("it was lowered to {sent}"),
+                );
+                let text = format!("{name}: the volume went to {real}, above {limit}, {done}");
+                note_rise(ctx, Raised::new(text.clone(), true));
+                problems.push(text);
             }
+            volume.stop = false;
         }
         if i % 10 == 9 {
-            compare_group(ctx, name, preset_sent, &mut problems).await?;
+            // Source commands go last: if `name` is one, the source can play.
+            if changes_source(name, &source_codes) {
+                let at = format!("after {name}");
+                let go_on = watched_compare(
+                    ctx,
+                    watch_start,
+                    &at,
+                    "while the entities were compared after the source commands",
+                    volume,
+                    &mut problems,
+                    async |ctx: &mut Ctx, problems: &mut Vec<String>| {
+                        compare_group(ctx, name, preset_sent, problems).await
+                    },
+                )
+                .await?;
+                if !go_on {
+                    problems.insert(
+                        0,
+                        format!("the commands after {name} not sent: {STOP_TEXT}"),
+                    );
+                    sent = i + 1;
+                    break;
+                }
+            } else {
+                compare_group(ctx, name, preset_sent, &mut problems).await?;
+            }
             preset_sent = false;
         }
     }
-    verify_fresh(ctx)
-        .await
-        .map_err(|e| Fail::new(format!("at the end: {e}")))?;
+    watched_compare(
+        ctx,
+        watch_start,
+        "at the end",
+        "while the entities were compared at the end",
+        volume,
+        &mut problems,
+        async |ctx: &mut Ctx, _: &mut Vec<String>| {
+            verify_fresh(ctx)
+                .await
+                .map_err(|e| Fail::new(format!("at the end: {e}")))
+        },
+    )
+    .await?;
     if problems.is_empty() {
         // The effect of one command is not checked: only that the entities showed the values of
         // the receiver after each group of 10 commands.
@@ -4942,6 +5914,38 @@ async fn send_simple_commands(ctx: &mut Ctx, plan: &SourcePlan) -> Check {
             problems.join(" | ")
         )))
     }
+}
+
+/// Run the compare `wait` of [`send_commands`] with [`watched_any`] and the start volume `start`: a
+/// source command can play. The watch reads the volume once more after the wait. A rise goes to
+/// `problems` with the prefix `at`, so it fails the check. After a rise that was not lowered or a
+/// failed volume read, `volume.stop` is set and the result is `Ok(false)`: no more command is sent.
+/// Error if `wait` fails; the error then has the rise too. `when` says in the text when the volume
+/// was read during the wait.
+async fn watched_compare(
+    ctx: &mut Ctx,
+    start: f64,
+    at: &str,
+    when: &str,
+    volume: &mut CommandVolume,
+    problems: &mut Vec<String>,
+    wait: impl AsyncFnOnce(&mut Ctx, &mut Vec<String>) -> Result<(), Fail>,
+) -> Result<bool, Fail> {
+    let waited = watched_any(ctx, start, when, async |ctx: &mut Ctx| {
+        wait(ctx, &mut *problems).await
+    })
+    .await;
+    let (result, rise) = match waited {
+        Ok(Watched::Ended(rise)) => (Ok(()), Some(rise)),
+        waited => end_watch(waited),
+    };
+    let stop = stops(&rise);
+    volume.stop |= stop;
+    match (result, rise) {
+        (Ok(()), Some(rise)) => problems.push(format!("{at}: {}", rise.fail)),
+        (result, rise) => add_failure(result, rise_result(rise))?,
+    }
+    Ok(!stop)
 }
 
 /// A source may be selected: the receiver gives its name, the source names page gives its default
@@ -4983,7 +5987,8 @@ struct SourcePlan {
     /// or tuner command is sent without it.
     start_ok: bool,
     /// The start source may be selected, a tuner source exists and each tuner source may be
-    /// selected: a tuner command can select the tuner.
+    /// selected: a tuner command can select the tuner. [`skipped`] leaves out all tuner commands of
+    /// the command table, so this matters only for a `TUNER_` command that it does not leave out.
     tuner_ok: bool,
     /// Codes of the sources that may be selected.
     allowed: Vec<String>,
@@ -5032,12 +6037,18 @@ impl SourcePlan {
         }
     }
 
+    /// The source with this telnet code may be selected.
+    fn allows(&self, code: &str) -> bool {
+        self.allowed.iter().any(|a| a == code)
+    }
+
     /// The simple command `name` may be sent. `codes` are the sources that it selects: empty if it
     /// is not a source command.
     fn command_ok(&self, name: &str, codes: &[&str]) -> bool {
         if !codes.is_empty() {
-            return self.start_ok && codes.iter().all(|c| self.allowed.iter().any(|a| a == c));
+            return self.start_ok && codes.iter().all(|c| self.allows(c));
         }
+        // Only for a `TUNER_` command that `skipped` does not leave out.
         self.tuner_ok || !name.starts_with("TUNER_")
     }
 }
@@ -5090,7 +6101,9 @@ async fn compare_group(
 // ---------------------------------------------------------------- extra entities
 
 /// Switch the tone control and change the bass level, then restore both. The triggers and the
-/// Bluetooth transmitter are not changed: they can switch other equipment.
+/// Bluetooth transmitter are not changed: they can switch other equipment. The changes and the set
+/// back are watched with the start volume from [`start_volume`], see [`watched`]: a rise is
+/// lowered and fails.
 pub async fn extra_entities(ctx: &mut Ctx) -> Check {
     ensure_on(ctx).await?;
     verify_fresh(ctx).await?;
@@ -5107,100 +6120,118 @@ pub async fn extra_entities(ctx: &mut Ctx) -> Check {
     let mut tone_changed = false;
     // The bass level before its change. `None` while the bass is not changed.
     let mut bass_start = None;
-    let result = async {
-        tone_changed = true;
-        let (response, _) = ctx
-            .client
-            .command("switch", &tone, "toggle", json!({}))
-            .await?;
-        if [409, 503].contains(&response["code"].as_u64().unwrap_or(0)) {
-            tone_changed = false;
-            // A Dirac filter blocks the tone control.
-            notes.push(format!(
-                "tone control refused: {}",
-                response["msg_data"]["message"]
-                    .as_str()
-                    .unwrap_or("no reason")
-            ));
-        } else {
-            ensure!(response["code"] == 200, "toggle: code {}", response["code"]);
-            let after = if before == "ON" { "OFF" } else { "ON" };
-            if ctx
+    // The tone and bass changes can make the sound louder: the receiver volume is watched.
+    let volume = setting_start(ctx).await?;
+    let waited = watched(
+        ctx,
+        volume,
+        "while the tone was changed",
+        async |ctx: &mut Ctx| {
+            tone_changed = true;
+            let (response, _) = ctx
                 .client
-                .wait_text(&tone, "state", 6, after)
-                .await
-                .is_err()
-            {
-                // The receiver can ignore it, for example in a direct sound mode. The driver is
-                // right if it shows what the receiver has.
-                verify_all(ctx, 3).await?;
-                notes.push("tone control: the receiver did not change it".to_owned());
+                .command("switch", &tone, "toggle", json!({}))
+                .await?;
+            if [409, 503].contains(&response["code"].as_u64().unwrap_or(0)) {
+                tone_changed = false;
+                // A Dirac filter blocks the tone control.
+                notes.push(format!(
+                    "tone control refused: {}",
+                    response["msg_data"]["message"]
+                        .as_str()
+                        .unwrap_or("no reason")
+                ));
             } else {
-                verify_all(ctx, 6).await?;
-                ctx.client
-                    .command_ok("switch", &tone, "toggle", json!({}))
-                    .await?;
-                ctx.client.wait_text(&tone, "state", 6, &before).await?;
-                verify_all(ctx, 6).await?;
-                notes.push("tone control toggled and restored".to_owned());
-            }
-        }
-
-        let start = ctx.client.attr(&bass, "value").and_then(Value::as_i64);
-        bass_start = start;
-        match start {
-            None => notes.push("bass has no value".to_owned()),
-            Some(start) => {
-                let (up, back) = if start < 6 {
-                    ("increment", "decrement")
-                } else {
-                    ("decrement", "increment")
-                };
-                let moved = if start < 6 { start + 1 } else { start - 1 };
-                let (response, _) = ctx.client.command("number", &bass, up, json!({})).await?;
-                if response["code"] == 409 {
-                    bass_start = None;
-                    // A Dirac filter blocks the tone control.
-                    notes.push(format!(
-                        "bass refused: {}",
-                        response["msg_data"]["message"]
-                            .as_str()
-                            .unwrap_or("no reason")
-                    ));
-                    return Ok(notes.join(", "));
-                }
-                ensure!(response["code"] == 200, "{up}: code {}", response["code"]);
-                let moved_to = ctx
+                ensure!(response["code"] == 200, "toggle: code {}", response["code"]);
+                let after = if before == "ON" { "OFF" } else { "ON" };
+                if ctx
                     .client
-                    .wait_attr(&bass, "value", 6, |v| v.as_i64() == Some(moved))
-                    .await;
-                if moved_to.is_err() {
+                    .wait_text(&tone, "state", 6, after)
+                    .await
+                    .is_err()
+                {
+                    // The receiver can ignore it, for example in a direct sound mode. The driver is
+                    // right if it shows what the receiver has.
                     verify_all(ctx, 3).await?;
-                    notes.push("bass: the receiver did not change it".to_owned());
+                    notes.push("tone control: the receiver did not change it".to_owned());
                 } else {
                     verify_all(ctx, 6).await?;
                     ctx.client
-                        .command_ok("number", &bass, back, json!({}))
+                        .command_ok("switch", &tone, "toggle", json!({}))
                         .await?;
-                    ctx.client
-                        .wait_attr(&bass, "value", 6, |v| v.as_i64() == Some(start))
-                        .await?;
+                    ctx.client.wait_text(&tone, "state", 6, &before).await?;
                     verify_all(ctx, 6).await?;
-                    notes.push(format!("bass {start} -> {moved} -> {start} dB"));
+                    notes.push("tone control toggled and restored".to_owned());
                 }
             }
-        }
-        Ok(notes.join(", "))
-    }
+
+            let start = ctx.client.attr(&bass, "value").and_then(whole_db);
+            bass_start = start;
+            match start {
+                None => notes.push("bass has no value".to_owned()),
+                Some(start) => {
+                    let (up, back) = if start < 6 {
+                        ("increment", "decrement")
+                    } else {
+                        ("decrement", "increment")
+                    };
+                    let moved = if start < 6 { start + 1 } else { start - 1 };
+                    let (response, _) = ctx.client.command("number", &bass, up, json!({})).await?;
+                    if response["code"] == 409 {
+                        bass_start = None;
+                        // A Dirac filter blocks the tone control.
+                        notes.push(format!(
+                            "bass refused: {}",
+                            response["msg_data"]["message"]
+                                .as_str()
+                                .unwrap_or("no reason")
+                        ));
+                        return Ok(notes.join(", "));
+                    }
+                    ensure!(response["code"] == 200, "{up}: code {}", response["code"]);
+                    let moved_to = ctx
+                        .client
+                        .wait_attr(&bass, "value", 6, |v| whole_db(v) == Some(moved))
+                        .await;
+                    if moved_to.is_err() {
+                        verify_all(ctx, 3).await?;
+                        notes.push("bass: the receiver did not change it".to_owned());
+                    } else {
+                        verify_all(ctx, 6).await?;
+                        ctx.client
+                            .command_ok("number", &bass, back, json!({}))
+                            .await?;
+                        ctx.client
+                            .wait_attr(&bass, "value", 6, |v| whole_db(v) == Some(start))
+                            .await?;
+                        verify_all(ctx, 6).await?;
+                        notes.push(format!("bass {start} -> {moved} -> {start} dB"));
+                    }
+                }
+            }
+            Ok(notes.join(", "))
+        },
+    )
     .await;
+    let result = with_rise(waited);
     let tone_before = tone_changed.then_some(before.as_str());
-    let undo = tone_back(ctx, &tone, tone_before, &bass, bass_start, result.is_err()).await;
+    let undo = with_rise(
+        watched_any(
+            ctx,
+            volume,
+            "while the tone was set back",
+            async |ctx: &mut Ctx| {
+                tone_back(ctx, &tone, tone_before, &bass, bass_start, result.is_err()).await
+            },
+        )
+        .await,
+    );
     first_error(result, undo)
 }
 
 /// Set the tone control switch back to `tone_before`, then the bass level back to `bass_start`.
 /// `None` means that the check did not change the value: nothing is sent for it. Without `force`,
-/// a value that the driver shows as the old one is not sent.
+/// a value that the driver shows as the old one is not sent. The bass is read with [`whole_db`].
 async fn tone_back(
     ctx: &mut Ctx,
     tone: &str,
@@ -5225,13 +6256,13 @@ async fn tone_back(
     .await;
     let bass_result = async {
         if let Some(start) = bass_start
-            && (force || ctx.client.attr(bass, "value").and_then(Value::as_i64) != Some(start))
+            && (force || ctx.client.attr(bass, "value").and_then(whole_db) != Some(start))
         {
             ctx.client
                 .command_ok("number", bass, "set_value", json!({ "value": start }))
                 .await?;
             ctx.client
-                .wait_attr(bass, "value", 6, |v| v.as_i64() == Some(start))
+                .wait_attr(bass, "value", 6, |v| whole_db(v) == Some(start))
                 .await?;
         }
         Ok(())
@@ -5248,10 +6279,14 @@ const HEOS_POSITION_SLACK: i64 = 4;
 
 /// HEOS: what plays, the position, the number of events and play and pause, compared with a second
 /// HEOS connection. If HEOS does not play on the main zone, the owner is asked to start it, see
-/// [`start_heos`]. The check sends no volume command, except the lowering after a power on and
-/// the lowering with [`cap_volume`] in [`start_heos`], and in the set back of the source. If the
-/// owner was asked to start HEOS, the end steps of [`heos_end`] run, also after a failure: HEOS is
-/// paused or stopped and the start source is set back.
+/// [`start_heos`]. The check sends no volume command, except the lowering after a power on, the
+/// lowering with [`cap_volume`] in [`start_heos`], the lowering of a volume above the start volume
+/// by the volume watch (see [`start_heos`], [`heos_compare`] and [`heos_played_watched`]) and in
+/// [`heos_end`], and in the set back of the source. If the owner was asked to start HEOS, the end
+/// steps of [`heos_end`] run, also after a failure: HEOS is paused or stopped, a volume above the
+/// start volume is lowered and the start source is set back. If the check switched the receiver on
+/// and the owner did not start HEOS, a skip puts the receiver back to standby with
+/// [`standby_again`].
 pub async fn heos(ctx: &mut Ctx) -> Check {
     use denon_marantz_heos::Heos;
     let mp = ctx.mp();
@@ -5275,7 +6310,16 @@ pub async fn heos(ctx: &mut Ctx) -> Check {
     let mut started = None;
     let result = heos_compare(ctx, &heos, &features, &mut started).await;
     let result = match started {
-        Some(start) => heos_end(ctx, &heos, &start, result).await,
+        Some(start) => {
+            let result = heos_end(ctx, &heos, &start, result).await;
+            match result {
+                // The receiver was switched on only for HEOS, and the owner did not start it.
+                Err(e) if e.skip && start.was_off && !start.answered => {
+                    Err(standby_again(ctx, e).await)
+                }
+                result => result,
+            }
+        }
         None => result,
     };
     heos.close().await;
@@ -5291,52 +6335,108 @@ struct HeosStart {
     source: String,
     /// The source list of the driver.
     list: Vec<String>,
-    /// The telnet code of the source from the second connection.
-    code: Option<String>,
-    /// The higher of the receiver and the driver volume, the limit for the set back of the source.
+    /// The source from the second connection, as the library keeps it, see [`state_source`].
+    code: String,
+    /// The start volume from [`start_volume`]: the limit for the set back of the source, for a
+    /// rise at the end (see [`heos_end`]) and for a rise while the owner prompt of the set back
+    /// waits.
     volume: f64,
+    /// The receiver was off before [`start_heos`] switched it on, see [`was_off`].
+    was_off: bool,
     /// The owner said that HEOS plays.
     answered: bool,
+    /// A rise of the receiver volume was not lowered or a volume read failed: the source set back
+    /// goes through the owner, see [`VOLUME_NOT_SAFE`].
+    stop: bool,
 }
 
-/// The end steps of [`heos`] after the owner was asked to start HEOS, added to the result
-/// `result`: pause or stop HEOS with [`end_heos_play`], then set the start source back with
-/// [`heos_source_back`]. The check first reads the events for 300 ms, or for 2 s if the owner
-/// did not say that HEOS plays: HEOS can start a moment after the answer.
+/// The end steps of [`heos`] and of the track part of [`media_keys`] after the owner was asked to
+/// start HEOS, added to the result `result`. The check first reads the events for 300 ms, or for
+/// 2 s if the owner did not say that HEOS plays: HEOS can start a moment after the answer. The
+/// volume is watched while it reads, see [`listen_watched`]. Then HEOS is paused or stopped with
+/// [`end_heos_play`], watched with [`watched_any`] too, also after a stop: the watch lowers a
+/// receiver volume above the start volume while or right after the pause (a failure). A rise of the
+/// read and a rise of the pause are joined with [`join_rises`]. Then the start source is set back
+/// with [`heos_source_back`]: through the owner if a rise was not lowered or a volume read failed,
+/// here or before (see [`HeosStart::stop`]).
 async fn heos_end(
     ctx: &mut Ctx,
     heos: &denon_marantz_heos::Heos,
     start: &HeosStart,
     result: Check,
 ) -> Check {
-    let settle = ctx
-        .client
-        .listen_ms(if start.answered { 300 } else { 2000 })
-        .await;
-    let result = add_back_note(result, end_heos_play(heos, start.pid).await);
+    let ms = if start.answered { 300 } else { 2000 };
+    let (settle, ended) = listen_watched(ctx, ms, start.volume, "at the end").await;
+    let paused = watched_any(
+        ctx,
+        start.volume,
+        "while HEOS was paused or stopped",
+        async |_: &mut Ctx| end_heos_play(heos, start.pid).await,
+    )
+    .await;
+    let (paused, pause_rise) = match paused {
+        Ok(Watched::Done(note)) => (Ok(note), None),
+        Ok(Watched::After(note, rise)) => (Ok(note), Some(rise)),
+        Ok(Watched::Ended(rise)) => (
+            Err(Fail::new(format!(
+                "HEOS not paused or stopped at the end: {ENDED_EARLY}"
+            ))),
+            Some(rise),
+        ),
+        Err(e) => (Err(e), None),
+    };
+    let result = add_back_note(result, paused);
+    let rise = match (ended, pause_rise) {
+        (Some(first), Some(second)) => Some(join_rises(first, second)),
+        (first, second) => first.or(second),
+    };
+    let stop = start.stop || stops(&rise);
     // The source is set back also after a failed read: the owner can still be asked.
-    let back = heos_source_back(ctx, start).await;
-    add_set_back(first_error(result, settle), back)
+    let back = heos_source_back(ctx, start, stop).await;
+    add_failure(
+        add_set_back(first_error(result, settle), back),
+        rise_result(rise),
+    )
+}
+
+/// One rise with the texts of the rises `first` and `second`. It is lowered only if both were.
+pub(crate) fn join_rises(first: Raised, second: Raised) -> Raised {
+    // A rise that was not lowered goes last: its text ends with the stop text.
+    let (first, second) = if first.lowered {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    // The stop text comes once, at the end.
+    let msg = &first.fail.msg;
+    let msg = match msg
+        .strip_suffix(STOP_TEXT)
+        .and_then(|m| m.strip_suffix("; "))
+    {
+        Some(m) if !first.lowered => m,
+        _ => msg,
+    };
+    Raised::new(
+        format!("{msg}; {}", second.fail.msg),
+        first.lowered && second.lowered,
+    )
 }
 
 /// Set the start source of `start` back with [`source_back`] if the driver or the second
-/// connection shows another source.
-async fn heos_source_back(ctx: &mut Ctx, start: &HeosStart) -> Result<SetBack, Fail> {
+/// connection shows another source. The owner prompt is watched with the start volume. With
+/// `stop`, the owner is asked at once: the check selects no source.
+async fn heos_source_back(ctx: &mut Ctx, start: &HeosStart, stop: bool) -> Result<SetBack, Fail> {
     let label = ctx.client.text(&ctx.mp(), "source");
     let code = main_source(ctx);
-    if !source_changed(
-        &label,
-        &start.source,
-        code.as_deref(),
-        start.code.as_deref(),
-    ) {
+    if !source_changed(&label, &start.source, code.as_deref(), &start.code) {
         return Ok(SetBack::note("the source did not change".to_owned()));
     }
-    source_back(ctx, &start.source, &start.list, start.volume).await
+    let owner = stop.then_some(VOLUME_NOT_SAFE);
+    source_back(ctx, &start.source, &start.list, start.volume, owner).await
 }
 
-/// The telnet code of the main zone source from the second connection. `None` without that
-/// connection or if it is not known.
+/// The main zone source from the second connection, as the library keeps it, see
+/// [`state_source`]. `None` without that connection or if it is not known.
 fn main_source(ctx: &Ctx) -> Option<String> {
     ctx.oracle
         .as_ref()
@@ -5344,23 +6444,59 @@ fn main_source(ctx: &Ctx) -> Option<String> {
 }
 
 /// The driver shows the source `label` and not the start source `old`, or the second connection
-/// has the code `code` and not the start code `old_code`. Codes are compared only when both are
-/// known.
-fn source_changed(label: &str, old: &str, code: Option<&str>, old_code: Option<&str>) -> bool {
-    label != old || matches!((code, old_code), (Some(c), Some(o)) if c != o)
+/// has the source `code` and not the start source `old_code`. Both are sources as the library
+/// keeps them (see [`state_source`]): a telnet code, or the display name of some network sources.
+/// The source of the second connection is compared only when it is known.
+fn source_changed(label: &str, old: &str, code: Option<&str>, old_code: &str) -> bool {
+    label != old || code.is_some_and(|c| c != old_code)
+}
+
+/// [`source_changed`] for a saved start source `saved`, a telnet code. The source `code` of the
+/// second connection is compared with [`restore::is_source_now`]: the library keeps some network
+/// sources by their display name, for example `Internet Radio` for `IRADIO`.
+fn saved_source_changed(label: &str, old: &str, code: Option<&str>, saved: &str) -> bool {
+    label != old || code.is_some_and(|c| !restore::is_source_now(Some(c), saved))
+}
+
+/// The station of a HEOS item, `""` if it is blank or not known.
+fn heos_station<'a>(media: &'a denon_marantz_heos::NowPlaying<'_>) -> &'a str {
+    media
+        .station
+        .as_deref()
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or("")
+}
+
+/// The title that the driver shows for a HEOS item: the song, else the station.
+fn heos_title<'a>(media: &'a denon_marantz_heos::NowPlaying<'_>) -> &'a str {
+    if media.song.trim().is_empty() {
+        heos_station(media)
+    } else {
+        &media.song
+    }
+}
+
+/// The album that the driver shows for a HEOS item: the album, else the station when the song is
+/// the title. Without a song, the station is the title, so the album stays.
+fn heos_album<'a>(media: &'a denon_marantz_heos::NowPlaying<'_>) -> &'a str {
+    if media.song.trim().is_empty() || !media.album.trim().is_empty() {
+        &media.album
+    } else {
+        heos_station(media)
+    }
 }
 
 /// The part of [`heos`] after the connect to HEOS: the HEOS connection `heos` and the features
 /// `features` of the media player. `started` gets the start values if the owner is asked to start
-/// HEOS.
+/// HEOS. Then the compare of [`heos_playing_checks`] is watched with [`watched`] and the start
+/// volume: a rise ends it and fails. If HEOS played at the start, [`heos_played_watched`] watches
+/// the compare.
 async fn heos_compare(
     ctx: &mut Ctx,
     heos: &denon_marantz_heos::Heos,
     features: &[String],
     started: &mut Option<HeosStart>,
 ) -> Check {
-    use denon_marantz_heos::{PlayState, RepeatMode};
-    let mp = ctx.mp();
     ensure!(
         features.iter().any(|f| f == "media_position"),
         "HEOS answers, but the media player has no position feature"
@@ -5378,17 +6514,70 @@ async fn heos_compare(
         .ok_or_else(|| Fail::new("HEOS player not read"))?;
     let (player, media) = match heos_playing(&player) {
         Some(media) => (player, media),
-        None => start_heos(ctx, heos, pid, started).await?,
+        None => start_heos(ctx, heos, pid, started, None, SKIP_CHECK).await?,
     };
-    let blank = |t: &str| t.trim().is_empty();
-    let station = media.station.as_deref().filter(|t| !blank(t)).unwrap_or("");
-    let (title, album) = if blank(&media.song) {
-        (station, media.album.as_ref())
-    } else if blank(&media.album) {
-        (media.song.as_ref(), station)
-    } else {
-        (media.song.as_ref(), media.album.as_ref())
+    let Some(start) = started.as_mut() else {
+        return heos_played_watched(ctx, "", async |ctx: &mut Ctx| {
+            heos_playing_checks(ctx, heos, pid, &player, &media).await
+        })
+        .await;
     };
+    let waited = watched(
+        ctx,
+        start.volume,
+        "while HEOS played",
+        async |ctx: &mut Ctx| heos_playing_checks(ctx, heos, pid, &player, &media).await,
+    )
+    .await;
+    match waited {
+        Ok(Watched::Done(note)) => Ok(note),
+        Ok(Watched::After(note, rise)) => {
+            add_failure(Ok(note), Err(stop_fail(&mut start.stop, rise)))
+        }
+        Ok(Watched::Ended(rise)) => Err(stop_fail(&mut start.stop, rise)),
+        Err(e) => Err(e),
+    }
+}
+
+/// Run `wait` while HEOS plays and the check did not start it. The receiver volume at the start is
+/// the start volume, see [`start_volume`]: the check only reads it. `wait` is watched with
+/// [`watched`], which reads the volume once more after it. A rise is lowered and fails. A rise that
+/// ends `wait` gets `ended` after its text, if `ended` is not empty. Skips without a second
+/// connection or if [`start_volume`] gives an error.
+async fn heos_played_watched(
+    ctx: &mut Ctx,
+    ended: &str,
+    wait: impl AsyncFnOnce(&mut Ctx) -> Check,
+) -> Check {
+    let Some(receiver) = receiver_volume(ctx).await? else {
+        return Err(Fail::skip(
+            "no second connection: the receiver volume is not known, so it cannot be watched",
+        ));
+    };
+    let volume = start_volume(Some(receiver), driver_volume(ctx).await?)
+        .map_err(|why| Fail::skip(format!("{why}: the volume is not watched")))?;
+    let waited = watched(ctx, volume, "while HEOS played", wait).await;
+    let early = matches!(waited, Ok(Watched::Ended(_)));
+    let (result, mut rise) = end_watch(waited);
+    if let Some(rise) = rise.as_mut().filter(|_| early && !ended.is_empty()) {
+        rise.add(ended);
+    }
+    add_failure(result, rise_result(rise))
+}
+
+/// The compare of [`heos_compare`] while HEOS plays `media` on the player `pid`: what plays, the
+/// position, the number of events, and play and pause.
+async fn heos_playing_checks(
+    ctx: &mut Ctx,
+    heos: &denon_marantz_heos::Heos,
+    pid: denon_marantz_heos::PlayerId,
+    player: &denon_marantz_heos::PlayerState,
+    media: &denon_marantz_heos::NowPlaying<'static>,
+) -> Check {
+    use denon_marantz_heos::{PlayState, RepeatMode};
+    let mp = ctx.mp();
+    let title = heos_title(media);
+    let album = heos_album(media);
     ctx.client.wait_text(&mp, "media_title", 8, title).await?;
     ctx.client.wait_text(&mp, "state", 4, "PLAYING").await?;
     ensure!(
@@ -5402,7 +6591,11 @@ async fn heos_compare(
         "album {:?}, HEOS has {album:?}",
         ctx.client.text(&mp, "media_album")
     );
-    if let Some(mode) = player.play_mode() {
+    // The owner can change shuffle and repeat while HEOS plays.
+    let fresh = heos
+        .player(pid)
+        .ok_or_else(|| Fail::new("HEOS player not read"))?;
+    if let Some(mode) = fresh.play_mode() {
         let repeat = match mode.repeat {
             RepeatMode::OnAll => "ALL",
             RepeatMode::OnOne => "ONE",
@@ -5516,20 +6709,30 @@ fn heos_playing(
 /// Time for the HEOS player to play after the owner started it, in seconds.
 const HEOS_START_SECS: u64 = 10;
 
-/// HEOS does not play: switch the receiver on with [`ensure_on`], ask the owner to start HEOS
-/// Music, then read the player again and wait for its play state. `started` gets `pid` and the
-/// start source before the question. Skips if there is no terminal, without `--avoid-sources` or
-/// without the second connection, if [`ensure_on`] skips, if the volume is above [`MAX_VOLUME`] or
-/// not known, if [`read_sources`] fails, if [`start_source_ok`] says that the start source cannot
-/// be set back, or if the owner does not answer. The source rule does not apply to
-/// [`HEOS_SOURCE`]: the owner selects it. Fails if [`ensure_on`] fails, if the volume or the
-/// prompt cannot be read, if HEOS does not play [`HEOS_START_SECS`] after the answer, or if the
-/// volume is above [`MAX_VOLUME`] once HEOS plays (it is lowered with [`cap_volume`]).
+/// HEOS does not play: switch the receiver on with [`ensure_on`], read the start values with
+/// [`heos_start`], ask the owner to start HEOS Music, then read the player again and wait for its
+/// play state. `hint` is a line under the prompt, `skip` says what s + Enter means. `started` gets
+/// the start values before the question. Skips if there is no terminal, without `--avoid-sources`
+/// or without the second connection, if [`ensure_on`] skips, if [`heos_start`] skips, or if the
+/// owner does not answer. If the receiver was off before [`ensure_on`] (see [`was_off`]), a skip
+/// of [`heos_start`] puts it back to standby with [`standby_again`]; after the question, [`heos`]
+/// does that. The track part of `media_keys` has no standby step: the receiver is on before it.
+/// The source rule does not apply to [`HEOS_SOURCE`]: the owner selects it. The prompt is watched
+/// with [`ask_watched`] and the wait for the play state with [`watched`], both with the start
+/// volume: a rise ends them and fails, and a rise that was not lowered sets [`HeosStart::stop`].
+/// Right after the prompt and once HEOS plays, the watch reads the volume once more and lowers a
+/// rise before any key is sent; a rise fails. The caller runs [`heos_end`]. Fails if
+/// [`ensure_on`] or [`heos_start`] fails, if the prompt cannot be read, if HEOS does not play
+/// [`HEOS_START_SECS`] after the answer, or if the volume is above [`MAX_VOLUME`] once HEOS plays
+/// (it is lowered with [`cap_volume`]). A failed lowering or volume read there sets
+/// [`HeosStart::stop`] too.
 async fn start_heos(
     ctx: &mut Ctx,
     heos: &denon_marantz_heos::Heos,
     pid: denon_marantz_heos::PlayerId,
     started: &mut Option<HeosStart>,
+    hint: Option<&str>,
+    skip: &'static str,
 ) -> Result<
     (
         denon_marantz_heos::PlayerState,
@@ -5537,47 +6740,81 @@ async fn start_heos(
     ),
     Fail,
 > {
-    const NOT_PLAYING: &str = "HEOS does not play";
-    let kind = Ask::Action("it plays", SKIP_CHECK);
+    let kind = Ask::Action("it plays", skip);
     let text = "Start HEOS Music on the receiver. This makes sound.";
     // Without a terminal the receiver is not switched on only to skip.
     if !terminal() {
         ctx.answers
             .push(format!("{text:?}: not asked, no terminal"));
-        return Err(Fail::skip(format!("{NOT_PLAYING} (no terminal)")));
+        return Err(heos_not_playing("no terminal"));
     }
-    let not_playing = |why: String| Fail::skip(format!("{NOT_PLAYING} ({why})"));
     // Without `--avoid-sources` or the second connection the receiver is not switched on only to
     // skip.
-    source_oracle(ctx).map_err(not_playing)?;
+    source_oracle(ctx).map_err(heos_not_playing)?;
     // The receiver is switched on first with the volume check: a power on by HEOS can set a loud
     // power-on volume.
+    let was_off = was_off(ctx);
     ensure_on(ctx)
         .await
-        .map_err(|e| if e.skip { not_playing(e.msg) } else { e })?;
-    let receiver = receiver_volume(ctx).await?;
-    let volume = sound_volume(highest(receiver, driver_volume(ctx).await?)).map_err(not_playing)?;
-    // The input levels must pass `levels_ok`: a higher level makes the source louder.
-    let sources = read_sources(ctx).await.map_err(not_playing)?;
-    let rule = source_rule(ctx, &sources);
-    // The start source is set back at the end, so it must be one that may be selected.
-    let mp = ctx.mp();
-    let source = ctx.client.text(&mp, "source");
-    let list = strings(ctx.client.attr(&mp, "source_list").unwrap_or(&Value::Null));
-    start_source_ok(&rule, &source, &list).map_err(not_playing)?;
-    let start = started.insert(HeosStart {
-        pid,
-        source,
-        list,
-        code: main_source(ctx),
-        volume,
-        answered: false,
-    });
-    let answer = ask(ctx, kind, text).await?;
+        .map_err(|e| if e.skip { heos_not_playing(e.msg) } else { e })?;
+    let start = match heos_start(ctx, pid, was_off).await {
+        Ok(start) => start,
+        Err(e) if e.skip && was_off => return Err(standby_again(ctx, e).await),
+        Err(e) => return Err(e),
+    };
+    let start = started.insert(start);
+    let answer = match ask_watched(ctx, kind, text, hint, start.volume).await? {
+        Watched::Done(answer) => answer,
+        Watched::After(answer, rise) => {
+            // HEOS can start a moment after the answer: the end steps read the events for less
+            // time only after the answer "it plays".
+            start.answered = answer == Answer::Done;
+            return Err(stop_fail(&mut start.stop, rise));
+        }
+        Watched::Ended(rise) => {
+            return Err(stop_fail(&mut start.stop, rise));
+        }
+    };
     if answer != Answer::Done {
-        return Err(Fail::skip(format!("{NOT_PLAYING} (answer {answer:?})")));
+        return Err(heos_not_playing(format_args!("answer {answer:?}")));
     }
     start.answered = true;
+    let waited = watched(
+        ctx,
+        start.volume,
+        "while the check waited for HEOS",
+        async |ctx: &mut Ctx| wait_heos_play(ctx, heos, pid).await,
+    )
+    .await;
+    let rise = match waited {
+        Ok(Watched::Done(Ok(found))) => return Ok(found),
+        Ok(Watched::Done(Err(rise)) | Watched::Ended(rise)) => rise,
+        Ok(Watched::After(Err(first), rise)) => join_rises(first, rise),
+        Ok(Watched::After(Ok(_), rise)) => rise,
+        Err(e) => return Err(e),
+    };
+    Err(stop_fail(&mut start.stop, rise))
+}
+
+/// Wait up to [`HEOS_START_SECS`] until the HEOS player `pid` plays. Returns its state and what it
+/// plays. Fails if it does not play in that time, or if the volume is above [`MAX_VOLUME`] once
+/// it plays (it is lowered with [`cap_volume`]). An error of [`cap_volume`] that is not a skip
+/// gives a [`Raised`] that was not lowered: the volume can still be above the limit. The caller
+/// watches the volume.
+async fn wait_heos_play(
+    ctx: &mut Ctx,
+    heos: &denon_marantz_heos::Heos,
+    pid: denon_marantz_heos::PlayerId,
+) -> Result<
+    Result<
+        (
+            denon_marantz_heos::PlayerState,
+            denon_marantz_heos::NowPlaying<'static>,
+        ),
+        Raised,
+    >,
+    Fail,
+> {
     // A failed read is not a failure: the events of the player can still come.
     let deadline = Instant::now() + Duration::from_secs(HEOS_START_SECS);
     let refresh = heos.refresh().await.err();
@@ -5586,10 +6823,18 @@ async fn start_heos(
         let playing = heos.with_player(pid, |p| heos_playing(p).map(|m| (p.clone(), m)));
         if let Some(found) = playing.flatten() {
             // The owner can change the volume in the HEOS app.
-            if let Some(loud) = cap_volume(ctx).await? {
-                return Err(Fail::new(format!("after HEOS started {loud}")));
-            }
-            return Ok(found);
+            return match cap_volume(ctx, None).await {
+                Ok(None) => Ok(Ok(found)),
+                Ok(Some(loud)) => {
+                    let rise = Raised::new(format!("after HEOS started {loud}"), true);
+                    Ok(Err(note_rise(ctx, rise)))
+                }
+                Err(e) if e.skip => Err(e),
+                Err(e) => {
+                    let rise = Raised::new(format!("after HEOS started {e}"), false);
+                    Ok(Err(note_rise(ctx, rise)))
+                }
+            };
         }
         if Instant::now() >= deadline {
             let state = heos.with_player(pid, |p| p.play_state).flatten();
@@ -5604,6 +6849,94 @@ async fn start_heos(
 
 /// The telnet code of the source that HEOS Music selects.
 const HEOS_SOURCE: &str = "NET";
+
+/// The skip of [`start_heos`] and [`heos_start`]: HEOS does not play, for the reason `why`.
+fn heos_not_playing(why: impl std::fmt::Display) -> Fail {
+    Fail::skip(format!("HEOS does not play ({why})"))
+}
+
+/// Time that [`ask_main_source`] waits for the answer to the source query, in milliseconds.
+const SOURCE_ANSWER_MS: u64 = 2000;
+
+/// The start values of [`start_heos`], read after [`ensure_on`]. `was_off` says if the receiver
+/// was off before it. The start volume comes from [`start_volume`]. Skips if the volume is above
+/// [`MAX_VOLUME`] or not known, if [`read_sources`] fails, if [`start_source_ok`] says that the
+/// start source cannot be set back, or if the second connection does not know the source code
+/// after [`ask_main_source`]: the switch to [`HEOS_SOURCE`] could then not be seen. Fails if the
+/// volume cannot be read or the query cannot be sent.
+async fn heos_start(
+    ctx: &mut Ctx,
+    pid: denon_marantz_heos::PlayerId,
+    was_off: bool,
+) -> Result<HeosStart, Fail> {
+    let receiver = receiver_volume(ctx).await?;
+    let volume = start_volume(receiver, driver_volume(ctx).await?).map_err(heos_not_playing)?;
+    // The input levels must pass `levels_ok`: a higher level makes the source louder.
+    let sources = read_sources(ctx).await.map_err(heos_not_playing)?;
+    let rule = source_rule(ctx, &sources);
+    // The start source is set back at the end, so it must be one that may be selected.
+    let mp = ctx.mp();
+    let source = ctx.client.text(&mp, "source");
+    let list = strings(ctx.client.attr(&mp, "source_list").unwrap_or(&Value::Null));
+    start_source_ok(&rule, &source, &list).map_err(heos_not_playing)?;
+    let code = match main_source(ctx) {
+        Some(code) => code,
+        None => ask_main_source(ctx).await?.ok_or_else(|| {
+            heos_not_playing(
+                "the second connection does not know the source, so the switch to HEOS cannot be \
+                 seen",
+            )
+        })?,
+    };
+    Ok(HeosStart {
+        pid,
+        source,
+        list,
+        code,
+        volume,
+        was_off,
+        answered: false,
+        stop: false,
+    })
+}
+
+/// Ask the second connection once for the source of the main zone (a read-only query) and wait
+/// up to [`SOURCE_ANSWER_MS`] until [`main_source`] knows it. `None` without that connection or
+/// if the source is still not known.
+async fn ask_main_source(ctx: &mut Ctx) -> Result<Option<String>, Fail> {
+    let Some(oracle) = &ctx.oracle else {
+        return Ok(None);
+    };
+    oracle
+        .avr()
+        .telnet_ask(&[denon_marantz::Ask::Query(Query::Source)])
+        .await?;
+    let deadline = Instant::now() + Duration::from_millis(SOURCE_ANSWER_MS);
+    loop {
+        if let Some(code) = main_source(ctx) {
+            return Ok(Some(code));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        ctx.client
+            .listen_until(deadline.min(Instant::now() + Duration::from_millis(200)))
+            .await?;
+    }
+}
+
+/// Switch the receiver off with [`switch_off`] after the skip or the failure `fail`, because the
+/// check switched it on, and add that to the text. A failed switch off is a failure.
+async fn standby_again(ctx: &mut Ctx, mut fail: Fail) -> Fail {
+    match switch_off(ctx).await {
+        Ok(()) => {
+            fail.msg
+                .push_str("; the receiver was off before the check, it is in standby again");
+            fail
+        }
+        Err(e) => Fail::new(format!("{fail}; not set back to standby: {e}")),
+    }
+}
 
 /// Pause the HEOS player `pid` if it plays, or stop it if the item cannot pause (for example a
 /// station). The player is read again first: the last play event can still be on its way.
@@ -5780,15 +7113,25 @@ mod tests {
 
     #[test]
     fn source_change_uses_the_label_and_the_known_codes() {
-        assert!(!source_changed("TV", "TV", Some("TV"), Some("TV")));
-        assert!(source_changed("HEOS Music", "TV", Some("NET"), Some("TV")));
+        assert!(!source_changed("TV", "TV", Some("TV"), "TV"));
+        assert!(source_changed("HEOS Music", "TV", Some("NET"), "TV"));
         assert!(
-            source_changed("TV", "TV", Some("NET"), Some("TV")),
+            source_changed("TV", "TV", Some("NET"), "TV"),
             "the driver can show an old source"
         );
-        assert!(source_changed("HEOS Music", "TV", None, Some("TV")));
-        assert!(!source_changed("TV", "TV", None, Some("TV")));
-        assert!(!source_changed("TV", "TV", Some("NET"), None));
+        assert!(source_changed("HEOS Music", "TV", None, "TV"));
+        assert!(!source_changed("TV", "TV", None, "TV"));
+    }
+
+    #[test]
+    fn saved_source_change_maps_the_display_name() {
+        let radio = "Internet Radio";
+        assert!(!saved_source_changed(radio, radio, Some(radio), "IRADIO"));
+        assert!(!saved_source_changed("TV", "TV", Some("TV"), "TV"));
+        assert!(saved_source_changed(radio, radio, Some("TV"), "IRADIO"));
+        assert!(saved_source_changed("TV", "TV", Some("NET"), "TV"));
+        assert!(saved_source_changed("HEOS Music", "TV", Some("TV"), "TV"));
+        assert!(!saved_source_changed("TV", "TV", None, "TV"));
     }
 
     #[test]
@@ -5844,6 +7187,96 @@ mod tests {
         assert!(!same_source(Some(("GAME", None)), "", "OPPO"));
     }
 
+    fn state(lines: &[&str]) -> denon_marantz::State {
+        use denon_marantz::proto::telnet::Message;
+        let mut state = denon_marantz::State::new(true);
+        for line in lines {
+            let message = Message::parse(line).unwrap_or_else(|| panic!("not a message: {line}"));
+            state.apply_message(&message);
+        }
+        state
+    }
+
+    #[test]
+    fn a_source_kept_by_its_display_name_gets_the_info_of_its_select_code() {
+        let radio = state(&["SSFUNIRADIO My Radio", "SIIRADIO"]);
+        let (source, info) = state_source(&radio).expect("source");
+        let info = info.expect("info of IRADIO");
+        assert_eq!("IRADIO", info.code);
+        assert!(same_source(Some((&source, Some(&info))), "", "My Radio"));
+        assert!(same_source(
+            Some((&source, Some(&info))),
+            "",
+            "My Radio (IRADIO)"
+        ));
+        assert!(!same_source(
+            Some((&source, Some(&info))),
+            "",
+            "Internet Radio"
+        ));
+        // Not listed: the display name.
+        let (source, info) = state_source(&state(&["SIIRADIO"])).expect("source");
+        assert!(info.is_none());
+        assert!(same_source(Some((&source, None)), "", "Internet Radio"));
+        let (source, info) = state_source(&state(&["SSFUNBD Blu-ray", "SIBD"])).expect("source");
+        assert_eq!(
+            ("BD", Some("BD")),
+            (source.as_str(), info.as_ref().map(|i| i.code.as_str()))
+        );
+        assert!(state_source(&state(&["PWON"])).is_none());
+    }
+
+    #[test]
+    fn the_select_code_maps_only_a_source_that_is_not_listed() {
+        let sources = [
+            source("IRADIO", Some("My Radio"), None),
+            source("BD", None, None),
+        ];
+        assert_eq!("BD", select_code(&sources, "BD"));
+        assert_eq!("IRADIO", select_code(&sources, "Internet Radio"));
+        assert_eq!("IRADIO", select_code(&[], "Internet Radio"));
+        assert_eq!("NET", select_code(&[], "Online Music"));
+        assert_eq!("XYZ", select_code(&[], "XYZ"));
+    }
+
+    #[test]
+    fn the_start_volume_is_the_receiver_volume_if_the_higher_one_is_safe() {
+        assert_eq!(Ok(30.0), start_volume(Some(30.0), Some(35.0)), "old driver");
+        assert_eq!(
+            Ok(35.0),
+            start_volume(Some(35.0), Some(30.0)),
+            "the receiver is higher"
+        );
+        assert_eq!(Ok(30.0), start_volume(Some(30.0), None));
+        assert_eq!(
+            Err(NO_WATCH.to_owned()),
+            start_volume(None, Some(30.0)),
+            "no receiver read"
+        );
+        assert_eq!(
+            Ok(MAX_VOLUME),
+            start_volume(Some(MAX_VOLUME), Some(MAX_VOLUME))
+        );
+        // An old, high driver value skips the check.
+        let loud = start_volume(Some(30.0), Some(MAX_VOLUME + 1.0)).unwrap_err();
+        assert!(loud.contains("above the limit"), "{loud}");
+        assert!(start_volume(Some(MAX_VOLUME + 1.0), None).is_err());
+        assert_eq!(
+            Err("the volume is not known".to_owned()),
+            start_volume(None, None)
+        );
+    }
+
+    #[test]
+    fn hdr_without_a_value_is_compared_only_with_the_signal_on_telnet() {
+        assert!(compared_without_value("sensor.hdr_input", true));
+        assert!(!compared_without_value("sensor.hdr_output", false));
+        assert!(!compared_without_value("sensor.colorspace_input", true));
+        assert!(!compared_without_value("select.picture_mode", true));
+        assert!(compared_without_value("sensor.volume_db", false));
+        assert!(compared_without_value("select.dimmer", false));
+    }
+
     #[test]
     fn now_ok_follows_the_source_rule() {
         let opt = options(&["oppo"]);
@@ -5889,11 +7322,116 @@ mod tests {
         assert!(skipped("RESET"));
         assert!(skipped("TUNER_PRESET_UP"), "the frequency is not set back");
         assert!(skipped("TUNER_PRESET_DOWN"));
+        assert!(skipped("TUNER_BAND_AM"), "the band is not set back");
+        assert!(skipped("TUNER_BAND_FM"));
+        assert!(
+            skipped("TUNER_FREQUENCY_UP"),
+            "the frequency is not set back"
+        );
+        assert!(skipped("TUNER_FREQUENCY_DOWN"));
+        assert!(skipped("TUNER_MODE_AUTO"), "the mode is not set back");
+        assert!(skipped("TUNER_MODE_MANUAL"));
+        assert!(!skipped("INPUT_TUNER"));
         assert!(!skipped("SPEAKER_PRESET_1"));
         assert!(!skipped("SPEAKER_PRESET_TOGGLE"));
         assert!(!skipped("AUROMATIC_3D_PRESET_SMALL"));
         assert!(skipped("QUICK_SELECT_1"));
         assert!(skipped("VOLUME_UP"));
+    }
+
+    #[test]
+    fn has_two_sources_does_not_count_the_source_entry() {
+        let list = |v: &[&str]| v.iter().map(|&s| s.to_owned()).collect::<Vec<_>>();
+        assert!(!has_two_sources(&[]));
+        assert!(!has_two_sources(&list(&["CD"])));
+        assert!(!has_two_sources(&list(&["CD", "Source"])));
+        assert!(has_two_sources(&list(&["CD", "Source", "TV"])));
+        assert!(has_two_sources(&list(&["CD", "TV"])));
+    }
+
+    #[test]
+    fn oracle_gate_needs_the_avoid_list_and_the_second_connection() {
+        let none = crate::tests::options(&[]);
+        assert_eq!(oracle_gate(&none, None).err(), Some("no --avoid-sources"));
+        let avoid = crate::tests::options(&["Oppo"]);
+        assert_eq!(
+            oracle_gate(&avoid, None).err(),
+            Some("no second connection")
+        );
+        // The `--avoid-sources` check comes first.
+        let mut no_oracle = crate::tests::options(&[]);
+        no_oracle.no_oracle = true;
+        assert_eq!(
+            oracle_gate(&no_oracle, None).err(),
+            Some("no --avoid-sources")
+        );
+        // `--no-oracle` opens no second connection. The `--no-oracle` error and the pass need a
+        // connection, so they are not tested here.
+        no_oracle.avoid_sources = vec!["Oppo".to_owned()];
+        assert_eq!(
+            oracle_gate(&no_oracle, None).err(),
+            Some("no second connection")
+        );
+    }
+
+    fn heos_item(
+        song: &str,
+        album: &str,
+        station: Option<&str>,
+    ) -> denon_marantz_heos::NowPlaying<'static> {
+        use std::borrow::Cow;
+        denon_marantz_heos::NowPlaying {
+            media_type: denon_marantz_heos::MediaType::Song,
+            song: Cow::Owned(song.to_owned()),
+            station: station.map(|s| Cow::Owned(s.to_owned())),
+            album: Cow::Owned(album.to_owned()),
+            artist: Cow::Borrowed(""),
+            image_url: Cow::Borrowed(""),
+            album_id: None,
+            mid: None,
+            qid: None,
+            sid: None,
+        }
+    }
+
+    #[test]
+    fn the_heos_album_is_the_album_else_the_station_under_a_song() {
+        assert_eq!(
+            "Album",
+            heos_album(&heos_item("Song", "Album", Some("Radio")))
+        );
+        assert_eq!("Radio", heos_album(&heos_item("Song", "", Some("Radio"))));
+        assert_eq!("Radio", heos_album(&heos_item("Song", " ", Some("Radio"))));
+        assert_eq!("", heos_album(&heos_item("Song", "", Some(" "))));
+        assert_eq!("", heos_album(&heos_item("Song", "", None)));
+        // Without a song the station is the title: the album stays.
+        assert_eq!("", heos_album(&heos_item("", "", Some("Radio"))));
+        assert_eq!("Album", heos_album(&heos_item(" ", "Album", Some("Radio"))));
+    }
+
+    #[test]
+    fn whole_db_rounds_floats() {
+        assert_eq!(whole_db(&json!(-3)), Some(-3));
+        assert_eq!(whole_db(&json!(-3.0)), Some(-3));
+        assert_eq!(whole_db(&json!(1.4)), Some(1));
+        assert_eq!(whole_db(&json!(-1.6)), Some(-2));
+        assert_eq!(whole_db(&json!("1")), None);
+        assert_eq!(whole_db(&Value::Null), None);
+    }
+
+    #[test]
+    fn the_sweep_sends_no_tuner_command() {
+        let mut tuner = 0;
+        for line in COMMANDS.lines() {
+            let Some((name, _, _)) = command_fields(line) else {
+                continue;
+            };
+            if name.starts_with("TUNER_") {
+                tuner += 1;
+                assert!(skipped(name), "{name} is not skipped");
+            }
+        }
+        assert!(tuner > 0, "the command table has no tuner command");
     }
 
     #[test]
@@ -5925,18 +7463,58 @@ mod tests {
         assert_eq!((fail.msg, fail.skip), (format!("why; {paused}"), true));
         let fail = add_back_note(Err(Fail::new("body")), Ok(paused.to_owned())).unwrap_err();
         assert_eq!((fail.msg, fail.skip), (format!("body; {paused}"), false));
-        let fail =
-            add_back_note(Ok("done".to_owned()), Err::<&str, _>(Fail::new("pause"))).unwrap_err();
+        let failed = || -> Result<&str, Fail> { Err(Fail::new("pause")) };
+        let fail = add_back_note(Ok("done".to_owned()), failed()).unwrap_err();
         assert_eq!(
             (fail.msg, fail.skip),
             ("not set back: pause".to_owned(), false)
         );
-        let fail =
-            add_back_note(Err(Fail::skip("why")), Err::<&str, _>(Fail::new("pause"))).unwrap_err();
+        let fail = add_back_note(Err(Fail::skip("why")), failed()).unwrap_err();
         assert_eq!(
             (fail.msg, fail.skip),
             ("why; not set back: pause".to_owned(), false)
         );
+    }
+
+    #[test]
+    fn add_failure_keeps_the_note_of_a_set_back_and_fails() {
+        let rise = || rise_result(Some(Raised::new("v".to_owned(), true)));
+        let msg = |result: Result<SetBack, Fail>| result.map_err(|e| (e.msg, e.skip));
+        assert_eq!(
+            msg(add_failure(Ok(SetBack::note("back".to_owned())), Ok(()))),
+            Ok(SetBack::note("back".to_owned()))
+        );
+        assert_eq!(
+            msg(add_failure(Ok(SetBack::note("back".to_owned())), rise())),
+            Err(("back; v".to_owned(), false))
+        );
+        assert_eq!(
+            msg(add_failure(Ok(SetBack::note(String::new())), rise())),
+            Err(("v".to_owned(), false))
+        );
+        let skipped = SetBack {
+            note: "left".to_owned(),
+            skipped: true,
+        };
+        assert_eq!(
+            msg(add_failure(Ok(skipped), rise())),
+            Err(("left; v".to_owned(), false)),
+            "a skipped set back with a rise is a failure"
+        );
+        assert_eq!(
+            msg(add_failure(Err(Fail::new("e")), rise())),
+            Err(("e; v".to_owned(), false))
+        );
+    }
+
+    #[test]
+    fn add_cap_fails_with_a_cap_note() {
+        let e = add_cap(Ok("a".to_owned()), ". v").unwrap_err();
+        assert_eq!((e.msg.as_str(), e.skip), ("a. v", false));
+        let e = add_cap(Err(Fail::skip("a")), ". v").unwrap_err();
+        assert_eq!((e.msg.as_str(), e.skip), ("a. v", false));
+        assert_eq!(add_cap(Ok("a".to_owned()), "").ok(), Some("a".to_owned()));
+        assert!(add_cap(Err(Fail::skip("a")), "").unwrap_err().skip);
     }
 
     #[test]
@@ -6731,6 +8309,19 @@ mod tests {
         assert!(!other_sound("dolby surround", Some(&modes)));
         assert!(!other_sound("", Some(&modes)));
         assert!(!other_sound("MULTI CH IN", None));
+    }
+
+    #[test]
+    fn joined_rises_have_the_stop_text_once_at_the_end() {
+        let rise = |t: &str, lowered| Raised::new(t.to_owned(), lowered);
+        let both = join_rises(rise("a", false), rise("b", false));
+        assert_eq!(format!("b; a; {STOP_TEXT}"), both.fail.msg);
+        assert!(!both.lowered);
+        let one = join_rises(rise("a", false), rise("b", true));
+        assert_eq!(format!("b; a; {STOP_TEXT}"), one.fail.msg);
+        let none = join_rises(rise("a", true), rise("b", true));
+        assert_eq!("a; b", none.fail.msg);
+        assert!(none.lowered);
     }
 
     #[test]

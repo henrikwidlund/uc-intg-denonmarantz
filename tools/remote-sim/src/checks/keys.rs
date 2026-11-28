@@ -3,9 +3,10 @@
 
 //! The navigation and playback keys of the media player.
 
+use super::prompt::{Watched, add_failure, stop_fail, watched};
 use super::{
-    HEOS_SOURCE, add_back_note, ensure_on, heos_now, heos_playing, join_errors, main_source,
-    too_loud,
+    HEOS_SOURCE, HeosStart, add_back_note, ensure_on, heos_end, heos_now, heos_played_watched,
+    heos_playing, heos_title, join_errors, main_source, start_heos, too_loud,
 };
 use crate::oracle::Oracle;
 use crate::{Check, Ctx, Fail};
@@ -40,8 +41,9 @@ const KEY_GAP_MS: u64 = 500;
 /// of the connection wait before them, for example after a power on.
 const MENU_ANSWER: Duration = Duration::from_secs(10);
 
-/// Next is sent only if the start track has at least this many seconds left: a track that ends
-/// during the part moves the queue on.
+/// Next is sent only if the start track has at least this many seconds left, and previous only if
+/// the next item has: an item that ends during the part moves the queue on. Previous is also sent
+/// if the position of the next item is not known.
 const MIN_TIME_LEFT: i64 = 30;
 
 /// Seconds to wait until the setup menu is closed.
@@ -54,14 +56,26 @@ const MENU_OPEN_SECS: u64 = 15;
 /// Empty value of a sensor of the driver.
 const EMPTY: &str = "--";
 
-/// Seconds to wait for another track or preset after a key, and for the first HEOS position.
+/// The line under the question of [`start_heos`] in [`track_part`].
+const TRACK_HINT: &str = "Play a queue of at least two songs, shuffle off, not the last song.";
+
+/// What s + Enter means at the question of [`start_heos`] in [`track_part`].
+const SKIP_TRACK: &str = "skip next and previous";
+
+/// Seconds to wait for a change after a key, for the HEOS source and for a HEOS position.
 const CHANGE_SECS: u64 = 10;
 
-/// Check the navigation and playback keys of the media player. Each key must get the answer OK.
-/// The setup menu is closed again, also after a failure. Next and previous come back to the start
+/// Check the navigation and playback keys of the media player. Each key must get the answer OK. The
+/// setup menu is closed again, also after a failure. Next and previous come back to the start
 /// track, and channel up and down come back to the start preset; if that fails, the failure says
-/// that the track or the preset is not set back. The keys never change the volume or the source
-/// and never start playback. The step fails if a part fails, and skips only if all parts skip.
+/// that the track or the preset is not set back. If the next item ends soon or HEOS plays another
+/// item, previous is not sent and the HEOS queue is not set back: this is a skip, not a failure.
+/// The keys do not change the volume or the source and do not start playback. Only when HEOS does
+/// not play, the owner is asked to start it for next and previous; then the volume can be lowered
+/// (also a rise above the start volume at the end, a failure) and the start source is set back, see
+/// [`track_part`]. When HEOS already plays, a rise above the start volume while or right after next
+/// and previous is lowered and fails. The step fails if a part fails, and skips only if all parts
+/// skip.
 pub async fn media_keys(ctx: &mut Ctx) -> Check {
     ensure_on(ctx).await?;
     let menu = Part::from(menu_part(ctx).await);
@@ -241,18 +255,15 @@ async fn menu_closed(ctx: &mut Ctx) -> Result<&'static str, Fail> {
 
 /// Send `info`, then `context_menu`, then `back` to close the option menu. There is no query for
 /// the option menu, so only the answers of the driver are checked. `back` is sent also after a
-/// failed `context_menu`. Runs only while the setup menu is closed, so it needs the second
+/// failure of [`option_keys`]. Runs only while the setup menu is closed, so it needs the second
 /// connection: in the setup menu, back goes up one level.
 async fn info_part(ctx: &mut Ctx) -> Check {
     if menu_open(menu_oracle(ctx)?).await? {
         return Err(Fail::skip("the setup menu is open"));
     }
-    press(ctx, "info").await?;
-    ctx.client.listen_ms(KEY_GAP_MS * 2).await?;
-    let option = press(ctx, "context_menu").await;
-    ctx.client.listen_ms(KEY_GAP_MS * 2).await?;
+    let keys = option_keys(ctx).await;
     let back = press(ctx, "back").await;
-    join_errors(option, back)?;
+    join_errors(keys, back)?;
     if menu_open(menu_oracle(ctx)?).await? {
         return Err(Fail::new(
             "the setup menu is open after info, context_menu and back",
@@ -261,8 +272,21 @@ async fn info_part(ctx: &mut Ctx) -> Check {
     Ok("info, context_menu, back".to_owned())
 }
 
+/// The keys of [`info_part`] before `back`: `info`, then `context_menu`, each with a wait for the
+/// receiver. `context_menu` is not sent after a failed `info` or a failed wait.
+async fn option_keys(ctx: &mut Ctx) -> Result<(), Fail> {
+    press(ctx, "info").await?;
+    ctx.client.listen_ms(KEY_GAP_MS * 2).await?;
+    let option = press(ctx, "context_menu").await;
+    let gap = ctx.client.listen_ms(KEY_GAP_MS * 2).await;
+    join_errors(option, gap)
+}
+
+/// A tuner preset and frequency.
+type Tuner = (Option<u8>, Option<TunerFrequency>);
+
 /// The tuner preset and frequency of the second connection.
-fn tuner_now(oracle: &Oracle) -> (Option<u8>, Option<TunerFrequency>) {
+fn tuner_now(oracle: &Oracle) -> Tuner {
     let state = oracle.state();
     let tuner = &state.device().tuner;
     (tuner.preset, tuner.frequency)
@@ -288,7 +312,9 @@ fn channel_skip(tuner: bool, code: Option<&str>, preset: Option<u8>) -> Option<S
 }
 
 /// Send `channel_up`, then `channel_down`, and check that the tuner preset changes and comes back.
-/// Runs only while the tuner is the source: a tuner command can select the tuner.
+/// Runs only while the tuner is the source: a tuner command can select the tuner. Skips if the
+/// preset and the frequency do not change in [`CHANGE_SECS`] after `channel_up`: the tuner may
+/// have only one preset.
 async fn channel_part(ctx: &mut Ctx) -> Check {
     let Some(oracle) = ctx.oracle.as_ref() else {
         return Err(Fail::skip(
@@ -311,13 +337,28 @@ async fn channel_part(ctx: &mut Ctx) -> Check {
         ))
     })?;
     // Channel down comes back only from another preset.
-    let (up, _) = wait_tuner(ctx, |p, _| p.is_some() && p != preset)
-        .await
-        .map_err(|e| {
-            Fail::new(format!(
+    let up = match wait_tuner(ctx, |p, _| p.is_some() && p != preset).await {
+        Ok(Ok((up, _))) => up,
+        // Nothing to set back if the tuner is still at the start.
+        Ok(Err(now)) if tuner_unchanged((preset, frequency), now) => {
+            return Err(Fail::skip(format!(
+                "the preset {} did not change after channel_up, the receiver did not move: only \
+                 one preset?",
+                show(preset)
+            )));
+        }
+        Ok(Err(now)) => {
+            return Err(Fail::new(format!(
+                "after channel_up: {}, channel_down not sent, the preset may not be set back",
+                timed_out(now)
+            )));
+        }
+        Err(e) => {
+            return Err(Fail::new(format!(
                 "after channel_up: {e}, channel_down not sent, the preset may not be set back"
-            ))
-        })?;
+            )));
+        }
+    };
     press(ctx, "channel_down").await.map_err(|e| {
         Fail::new(format!(
             "{e}, the preset {} is not set back to {}",
@@ -330,6 +371,7 @@ async fn channel_part(ctx: &mut Ctx) -> Check {
         p == preset && (frequency.is_none() || f == frequency)
     })
     .await
+    .and_then(|waited| waited.map_err(|now| Fail::new(timed_out(now))))
     .map_err(|e| {
         Fail::new(format!(
             "after channel_down: {e}, start was preset {} at {}, not set back",
@@ -347,6 +389,11 @@ async fn channel_part(ctx: &mut Ctx) -> Check {
         show(up),
         show(preset)
     ))
+}
+
+/// The tuner `now` has the preset of `start`, and its frequency if that was known at the start.
+fn tuner_unchanged(start: Tuner, now: Tuner) -> bool {
+    now.0 == start.0 && (start.1.is_none() || now.1 == start.1)
 }
 
 /// A preset number for the note.
@@ -367,36 +414,32 @@ fn tuner_oracle(ctx: &Ctx) -> Result<&Oracle, Fail> {
 }
 
 /// Wait until `accept` takes the tuner preset and frequency of the second connection. Returns
-/// them.
+/// them in `Ok(Ok(..))`, or the last values in `Ok(Err(..))` if `accept` does not take them in
+/// [`CHANGE_SECS`].
 async fn wait_tuner(
     ctx: &mut Ctx,
     accept: impl Fn(Option<u8>, Option<TunerFrequency>) -> bool,
-) -> Result<(Option<u8>, Option<TunerFrequency>), Fail> {
+) -> Result<Result<Tuner, Tuner>, Fail> {
     let deadline = Instant::now() + Duration::from_secs(CHANGE_SECS);
     loop {
-        let (preset, frequency) = tuner_now(tuner_oracle(ctx)?);
-        if accept(preset, frequency) {
-            return Ok((preset, frequency));
+        let now = tuner_now(tuner_oracle(ctx)?);
+        if accept(now.0, now.1) {
+            return Ok(Ok(now));
         }
         if Instant::now() >= deadline {
-            return Err(Fail::new(format!(
-                "preset {} at {} after {CHANGE_SECS} s",
-                show(preset),
-                show_frequency(frequency)
-            )));
+            return Ok(Err(now));
         }
         ctx.client.listen_ms(200).await?;
     }
 }
 
-/// The title that the driver shows for a HEOS item: the song, else the station.
-fn heos_title<'a>(media: &'a NowPlaying<'_>) -> &'a str {
-    let blank = |t: &str| t.trim().is_empty();
-    if blank(&media.song) {
-        media.station.as_deref().filter(|t| !blank(t)).unwrap_or("")
-    } else {
-        &media.song
-    }
+/// The note for a [`wait_tuner`] timeout with the last values `now`.
+fn timed_out(now: Tuner) -> String {
+    format!(
+        "preset {} at {} after {CHANGE_SECS} s",
+        show(now.0),
+        show_frequency(now.1)
+    )
 }
 
 /// `a` and `b` are the same queue item. An item without a queue id is not the same as any item.
@@ -452,30 +495,42 @@ async fn last_queue_item(heos: &denon_marantz_heos::Heos, pid: PlayerId) -> Opti
     page.items.first().map(|item| (count, item.qid))
 }
 
-/// Send `next`, then `previous`, while HEOS plays on the receiver, and check that the HEOS item
-/// and the title of the driver change and come back. The HEOS connection only reads. Skips if
-/// the source is not the HEOS source or HEOS does not play: no playback is started.
+/// Send `next`, then `previous`, while HEOS plays on the HEOS source, and check that the HEOS item
+/// and the title of the driver change and come back. If HEOS does not play, the owner is asked to
+/// start it with [`start_heos`]; then the end steps of [`heos_end`] run, also after a failure or a
+/// skip: HEOS is paused or stopped, a volume above the start volume is lowered and the start
+/// source is set back. If HEOS plays at the start, the HEOS connection only reads, and the volume
+/// is watched with [`heos_played_watched`]. Skips if HEOS does not answer.
 async fn track_part(ctx: &mut Ctx) -> Check {
+    // No standby step after a skip: `media_keys` switches the receiver on before the parts, so
+    // `start_heos` never finds it off.
     use denon_marantz_heos::Heos;
-    // The driver uses HEOS only on a net audio source. HEOS can also play in another zone, so
-    // only the HEOS source counts.
-    let source = main_source(ctx);
-    if source.as_deref() != Some(HEOS_SOURCE) {
-        return Err(Fail::skip(format!(
-            "the source is {}, not {HEOS_SOURCE}",
-            source.as_deref().unwrap_or("not known")
-        )));
-    }
     let heos = Heos::connect(ctx.opt.address.as_str())
         .await
         .map_err(|e| Fail::skip(format!("no HEOS: {e}")))?;
-    let result = track_keys(ctx, &heos).await;
+    let mut started = None;
+    let result = track_keys(ctx, &heos, &mut started).await;
+    let result = match started {
+        Some(start) => heos_end(ctx, &heos, &start, result).await,
+        None => result,
+    };
     heos.close().await;
     result
 }
 
-/// The body of [`track_part`] with the HEOS connection `heos`.
-async fn track_keys(ctx: &mut Ctx, heos: &denon_marantz_heos::Heos) -> Check {
+/// Added to the text of a rise that ends the keys of the track part.
+const TRACK_ENDED: &str = "next and previous may not be done, the HEOS item may not be set back";
+
+/// The body of [`track_part`] with the HEOS connection `heos`. `started` gets the start values if
+/// the owner is asked to start HEOS. Then the keys of [`track_steps`] are watched with
+/// [`watched`] and the start volume: a rise ends them and fails, and a rise that was not lowered
+/// sets [`HeosStart::stop`]. If HEOS played at the start, [`heos_played_watched`] watches the keys.
+/// A rise that ends the keys gets [`TRACK_ENDED`] in its text.
+async fn track_keys(
+    ctx: &mut Ctx,
+    heos: &denon_marantz_heos::Heos,
+    started: &mut Option<HeosStart>,
+) -> Check {
     let ip = ctx
         .opt
         .address
@@ -487,10 +542,62 @@ async fn track_keys(ctx: &mut Ctx, heos: &denon_marantz_heos::Heos) -> Check {
     let player = heos
         .player(pid)
         .ok_or_else(|| Fail::skip("HEOS player not read"))?;
-    let Some(start) = heos_playing(&player) else {
-        return Err(Fail::skip("HEOS does not play, no playback is started"));
+    let (player, start) = match heos_playing(&player) {
+        Some(media) => (player, media),
+        None => start_heos(ctx, heos, pid, started, Some(TRACK_HINT), SKIP_TRACK).await?,
     };
-    if let Some(why) = track_skip(&player, &start) {
+    let Some(begin) = started.as_mut() else {
+        return heos_played_watched(ctx, TRACK_ENDED, async |ctx: &mut Ctx| {
+            track_steps(ctx, heos, pid, player, &start, false).await
+        })
+        .await;
+    };
+    let waited = watched(
+        ctx,
+        begin.volume,
+        "while HEOS played",
+        async |ctx: &mut Ctx| track_steps(ctx, heos, pid, player, &start, true).await,
+    )
+    .await;
+    match waited {
+        Ok(Watched::Done(note)) => Ok(note),
+        Ok(Watched::After(note, rise)) => {
+            add_failure(Ok(note), Err(stop_fail(&mut begin.stop, rise)))
+        }
+        Ok(Watched::Ended(mut rise)) => {
+            rise.add(TRACK_ENDED);
+            Err(stop_fail(&mut begin.stop, rise))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The keys of [`track_keys`] while HEOS plays `start` on the player `pid`, with the state
+/// `player`. `started` is true if the owner started HEOS: then the player is read again after the
+/// wait for the source, and what it plays then is the start item. Skips if the source is not
+/// [`HEOS_SOURCE`] (see [`wait_heos_source`]), or if HEOS does not play after the start.
+async fn track_steps(
+    ctx: &mut Ctx,
+    heos: &denon_marantz_heos::Heos,
+    pid: PlayerId,
+    player: PlayerState,
+    start: &NowPlaying<'static>,
+    started: bool,
+) -> Check {
+    wait_heos_source(ctx, started).await?;
+    // The owner can change shuffle and repeat, and the item, while starting HEOS.
+    let fresh;
+    let (player, start) = if started {
+        let player = heos
+            .player(pid)
+            .ok_or_else(|| Fail::skip("HEOS player not read"))?;
+        fresh = heos_playing(&player)
+            .ok_or_else(|| Fail::skip("HEOS does not play after the start"))?;
+        (player, &fresh)
+    } else {
+        (player, start)
+    };
+    if let Some(why) = track_skip(&player, start) {
         return Err(Fail::skip(why));
     }
     let queue = last_queue_item(heos, pid).await;
@@ -501,11 +608,13 @@ async fn track_keys(ctx: &mut Ctx, heos: &denon_marantz_heos::Heos) -> Check {
         return Err(Fail::skip(why));
     }
     let mp = ctx.mp();
-    let start_title = heos_title(&start);
+    let start_title = heos_title(start);
+    // The driver needs more time for the title of a HEOS play that the owner just started.
+    let title_secs = if started { 8 } else { 4 };
     // Without the HEOS title, the driver does not use HEOS and next goes to the source.
     if ctx
         .client
-        .wait_text(&mp, "media_title", 4, start_title)
+        .wait_text(&mp, "media_title", title_secs, start_title)
         .await
         .is_err()
     {
@@ -515,20 +624,9 @@ async fn track_keys(ctx: &mut Ctx, heos: &denon_marantz_heos::Heos) -> Check {
         )));
     }
     // A new HEOS connection gets the position with the next progress event.
-    let deadline = Instant::now() + Duration::from_secs(CHANGE_SECS);
-    while heos.with_player(pid, |p| p.progress.is_none()) == Some(true) && Instant::now() < deadline
-    {
-        ctx.client.listen_ms(200).await?;
-    }
+    wait_progress(ctx, heos, pid).await?;
     // HEOS is read again just before next: next on a player that does not play can start it.
-    let now = heos.with_player(pid, |p| {
-        let playing = p
-            .current_media()
-            .filter(|_| p.play_state == Some(PlayState::Play))
-            .is_some_and(|m| same_track(m, &start));
-        (playing, p.progress.map(|pr| pr.duration_ms), heos_now(p))
-    });
-    let (playing, duration_ms, position) = now.unwrap_or((false, None, None));
+    let (playing, duration_ms, position) = plays_item(heos, pid, start);
     if !playing {
         return Err(Fail::skip("HEOS does not play the start track any more"));
     }
@@ -542,7 +640,7 @@ async fn track_keys(ctx: &mut Ctx, heos: &denon_marantz_heos::Heos) -> Check {
         ))
     })?;
     let next = wait_track(ctx, heos, pid, |m| {
-        m.qid.is_some() && !same_track(m, &start) && !heos_title(m).is_empty()
+        m.qid.is_some() && !same_track(m, start) && !heos_title(m).is_empty()
     })
     .await
     .map_err(|e| {
@@ -557,10 +655,49 @@ async fn track_keys(ctx: &mut Ctx, heos: &denon_marantz_heos::Heos) -> Check {
         .wait_text(&mp, "media_title", 8, next_title)
         .await
         .map_err(|e| Fail::new(format!("after next: {e}")));
+    // New media clears the position, so the position is the one of the next item.
+    if let Err(e) = wait_progress(ctx, heos, pid).await {
+        let e = Fail::new(format!(
+            "{e}, previous not sent, the start item is not set back"
+        ));
+        return Err(match shown {
+            Ok(()) => e,
+            Err(s) => Fail::new(format!("{s}; {e}")),
+        });
+    }
+    // Previous after the end of the next item would go back to the next item, not the start item.
+    // Without a position, previous is sent: it is the only way to set the start item back.
+    let (playing, duration_ms, position) = plays_item(heos, pid, &next);
+    // The start item can play again without previous, for example after previous in the HEOS app.
+    if !playing && plays_item(heos, pid, start).0 {
+        shown?;
+        ctx.client
+            .wait_text(&mp, "media_title", 8, start_title)
+            .await
+            .map_err(|e| Fail::new(format!("after the start item played again: {e}")))?;
+        return Ok(format!(
+            "{start_title:?} -> {next_title:?} -> {start_title:?}: the start item plays again, \
+             previous not sent"
+        ));
+    }
+    let plays_other = !playing && heos_plays(heos, pid);
+    let stop = previous_stop(
+        playing,
+        plays_other,
+        time_left(duration_ms, position),
+        next_title,
+    );
+    if let Some(stop) = stop {
+        // A wrong driver title fails the part also when previous is not sent.
+        return Err(match shown {
+            Ok(()) => stop,
+            Err(e) => Fail::new(format!("{e}; {stop}")),
+        });
+    }
     press(ctx, "previous")
         .await
         .map_err(|e| Fail::new(format!("{e}, the start item is not set back")))?;
-    wait_track(ctx, heos, pid, |m| same_track(m, &start))
+    wait_track(ctx, heos, pid, |m| same_track(m, start))
         .await
         .map_err(|e| {
             Fail::new(format!(
@@ -587,11 +724,112 @@ async fn track_keys(ctx: &mut Ctx, heos: &denon_marantz_heos::Heos) -> Check {
 /// `duration_ms` at `position` seconds plays less than [`MIN_TIME_LEFT`] more, or either value
 /// is not known.
 fn near_end(duration_ms: Option<u64>, position: Option<i64>) -> Option<&'static str> {
-    let (Some(duration_ms), Some(position)) = (duration_ms, position) else {
-        return Some("the position in the HEOS track is not known");
+    let Some(left) = time_left(duration_ms, position) else {
+        return Some("the position or the length of the HEOS track is not known");
     };
+    (left < MIN_TIME_LEFT).then_some("the HEOS track ends soon")
+}
+
+/// Seconds left in a track of `duration_ms` at `position` seconds, or `None` if either value is
+/// not known. A duration of 0 is not known.
+fn time_left(duration_ms: Option<u64>, position: Option<i64>) -> Option<i64> {
+    let duration_ms = duration_ms.filter(|d| *d > 0)?;
     let duration = i64::try_from(duration_ms / 1000).unwrap_or(i64::MAX);
-    (duration - position < MIN_TIME_LEFT).then_some("the HEOS track ends soon")
+    Some(duration.saturating_sub(position?))
+}
+
+/// Skips unless the main zone source of the second connection is [`HEOS_SOURCE`]: the driver uses
+/// HEOS only on a net audio source, and HEOS can also play in another zone. After the owner
+/// started HEOS (`started`), it waits at most [`CHANGE_SECS`] for that source: the source can
+/// change after HEOS plays.
+async fn wait_heos_source(ctx: &mut Ctx, started: bool) -> Result<(), Fail> {
+    let wait = if started { CHANGE_SECS } else { 0 };
+    let deadline = Instant::now() + Duration::from_secs(wait);
+    loop {
+        let source = main_source(ctx);
+        if source.as_deref() == Some(HEOS_SOURCE) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(Fail::skip(format!(
+                "the source is {}, not {HEOS_SOURCE}",
+                source.as_deref().unwrap_or("not known")
+            )));
+        }
+        ctx.client.listen_ms(200).await?;
+    }
+}
+
+/// Wait at most [`CHANGE_SECS`] until the HEOS player `pid` has a position. Returns also without
+/// one: the caller decides what a missing position means.
+async fn wait_progress(
+    ctx: &mut Ctx,
+    heos: &denon_marantz_heos::Heos,
+    pid: PlayerId,
+) -> Result<(), Fail> {
+    let deadline = Instant::now() + Duration::from_secs(CHANGE_SECS);
+    while heos.with_player(pid, |p| p.progress.is_none()) == Some(true) && Instant::now() < deadline
+    {
+        ctx.client.listen_ms(200).await?;
+    }
+    Ok(())
+}
+
+/// Whether the HEOS player `pid` plays `item`, and the duration of what plays in milliseconds and
+/// the position in seconds. `(false, None, None)` if the player is not known.
+fn plays_item(
+    heos: &denon_marantz_heos::Heos,
+    pid: PlayerId,
+    item: &NowPlaying<'_>,
+) -> (bool, Option<u64>, Option<i64>) {
+    heos.with_player(pid, |p| {
+        let playing = p
+            .current_media()
+            .filter(|_| p.play_state == Some(PlayState::Play))
+            .is_some_and(|m| same_track(m, item));
+        (playing, p.progress.map(|pr| pr.duration_ms), heos_now(p))
+    })
+    .unwrap_or((false, None, None))
+}
+
+/// The HEOS player `pid` plays an item: its state is play and it has media. False if the player
+/// is not known.
+fn heos_plays(heos: &denon_marantz_heos::Heos, pid: PlayerId) -> bool {
+    heos.with_player(pid, |p| {
+        p.play_state == Some(PlayState::Play) && p.current_media().is_some()
+    }) == Some(true)
+}
+
+/// Why previous is not sent after next, or `None` if it may be. `playing` is true if HEOS plays
+/// the next item `next_title`, `plays_other` if it plays another item, `left` the seconds left in
+/// the next item. A pause or a stop fails. Another item (the next item ended), or less than
+/// [`MIN_TIME_LEFT`] left (it ends soon), is a skip.
+fn previous_stop(
+    playing: bool,
+    plays_other: bool,
+    left: Option<i64>,
+    next_title: &str,
+) -> Option<Fail> {
+    let ends_soon = || {
+        Fail::skip(format!(
+            "the next HEOS item {next_title:?} ends soon: previous not sent, the start item is \
+             not set back"
+        ))
+    };
+    if playing {
+        left.is_some_and(|left| left < MIN_TIME_LEFT)
+            .then(ends_soon)
+    } else if plays_other {
+        Some(Fail::skip(format!(
+            "HEOS plays another item than the next item {next_title:?}: previous not sent, the \
+             start item is not set back"
+        )))
+    } else {
+        Some(Fail::new(
+            "HEOS does not play the next item any more: previous not sent, the start item is not \
+             set back",
+        ))
+    }
 }
 
 /// Wait until the HEOS player `pid` plays an item that `accept` takes. The caller sends no key
@@ -642,6 +880,42 @@ mod tests {
             qid: qid.map(QueueId),
             sid: None,
         }
+    }
+
+    #[test]
+    fn previous_is_not_sent_when_the_next_item_ended_or_stopped() {
+        let stop = |playing, other, left| {
+            previous_stop(playing, other, left, "n").map(|f| {
+                let why = if f.msg.contains("ends soon") {
+                    "soon"
+                } else if f.msg.contains("another item") {
+                    "other"
+                } else {
+                    ""
+                };
+                (f.skip, why)
+            })
+        };
+        assert_eq!(stop(true, false, Some(MIN_TIME_LEFT)), None);
+        assert_eq!(
+            stop(true, false, None),
+            None,
+            "previous is the only way back"
+        );
+        assert_eq!(
+            stop(true, false, Some(MIN_TIME_LEFT - 1)),
+            Some((true, "soon"))
+        );
+        assert_eq!(
+            stop(false, true, Some(100)),
+            Some((true, "other")),
+            "another item plays"
+        );
+        assert_eq!(
+            stop(false, false, Some(100)),
+            Some((false, "")),
+            "paused or stopped"
+        );
     }
 
     #[test]
@@ -735,6 +1009,28 @@ mod tests {
         assert!(near_end(Some(200_000), Some(300)).is_some());
         assert!(near_end(None, Some(10)).is_some());
         assert!(near_end(Some(200_000), None).is_some());
+    }
+
+    #[test]
+    fn seconds_left() {
+        assert_eq!(time_left(Some(200_999), Some(20)), Some(180));
+        assert_eq!(time_left(Some(10_000), Some(15)), Some(-5));
+        assert_eq!(time_left(None, Some(10)), None);
+        assert_eq!(time_left(Some(200_000), None), None);
+        assert_eq!(time_left(Some(0), Some(10)), None, "no duration");
+        // No overflow with a negative position.
+        assert_eq!(time_left(Some(u64::MAX), Some(i64::MIN)), Some(i64::MAX));
+    }
+
+    #[test]
+    fn tuner_at_start() {
+        let f = TunerFrequency::from_hundredths;
+        assert!(tuner_unchanged((Some(1), f(8750)), (Some(1), f(8750))));
+        assert!(!tuner_unchanged((Some(1), f(8750)), (Some(2), f(8750))));
+        assert!(!tuner_unchanged((Some(1), f(8750)), (Some(1), f(9000))));
+        assert!(!tuner_unchanged((Some(1), f(8750)), (None, f(8750))));
+        // A frequency that was not known at the start is not compared.
+        assert!(tuner_unchanged((Some(1), None), (Some(1), f(9000))));
     }
 
     #[test]

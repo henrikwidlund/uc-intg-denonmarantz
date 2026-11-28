@@ -177,6 +177,12 @@ impl Client {
         Ok(())
     }
 
+    /// Send the frames that wait in the write buffer, for example after a dropped send.
+    pub async fn flush(&mut self) -> Result<(), Fail> {
+        self.sink.flush().await?;
+        Ok(())
+    }
+
     /// Send a request and wait for the response.
     pub async fn request(&mut self, msg: &str, data: Value) -> Result<Value, Fail> {
         self.next_id += 1;

@@ -3,11 +3,15 @@
 
 //! The media info of the tuner and of Bluetooth.
 
-use super::prompt::{Answer, Ask, ask, ask_hint, terminal};
+use super::prompt::{
+    Answer, Ask, Raised, Watched, add_failure, ask_watched, end_watch, listen_watched, note_rise,
+    owner_ask_watched, rise_back, rise_result, stop_fail, stops, terminal, watched,
+};
 use super::{
-    SourceRule, above_baseline, add_back_note, add_set_back, cap_volume, driver_volume, ensure_on,
-    first_error, highest, label_fits, lower_volume, read_sources, receiver_volume, restore_source,
-    sound_volume, source_back, source_rule, start_source_ok, strings, too_loud, unmute_limit,
+    SourceRule, VOLUME_NOT_SAFE, add_back_note, add_set_back, cap_volume, driver_volume, ensure_on,
+    join_errors, join_rises, label_fits, owner_back, owner_result, owner_source_back, read_sources,
+    receiver_volume, restore_source, source_back, source_rule, start_source_ok, start_volume,
+    strings,
 };
 use crate::{Check, Ctx, Fail};
 use denon_marantz::Zone;
@@ -27,12 +31,23 @@ const MUSIC_PLAYS: &str = "the music still plays";
 /// Why a part that makes sound does not run.
 const NO_SOUND: &str = "nothing that makes sound runs";
 
+/// Why the Bluetooth part does not run after the tuner part.
+const NO_START_SOURCE: &str = "the tuner part did not set the start source back, or a rise of the \
+                               receiver volume in it was not lowered or a read failed";
+
+/// How often the prompt to stop the music is asked at most, when a rise comes while or right after
+/// it.
+const STOP_ASKS: usize = 3;
+
 /// Seconds to wait for the media info or the Bluetooth source.
 const MEDIA_SECS: u64 = 10;
 
 /// Check the media info of the media player: the tuner shows the text of the driver rule (the title
 /// of the receiver, else the frequency; the artist of the receiver, else the band), and the owner
 /// checks what Bluetooth shows. The step fails if a part fails, and skips only if all parts skip.
+/// The start source is read once, before the parts. The Bluetooth part skips if the start source is
+/// not back after the tuner part, or if a rise of the receiver volume in the tuner part was not
+/// lowered or a volume read failed. A rise that was lowered does not skip it by itself.
 pub async fn media_info(ctx: &mut Ctx) -> Check {
     // The tuner part selects a source and both parts set the start source back, so both need the
     // source rule.
@@ -47,8 +62,16 @@ pub async fn media_info(ctx: &mut Ctx) -> Check {
         ));
     }
     ensure_on(ctx).await?;
-    let tuner = Part::from(tuner_part(ctx).await);
-    let bluetooth = Part::from(bluetooth_part(ctx).await);
+    let mp = ctx.mp();
+    let old = ctx.client.text(&mp, "source");
+    let list = strings(ctx.client.attr(&mp, "source_list").unwrap_or(&Value::Null));
+    let (tuner, tuner_back_ok) = tuner_part(ctx, &old, &list).await;
+    let tuner = Part::from(tuner);
+    let bluetooth = if tuner_back_ok {
+        Part::from(bluetooth_part(ctx, &old, &list).await)
+    } else {
+        Part::Skip(NO_START_SOURCE.to_owned())
+    };
     combine(&[("tuner", tuner), ("Bluetooth", bluetooth)])
 }
 
@@ -110,9 +133,106 @@ fn tuner_source(rule: &SourceRule<'_>, old: &str, list: &[String]) -> Result<Str
         .ok_or_else(|| "no tuner source that may be selected is in the source list".to_owned())
 }
 
-/// Select a tuner source, check the media info and set the start source back, also after a
-/// failure.
-async fn tuner_part(ctx: &mut Ctx) -> Check {
+/// Select a tuner source, check the media info and set the start source `old` of the driver list
+/// `list` back, also after a failure. A receiver volume above the start volume from [`tuner_label`]
+/// after the sources are read is set back there, and the part fails before the tuner is selected.
+/// While the tuner plays, the receiver volume is watched with [`watched`] and this start volume: a
+/// volume above it ends the wait, is lowered and fails. Right after the wait, on every result, the
+/// watch lowers a volume above the start volume (a failure). If a rise was not lowered or a volume
+/// read failed, the check selects no source: the owner is asked with [`owner_source_back`]. Such a
+/// rise or failed read right after a set back that worked asks no owner: the source is back. Else
+/// the check sets the source back with [`restore_source`], and if that fails, the owner is asked,
+/// watched with the same start volume: a failed set back of the check is a failure also when the
+/// owner sets the source back. Returns the result, and true only if the start source is back, no
+/// rise stayed not lowered and the reads before the tuner plays did not fail. A rise that was
+/// lowered does not make it false. False means that no more sound part may run.
+async fn tuner_part(ctx: &mut Ctx, old: &str, list: &[String]) -> (Check, bool) {
+    let (label, start) = match tuner_label(ctx, old, list).await {
+        Ok((label, start, None)) => (label, start),
+        // The part fails before the tuner plays. A rise that was lowered does not stop the next
+        // part.
+        Ok((_, _, Some(rise))) => return (Err(rise.fail), rise.lowered),
+        // An error that is not a skip is a failed read of the volume or of the WebSocket.
+        Err(e) => {
+            let ok = e.skip;
+            return (Err(e), ok);
+        }
+    };
+    let selected = label != old;
+    let mp = ctx.mp();
+    let waited = watched(
+        ctx,
+        start,
+        "while the tuner played",
+        async |ctx: &mut Ctx| {
+            if selected {
+                ctx.client
+                    .command_ok(
+                        "media_player",
+                        &mp,
+                        "select_source",
+                        json!({ "source": label }),
+                    )
+                    .await?;
+                ctx.client
+                    .wait_text(&mp, "source", 8, &label)
+                    .await
+                    .map_err(|e| {
+                        Fail::new(format!("{e}. Wanted: {label}, source list: {list:?}"))
+                    })?;
+            }
+            tuner_shown(ctx, &label).await
+        },
+    )
+    .await;
+    // The volume goes back first: a source set back must not start at a volume that the owner set.
+    let (result, rise) = end_watch(waited);
+    let stop = stops(&rise);
+    let volume = rise_result(rise);
+    if !selected {
+        let result = result.map(|note| format!("{note}, the tuner was the start source"));
+        // The start source did not change.
+        return (add_failure(result, volume), !stop);
+    }
+    if stop {
+        // The check selects no source: the owner sets it back. The rise was not lowered, so no
+        // more sound part runs.
+        let back = owner_source_back(ctx, old, VOLUME_NOT_SAFE, start).await;
+        return (add_set_back(add_failure(result, volume), back), false);
+    }
+    let (back, back_rise) = restore_source(ctx, old, 4, start).await;
+    let (back, source_back) = match back {
+        Ok(tries) => (
+            Ok(format!("source set back to {old} in {tries} tries")),
+            true,
+        ),
+        Err(e) => {
+            let why = format!("the set back failed: {e}");
+            let (owner, owner_rise) = owner_back(ctx, old, &why, start).await;
+            let owner_ok = owner.as_ref().is_ok_and(|back| !back.skipped);
+            // With the error of the check, the result is always an error.
+            let fail = match owner_result(Some(e.msg), owner) {
+                Err(fail) => fail,
+                Ok(back) => Fail::new(back.note),
+            };
+            let back_ok = owner_ok && !stops(&owner_rise);
+            (add_failure(Err(fail), rise_result(owner_rise)), back_ok)
+        }
+    };
+    let back_ok = source_back && !stops(&back_rise);
+    let volume = join_errors(volume, rise_result(back_rise));
+    (add_failure(add_back_note(result, back), volume), back_ok)
+}
+
+/// The tuner source of the driver list `list` that [`tuner_part`] selects, the start volume from
+/// [`start_volume`] and the rise that [`rise_back`] finds after the sources are read, or why the
+/// part does not run. `old` is the start source. With a rise, the part fails before the tuner
+/// plays.
+async fn tuner_label(
+    ctx: &mut Ctx,
+    old: &str,
+    list: &[String],
+) -> Result<(String, f64, Option<Raised>), Fail> {
     if !ctx.tuner {
         return Err(Fail::skip("the driver shows no tuner entities"));
     }
@@ -126,38 +246,15 @@ async fn tuner_part(ctx: &mut Ctx) -> Check {
             "the driver shows no tuner frequency sensor, it needs telnet",
         ));
     }
-    let mp = ctx.mp();
-    let old = ctx.client.text(&mp, "source");
-    let list = strings(ctx.client.attr(&mp, "source_list").unwrap_or(&Value::Null));
+    // The start volume is read first: the start source plays while the sources are read. A skip in
+    // the reads runs no `rise_back`: the check has started no sound.
+    let receiver = receiver_volume(ctx).await?;
+    let start = start_volume(receiver, driver_volume(ctx).await?)
+        .map_err(|why| Fail::skip(format!("{why}: {NO_SOUND}")))?;
     let sources = read_sources(ctx).await.map_err(Fail::skip)?;
-    let label = tuner_source(&source_rule(ctx, &sources), &old, &list).map_err(Fail::skip)?;
-    if let Some(why) = too_loud(ctx).await? {
-        return Err(Fail::skip(format!("{why}: {NO_SOUND}")));
-    }
-    if label == old {
-        let note = tuner_shown(ctx, &label).await?;
-        return Ok(format!("{note}, the tuner was the start source"));
-    }
-    let result = async {
-        ctx.client
-            .command_ok(
-                "media_player",
-                &mp,
-                "select_source",
-                json!({ "source": label }),
-            )
-            .await?;
-        ctx.client
-            .wait_text(&mp, "source", 8, &label)
-            .await
-            .map_err(|e| Fail::new(format!("{e}. Wanted: {label}, source list: {list:?}")))?;
-        tuner_shown(ctx, &label).await
-    }
-    .await;
-    let back = restore_source(ctx, &old, 4)
-        .await
-        .map(|tries| format!("source set back to {old} in {tries} tries"));
-    add_back_note(result, back)
+    let label = tuner_source(&source_rule(ctx, &sources), old, list).map_err(Fail::skip)?;
+    let rise = rise_back(ctx, start, "while the check read the sources").await;
+    Ok((label, start, rise))
 }
 
 /// Wait until the media player shows the tuner text that the driver rule gives.
@@ -224,98 +321,118 @@ fn tuner_mismatch(title: &str, artist: &str, expected: (&str, &str)) -> Option<S
     })
 }
 
-/// The owner plays music from a phone over Bluetooth and says if the media player shows it.
-/// The source rule does not apply to the `BT` source: the owner selects it. At the end a receiver
-/// volume above the start volume is set back, then the source is set back, then the owner stops
-/// the music. A skipped set back of the source makes the part skip if nothing failed.
-async fn bluetooth_part(ctx: &mut Ctx) -> Check {
+/// The owner plays music from a phone over Bluetooth and says if the media player shows it. The
+/// source rule does not apply to the `BT` source: the owner selects it. The start volume comes from
+/// [`start_volume`]: it is the receiver volume. A receiver volume above it after the sources are
+/// read is set back with [`rise_back`], and the part fails before the play prompt. The prompts and
+/// the waits are watched with this start volume, see [`ask_watched`] and [`bluetooth_shown`]. At
+/// the end, on every answer, the check reads the events while it watches the volume (see
+/// [`listen_watched`]): a receiver volume above the start volume is set back. Then the start source
+/// `old` of the driver list `list` is set back: through the owner if a rise was not lowered or a
+/// volume read failed. Then the owner stops the music (see [`ask_stop`]), watched too. A skipped
+/// set back of the source makes the part skip if nothing failed.
+async fn bluetooth_part(ctx: &mut Ctx, old: &str, list: &[String]) -> Check {
     if !terminal() {
         return Err(Fail::skip(not_answered(Answer::Skip, false)));
     }
-    // The input levels must pass `levels_ok`: a higher level makes the source louder.
-    read_sources(ctx).await.map_err(Fail::skip)?;
-    let Some(start) = receiver_volume(ctx).await? else {
+    // The start volume is read first: the start source plays while the sources are read. A skip in
+    // the reads runs no `rise_back`: the check has started no sound.
+    let Some(receiver) = receiver_volume(ctx).await? else {
         return Err(Fail::skip(
             "no second connection: the receiver volume is not known",
         ));
     };
-    // The higher volume is the limit for the source set back, as in the other checks.
-    let start_high = sound_volume(highest(Some(start), driver_volume(ctx).await?))
+    let start = start_volume(Some(receiver), driver_volume(ctx).await?)
         .map_err(|why| Fail::skip(format!("{why}: {NO_SOUND}")))?;
-    let mp = ctx.mp();
-    let old = ctx.client.text(&mp, "source");
-    let list = strings(ctx.client.attr(&mp, "source_list").unwrap_or(&Value::Null));
+    // The input levels must pass `levels_ok`: a higher level makes the source louder.
+    read_sources(ctx).await.map_err(Fail::skip)?;
+    if let Some(rise) = rise_back(ctx, start, "while the check read the sources").await {
+        return Err(rise.fail);
+    }
     let start_bt = receiver_on_bt(ctx);
-    let answer = ask(
+    let answer = ask_watched(
         ctx,
         Ask::Action("it plays", SKIP_BLUETOOTH),
         "Play music from a phone over Bluetooth to the receiver. This makes sound.",
+        None,
+        start,
     )
     .await;
     // The owner may have started Bluetooth also before a skip or an error. The skip and error
     // paths do not wait in `bluetooth_shown`, so the source and the volume get 2 s to change
     // before they are compared.
+    let mut stop = false;
     let (body, settle_ms) = match answer {
-        Ok(Answer::Done) => (bluetooth_shown(ctx, &old, start_bt, start).await, 300),
-        Ok(other) => (Err(Fail::skip(not_answered(other, true))), 2000),
+        Ok(Watched::Done(Answer::Done)) => (
+            bluetooth_shown(ctx, old, start_bt, start, &mut stop).await,
+            300,
+        ),
+        Ok(Watched::Done(other)) => (Err(Fail::skip(not_answered(other, true))), 2000),
+        Ok(Watched::Ended(rise) | Watched::After(_, rise)) => {
+            (Err(stop_fail(&mut stop, rise)), 2000)
+        }
         Err(e) => (Err(e), 2000),
     };
     // The volume goes back first: a source set back must not start at a volume that the phone set.
-    let settle = ctx.client.listen_ms(settle_ms).await;
-    let volume = first_error(bt_volume_back(ctx, start).await, settle);
+    let (settle, rise) = listen_watched(ctx, settle_ms, start, "after Bluetooth").await;
+    stop |= stops(&rise);
+    let settle = settle.map_err(|e| Fail::new(format!("the events could not be read: {e}")));
+    let volume = join_errors(rise_result(rise), settle);
     // `source_back` sends nothing if the receiver has the start source.
-    let back = source_back(ctx, &old, &list, start_high).await;
-    let stop = ask(
-        ctx,
-        Ask::Action("done", MUSIC_PLAYS),
-        "Stop the music on the phone.",
-    )
-    .await;
-    with_stop(with_volume(add_set_back(body, back), volume), stop)
+    let back = source_back(ctx, old, list, start, stop.then_some(VOLUME_NOT_SAFE)).await;
+    let (stop, ended) = ask_stop(ctx, start).await;
+    let result = ended.into_iter().fold(
+        add_failure(add_set_back(body, back), volume),
+        |result, e| add_failure(result, Err(e)),
+    );
+    with_stop(result, stop)
 }
 
-/// Set the receiver volume back to `start`, the volume before the play prompt, if it is above it:
-/// the phone can set the volume. A volume above `start` is a failure, also after it is set back.
-/// The limit is never above [`MAX_VOLUME`](super::MAX_VOLUME).
-async fn bt_volume_back(ctx: &mut Ctx, start: f64) -> Result<(), Fail> {
-    let now = receiver_volume(ctx)
-        .await?
-        .ok_or_else(|| Fail::new("the receiver volume after Bluetooth is not known"))?;
-    if !above_baseline(now, Some(start)) {
-        return Ok(());
-    }
-    let limit = unmute_limit(Some(start));
-    let back = match lower_volume(ctx, Some(start)).await {
-        Ok(()) => format!("set back to {limit}"),
-        Err(e) => format!("not set back to {limit}: {e}"),
-    };
-    Err(Fail::new(format!(
-        "the receiver volume {now} after Bluetooth is above the start volume {start}, {back}"
-    )))
-}
-
-/// Add the result `volume` of the volume check to `result`. A volume error is always a failure.
-fn with_volume(result: Check, volume: Result<(), Fail>) -> Check {
-    match (result, volume) {
-        (result, Ok(())) => result,
-        (Ok(note), Err(v)) => Err(Fail::new(format!("{note}; {v}"))),
-        (Err(e), Err(v)) => Err(Fail::new(format!("{e}; {v}"))),
-    }
-}
-
-/// Add the answer `stop` of the prompt to stop the music to `result`. An error of the prompt is
-/// a failure.
-fn with_stop(result: Check, stop: Result<Answer, Fail>) -> Check {
-    let note = match stop {
-        Ok(Answer::Done) => "the owner stopped the music",
-        Ok(Answer::Skip) => "the owner said that the music still plays",
-        Ok(_) => "the owner did not say that the music stopped",
-        Err(e) => {
-            return Err(Fail::new(match result {
-                Ok(_) => format!("the prompt to stop the music failed: {e}"),
-                Err(body) => format!("{body}; the prompt to stop the music failed: {e}"),
-            }));
+/// Ask the owner to stop the music with [`owner_ask_watched`], also after a stop: the phone can set
+/// the volume. A prompt with a rise while or right after it is asked again after the lowering, at
+/// most [`STOP_ASKS`] times in total. Returns the result of the last prompt, and the failures of
+/// the earlier prompts with a rise.
+async fn ask_stop(ctx: &mut Ctx, start: f64) -> (Result<Watched, Fail>, Vec<Fail>) {
+    let mut ended = Vec::new();
+    loop {
+        let watched = owner_ask_watched(
+            ctx,
+            Ask::Action("done", MUSIC_PLAYS),
+            "Stop the music on the phone.",
+            None,
+            start,
+        )
+        .await;
+        match watched {
+            Ok(Watched::Ended(rise) | Watched::After(_, rise)) if ended.len() + 1 < STOP_ASKS => {
+                ended.push(rise.fail);
+            }
+            watched => return (watched, ended),
         }
+    }
+}
+
+/// Add the result `stop` of the prompt to stop the music to `result`. A rise while or right after
+/// the prompt (see [`Watched::Ended`] and [`Watched::After`]) and an error of the prompt are
+/// failures.
+fn with_stop(result: Check, stop: Result<Watched, Fail>) -> Check {
+    let failed = |text: String| {
+        Err(Fail::new(match &result {
+            Ok(_) => text,
+            Err(body) => format!("{body}; {text}"),
+        }))
+    };
+    let note = match stop {
+        Ok(Watched::Done(Answer::Done)) => "the owner stopped the music",
+        Ok(Watched::Done(Answer::Skip)) => "the owner said that the music still plays",
+        Ok(Watched::Done(_)) => "the owner did not say that the music stopped",
+        Ok(Watched::Ended(rise)) => {
+            return failed(format!("the stop prompt ended early: {}", rise.fail));
+        }
+        Ok(Watched::After(_, rise)) => {
+            return failed(format!("right after the stop prompt: {}", rise.fail));
+        }
+        Err(e) => return failed(format!("the prompt to stop the music failed: {e}")),
     };
     match result {
         Ok(mut msg) => {
@@ -332,12 +449,21 @@ fn with_stop(result: Check, stop: Result<Answer, Fail>) -> Check {
 }
 
 /// Lower the volume with [`cap_volume`] while Bluetooth plays: the phone can set the volume. A
-/// volume above [`MAX_VOLUME`](super::MAX_VOLUME) is a failure, also after it is lowered.
-async fn bt_volume_ok(ctx: &mut Ctx) -> Result<(), Fail> {
-    match cap_volume(ctx).await {
+/// volume above [`MAX_VOLUME`](super::MAX_VOLUME) is a failure, also after it is lowered. An error
+/// of [`cap_volume`] gives a [`Raised`] that was not lowered: the volume can still be above the
+/// limit. `watch` is the start volume for the watch of [`cap_volume`], `None` if the caller
+/// watches already.
+async fn bt_volume_ok(ctx: &mut Ctx, watch: Option<f64>) -> Result<(), Raised> {
+    match cap_volume(ctx, watch).await {
         Ok(None) => Ok(()),
-        Ok(Some(text)) => Err(Fail::new(format!("on Bluetooth {text}"))),
-        Err(e) => Err(Fail::new(format!("on Bluetooth {e}"))),
+        Ok(Some(text)) => Err(note_rise(
+            ctx,
+            Raised::new(format!("on Bluetooth {text}"), true),
+        )),
+        Err(e) => Err(note_rise(
+            ctx,
+            Raised::new(format!("on Bluetooth {e}"), false),
+        )),
     }
 }
 
@@ -359,49 +485,65 @@ fn receiver_on_bt(ctx: &Ctx) -> bool {
 }
 
 /// Wait for the Bluetooth source, show the media info to the owner and ask if it is right. When
-/// only the second connection says `BT`, the driver must show another source than the start
-/// source `old`, unless the receiver was on `BT` at the start (`start_bt`). Fails if the receiver
-/// changed to `BT` but the driver still shows `old`. Before the question, a receiver volume above
-/// `start`, the volume before the play prompt, is set back and the part fails.
-async fn bluetooth_shown(ctx: &mut Ctx, old: &str, start_bt: bool, start: f64) -> Check {
+/// only the second connection says `BT`, the driver must show another source than the start source
+/// `old`, unless the receiver was on `BT` at the start (`start_bt`). Fails if the receiver changed
+/// to `BT` but the driver still shows `old`. The waits and the question are watched with
+/// [`watched`] and [`ask_watched`]: a receiver volume above `start`, the volume before the play
+/// prompt, while or right after each of them is set back and the part fails. A rise that was not
+/// lowered or a failed volume read sets `stop`: no more sound prompts, and the source set back goes
+/// through the owner.
+async fn bluetooth_shown(
+    ctx: &mut Ctx,
+    old: &str,
+    start_bt: bool,
+    start: f64,
+    stop: &mut bool,
+) -> Check {
     let mp = ctx.mp();
-    let deadline = Instant::now() + Duration::from_secs(MEDIA_SECS);
-    loop {
-        let label = ctx.client.text(&mp, "source");
-        let bt_code = receiver_on_bt(ctx);
-        if is_bluetooth(&label, bt_code && (label != old || start_bt)) {
-            break;
-        }
-        if Instant::now() >= deadline {
-            if bt_code {
-                let msg = format!(
-                    "the receiver is on BT, the driver shows {label:?} after {MEDIA_SECS} s"
-                );
-                return Err(match bt_volume_ok(ctx).await {
-                    Ok(()) => Fail::new(msg),
-                    Err(e) => Fail::new(format!("{msg}; {e}")),
-                });
-            }
-            return Err(Fail::skip(format!(
-                "the source is not Bluetooth after {MEDIA_SECS} s: {label:?}"
-            )));
-        }
-        ctx.client.listen_ms(200).await?;
+    let waited = watched(
+        ctx,
+        start,
+        "while the check waited for Bluetooth",
+        async |ctx: &mut Ctx| wait_bluetooth(ctx, old, start_bt).await,
+    )
+    .await?;
+    let rise = match waited {
+        Watched::Done(Ok(())) => bt_volume_ok(ctx, Some(start)).await.err(),
+        Watched::Done(Err(rise)) | Watched::Ended(rise) => Some(rise),
+        Watched::After(Err(first), rise) => Some(join_rises(first, rise)),
+        Watched::After(Ok(()), rise) => Some(rise),
+    };
+    if let Some(rise) = rise {
+        return Err(stop_fail(stop, rise));
     }
-    bt_volume_ok(ctx).await?;
-    // No rise above the start volume while the owner reads the question.
-    bt_volume_back(ctx, start).await?;
     // The media info can come a moment after the source.
-    ctx.client.listen(2).await?;
+    let waited = watched(
+        ctx,
+        start,
+        "while the check waited for the media info",
+        async |ctx: &mut Ctx| ctx.client.listen(2).await,
+    )
+    .await?;
+    // No rise above the start volume while the owner reads the question.
+    if let Watched::Ended(rise) | Watched::After(_, rise) = waited {
+        return Err(stop_fail(stop, rise));
+    }
     let shown = media_shown(|attr| ctx.client.text(&mp, attr));
     let hint = format!("The media player shows: {shown}");
-    let answer = ask_hint(
+    let answer = match ask_watched(
         ctx,
         Ask::Question("it is right", "it is wrong", SKIP_BLUETOOTH),
         "Does the player show what the phone plays?",
         Some(&hint),
+        start,
     )
-    .await?;
+    .await?
+    {
+        Watched::Done(answer) => answer,
+        Watched::Ended(rise) | Watched::After(_, rise) => {
+            return Err(stop_fail(stop, rise));
+        }
+    };
     match answer {
         Answer::Yes => Ok(format!("shows {shown}")),
         Answer::No => Err(Fail::new(format!("the player shows {shown}"))),
@@ -409,6 +551,44 @@ async fn bluetooth_shown(ctx: &mut Ctx, old: &str, start_bt: bool, start: f64) -
             "{}, the player shows {shown}",
             not_answered(other, true)
         ))),
+    }
+}
+
+/// Wait up to [`MEDIA_SECS`] for the Bluetooth source, see [`bluetooth_shown`]. Skips if the
+/// source does not change. A volume that [`bt_volume_ok`] did not lower gives a [`Raised`] that
+/// was not lowered. The caller watches the receiver volume while it waits.
+async fn wait_bluetooth(
+    ctx: &mut Ctx,
+    old: &str,
+    start_bt: bool,
+) -> Result<Result<(), Raised>, Fail> {
+    let mp = ctx.mp();
+    let deadline = Instant::now() + Duration::from_secs(MEDIA_SECS);
+    loop {
+        let label = ctx.client.text(&mp, "source");
+        let bt_code = receiver_on_bt(ctx);
+        if is_bluetooth(&label, bt_code && (label != old || start_bt)) {
+            return Ok(Ok(()));
+        }
+        if Instant::now() >= deadline {
+            if bt_code {
+                let msg = format!(
+                    "the receiver is on BT, the driver shows {label:?} after {MEDIA_SECS} s"
+                );
+                return match bt_volume_ok(ctx, None).await {
+                    Ok(()) => Err(Fail::new(msg)),
+                    Err(rise) if rise.lowered => Err(Fail::new(format!("{msg}; {}", rise.fail))),
+                    Err(rise) => Ok(Err(Raised {
+                        fail: Fail::new(format!("{msg}; {}", rise.fail)),
+                        lowered: false,
+                    })),
+                };
+            }
+            return Err(Fail::skip(format!(
+                "the source is not Bluetooth after {MEDIA_SECS} s: {label:?}"
+            )));
+        }
+        ctx.client.listen_ms(200).await?;
     }
 }
 
@@ -643,11 +823,17 @@ mod tests {
     #[test]
     fn stop_answer_is_added() {
         assert_eq!(
-            outcome(with_stop(Ok("a".to_owned()), Ok(Answer::Done))),
+            outcome(with_stop(
+                Ok("a".to_owned()),
+                Ok(Watched::Done(Answer::Done))
+            )),
             (true, false, "a, the owner stopped the music".to_owned())
         );
         assert_eq!(
-            outcome(with_stop(Err(Fail::skip("a")), Ok(Answer::Skip))),
+            outcome(with_stop(
+                Err(Fail::skip("a")),
+                Ok(Watched::Done(Answer::Skip))
+            )),
             (
                 false,
                 true,
@@ -655,7 +841,10 @@ mod tests {
             )
         );
         assert_eq!(
-            outcome(with_stop(Ok("a".to_owned()), Ok(Answer::NoInput))),
+            outcome(with_stop(
+                Ok("a".to_owned()),
+                Ok(Watched::Done(Answer::NoInput))
+            )),
             (
                 true,
                 false,
@@ -678,24 +867,33 @@ mod tests {
                 "a; the prompt to stop the music failed: b".to_owned()
             )
         );
+        let ended = |msg: &str| Watched::Ended(Raised::new(msg.to_owned(), true));
+        assert_eq!(
+            outcome(with_stop(Ok("a".to_owned()), Ok(ended("b")))),
+            (false, false, "the stop prompt ended early: b".to_owned())
+        );
+        assert_eq!(
+            outcome(with_stop(Err(Fail::skip("a")), Ok(ended("b")))),
+            (false, false, "a; the stop prompt ended early: b".to_owned())
+        );
     }
 
     #[test]
     fn volume_error_is_a_failure() {
         assert_eq!(
-            outcome(with_volume(Ok("a".to_owned()), Ok(()))),
+            outcome(add_failure(Ok("a".to_owned()), Ok(()))),
             (true, false, "a".to_owned())
         );
         assert_eq!(
-            outcome(with_volume(Err(Fail::skip("a")), Ok(()))),
+            outcome(add_failure(Err(Fail::skip("a")), Ok(()))),
             (false, true, "a".to_owned())
         );
         assert_eq!(
-            outcome(with_volume(Ok("a".to_owned()), Err(Fail::new("v")))),
+            outcome(add_failure(Ok("a".to_owned()), Err(Fail::new("v")))),
             (false, false, "a; v".to_owned())
         );
         assert_eq!(
-            outcome(with_volume(Err(Fail::skip("a")), Err(Fail::new("v")))),
+            outcome(add_failure(Err(Fail::skip("a")), Err(Fail::new("v")))),
             (false, false, "a; v".to_owned()),
             "a skip with a volume error is a failure"
         );

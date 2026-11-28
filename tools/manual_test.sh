@@ -315,7 +315,7 @@ on the page 'Triggers': they can switch other devices. Buttons on the pages 'Mai
 'Channel Levels', 'Sound Tweaks', 'Standby', 'Dirac', 'Audyssey', 'ECO', 'Picture Mode' and 'Sleep
 Timer' change settings: set them back by hand, and set the sleep timer back to Off. The repeated
 command and the sequence must not use volume up or a source button." \
-"Open the pages of the remote entity (15 pages). Press a few buttons on each page that the text
+"Open the pages of the remote entity (up to 15 pages). Press a few buttons on each page that the text
 above allows, also a repeated command and a sequence of two commands with a pause of 5 seconds (the
 longest pause that the driver allows). Press volume down while the sequence runs. Hold a button that
 does not change the volume or the source (for example cursor down) for about 2 seconds." \

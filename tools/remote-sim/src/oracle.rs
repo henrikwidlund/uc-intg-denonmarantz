@@ -5,7 +5,7 @@
 //! them with the values that the driver shows.
 
 use crate::Fail;
-use denon_marantz::proto::source::telnet_to_display_source;
+use denon_marantz::proto::source::{display_to_select_code, telnet_to_display_source};
 use denon_marantz::proto::telnet::EventZone;
 use denon_marantz::proto::{DiracFilter, DiracSlot, Sleep};
 use denon_marantz::{
@@ -22,8 +22,21 @@ const VOLUME_ANSWER: Duration = Duration::from_secs(10);
 /// How long more volume lines are collected after the first one.
 const VOLUME_LAST_LINES: Duration = Duration::from_millis(300);
 
+/// The second connection. A clone shares the connection.
+#[derive(Clone)]
 pub struct Oracle {
     avr: Arc<Avr>,
+}
+
+/// The code of the receiver source `source` that the driver select uses: `source` if the receiver
+/// lists it (`listed`), else the select code of its display name, else `source`. The library keeps
+/// some network sources by their display name, for example `Internet Radio` for `IRADIO`.
+pub(crate) fn select_code(listed: bool, source: &str) -> &str {
+    if listed {
+        source
+    } else {
+        display_to_select_code(source).unwrap_or(source)
+    }
 }
 
 /// Expected value of an entity. `None` is shown as `--`.
@@ -199,7 +212,8 @@ fn label<T: Copy>(value: Option<T>, f: fn(T) -> &'static str) -> Option<String> 
     value.map(|v| f(v).to_owned())
 }
 
-/// The values that the entities must show. Keys are `select.<kind>` and `sensor.<kind>`.
+/// The values that the entities must show. Keys are `select.<kind>` and `sensor.<kind>`. The
+/// source entries are left out when two sources share a name.
 pub fn expected(state: &State) -> Vec<Expected> {
     use denon_marantz::proto::{
         BluetoothOutputMode, DigitalCodec, DimmerMode, DynamicVolume, EcoMode, HdmiOutput, MultiEq,
@@ -209,13 +223,27 @@ pub fn expected(state: &State) -> Vec<Expected> {
     let device = state.device();
     // The telnet name, else the code, as the driver shows it: the driver does not read the default
     // names of the web interface. A source that is not in the list gets its display name.
-    let source = zone.source.as_deref().map(|code| {
+    let source_label = |code: &str| {
         match device.sources.get(code) {
             Some(s) => s.name.as_deref().unwrap_or(&s.code),
             None => telnet_to_display_source(code),
         }
         .to_owned()
-    });
+    };
+    // The driver adds the code to the name when two shown sources share a name. Which sources the
+    // driver shows depends on its settings, so the source is not compared when any two sources
+    // share a name.
+    let shared = {
+        let sources = device.sources.as_slice();
+        let name = |i: usize| sources[i].name.as_deref().unwrap_or(&sources[i].code);
+        (0..sources.len()).any(|i| (i + 1..sources.len()).any(|j| name(i) == name(j)))
+    };
+    // The select maps a source that is not in the list to a select code, the sensor does not.
+    let select_source = zone
+        .source
+        .as_deref()
+        .map(|source| source_label(select_code(device.sources.get(source).is_some(), source)));
+    let sensor_source = zone.source.as_deref().map(source_label);
     let dimmer = label(device.dimmer, DimmerMode::label);
     let eco = label(device.eco_mode, EcoMode::label);
     let monitor = label(device.video_settings.hdmi_output, HdmiOutput::label);
@@ -223,11 +251,7 @@ pub fn expected(state: &State) -> Vec<Expected> {
     let codec = label(device.digital_codec, DigitalCodec::label);
     let dirac = dirac_label(&device.dirac_slots, device.dirac_filter);
     let db = zone.volume.map(|v| f64::from(v.db()));
-    let signal = &device.signal;
-    let color = signal.video_color();
-    let depth = signal.effective_pixel_depth();
-    vec![
-        ("select.input_source", source.clone()),
+    let mut values = vec![
         ("select.dimmer", dimmer.clone()),
         ("select.eco_mode", eco.clone()),
         ("select.monitor_output", monitor.clone()),
@@ -249,7 +273,6 @@ pub fn expected(state: &State) -> Vec<Expected> {
                 _ => "2".to_owned(),
             }),
         ),
-        ("sensor.input_source", source),
         ("sensor.dimmer", dimmer),
         ("sensor.eco_mode", eco),
         ("sensor.monitor_output", monitor),
@@ -268,26 +291,6 @@ pub fn expected(state: &State) -> Vec<Expected> {
             ),
         ),
         ("sensor.volume_db", db.map(|d| format!("{d:.1}"))),
-        // The color space with BT.2020, as the driver shows it.
-        (
-            "sensor.colorspace_input",
-            color.input.map(|c| c.to_string()),
-        ),
-        (
-            "sensor.colorspace_output",
-            color.output.map(|c| c.to_string()),
-        ),
-        // The HDR format as the receiver reports it, for example `HDR10`. `---` is no value.
-        ("sensor.hdr_input", signal.hdr.input.clone()),
-        ("sensor.hdr_output", signal.hdr.output.clone()),
-        (
-            "sensor.pixel_depth_input",
-            depth.input.map(|d| d.label().to_owned()),
-        ),
-        (
-            "sensor.pixel_depth_output",
-            depth.output.map(|d| d.label().to_owned()),
-        ),
         ("select.multi_eq", label(device.multi_eq, MultiEq::label)),
         (
             "select.tuner_band",
@@ -335,6 +338,44 @@ pub fn expected(state: &State) -> Vec<Expected> {
         (
             "sensor.sound_mode_category",
             zone.sound_mode_category.map(|c| c.label().to_owned()),
+        ),
+    ];
+    values.extend(signal_expected(state));
+    if !shared {
+        values.extend([
+            ("select.input_source", select_source),
+            ("sensor.input_source", sensor_source),
+        ]);
+    }
+    values
+}
+
+/// The values of the signal sensors, the part of [`expected`] that the signal check reads on each
+/// poll. Keys are `sensor.<kind>`.
+pub fn signal_expected(state: &State) -> [Expected; 6] {
+    let signal = &state.device().signal;
+    let color = signal.video_color();
+    let depth = signal.effective_pixel_depth();
+    [
+        // The color space with BT.2020, as the driver shows it.
+        (
+            "sensor.colorspace_input",
+            color.input.map(|c| c.to_string()),
+        ),
+        (
+            "sensor.colorspace_output",
+            color.output.map(|c| c.to_string()),
+        ),
+        // The HDR format as the receiver reports it, for example `HDR10`. `---` is no value.
+        ("sensor.hdr_input", signal.hdr.input.clone()),
+        ("sensor.hdr_output", signal.hdr.output.clone()),
+        (
+            "sensor.pixel_depth_input",
+            depth.input.map(|d| d.label().to_owned()),
+        ),
+        (
+            "sensor.pixel_depth_output",
+            depth.output.map(|d| d.label().to_owned()),
         ),
     ]
 }
@@ -405,6 +446,41 @@ mod tests {
     }
 
     #[test]
+    fn the_select_maps_a_source_that_is_not_in_the_list_and_the_sensor_does_not() {
+        let radio = ["SSFUNIRADIO My Radio", "SIIRADIO"];
+        assert_eq!(
+            Some("My Radio"),
+            value(&radio, "select.input_source").as_deref()
+        );
+        assert_eq!(
+            Some("Internet Radio"),
+            value(&radio, "sensor.input_source").as_deref()
+        );
+        let listed = ["SSFUNBD Blu-ray", "SIBD"];
+        assert_eq!(
+            value(&listed, "select.input_source"),
+            value(&listed, "sensor.input_source")
+        );
+        assert_eq!(None, value(&["PWON"], "sensor.input_source"));
+    }
+
+    #[test]
+    fn the_source_is_not_compared_when_two_sources_share_a_name() {
+        let has_source = |lines: &[&str]| {
+            expected(&state(lines))
+                .iter()
+                .any(|(n, _)| n.ends_with(".input_source"))
+        };
+        assert!(!has_source(&["SSFUNBD Movies", "SSFUNDVD Movies", "SIBD"]));
+        assert!(
+            !has_source(&["SSFUNBD TV", "SSSODTV USE", "SIBD"]),
+            "name and code"
+        );
+        assert!(has_source(&["SSFUNBD Movies", "SSFUNDVD Disc", "SIBD"]));
+        assert!(has_source(&["PWON"]));
+    }
+
+    #[test]
     fn the_hdr_format_is_shown_as_the_receiver_reports_it() {
         let hdr = ["SSINFSIGHDR IHDR10", "SSINFSIGHDR ODolby Vision"];
         assert_eq!(Some("HDR10"), value(&hdr, "sensor.hdr_input").as_deref());
@@ -415,6 +491,15 @@ mod tests {
         let none = ["SSINFSIGHDR IHDR10", "SSINFSIGHDR I---"];
         assert_eq!(None, value(&none, "sensor.hdr_input"), "--- is no value");
         assert_eq!(None, value(&[], "sensor.hdr_output"));
+    }
+
+    #[test]
+    fn the_signal_values_are_the_ones_of_all_values() {
+        let state = state(&["SSINFSIGCOS 11", "SSINFSIGHDR IHDR10"]);
+        let all = expected(&state);
+        for entry in signal_expected(&state) {
+            assert!(all.contains(&entry), "{entry:?}");
+        }
     }
 
     #[test]

@@ -161,7 +161,8 @@ async fn build_driver() -> Result<PathBuf, String> {
             .spawn()?;
         let mut bin = None;
         if let Some(stdout) = child.stdout.take() {
-            // Cargo writes UTF-8 JSON. Reading stops at a line that is not UTF-8 or at a read error.
+            // Cargo writes UTF-8 JSON. Reading stops at a line that is not UTF-8 or at a read
+            // error.
             for line in std::io::BufReader::new(stdout)
                 .lines()
                 .map_while(Result::ok)
@@ -304,6 +305,8 @@ pub struct Ctx {
     pub answers: Vec<String>,
     /// Lines of the terminal, from [`checks::stdin_lines`].
     pub stdin: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    /// The rises of the receiver volume in the current step.
+    pub rises: checks::Rises,
     report: Vec<String>,
     failed: usize,
     skipped: usize,
@@ -353,17 +356,28 @@ impl Ctx {
             return true;
         }
         let start = Instant::now();
-        let result = check(self).await;
+        self.rises = checks::Rises::default();
+        let mut result = check(self).await;
         let ms = start.elapsed().as_millis();
+        // A rise is a failure, also when a later error or a skip left it out of the result.
+        let (msg, failed) = match &result {
+            Ok(note) => (note.as_str(), false),
+            Err(f) => (f.msg.as_str(), !f.skip),
+        };
+        if let Some(msg) = self.rises.missing(msg) {
+            result = Err(Fail::new(msg));
+        } else if !failed && !self.rises.texts.is_empty() {
+            result = Err(Fail::new(msg.to_owned()));
+        }
         let (tag, note) = match result {
             Ok(note) => ("PASS", note),
             Err(f) if f.skip => {
                 self.skipped += 1;
-                ("SKIP", f.msg)
+                ("SKIP", checks::stop_text_once(f.msg))
             }
             Err(f) => {
                 self.failed += 1;
-                ("FAIL", f.msg)
+                ("FAIL", checks::stop_text_once(f.msg))
             }
         };
         let mut line = if note.is_empty() {
@@ -586,6 +600,7 @@ async fn main() {
         start: None,
         tuner: true,
         answers: Vec::new(),
+        rises: checks::Rises::default(),
         // Started at once on a terminal, so lines typed before a prompt are dropped. A run in the
         // background with a terminal stdin stops; use `< /dev/null` there.
         stdin: checks::terminal().then(checks::stdin_lines),
