@@ -291,7 +291,7 @@ fn tuner_mismatch(title: &str, artist: &str, expected: (&str, &str)) -> Option<S
 /// set back of the source makes the part skip if nothing failed.
 async fn bluetooth_part(ctx: &mut Ctx, old: &str, list: &[String]) -> Check {
     if !terminal() {
-        return Err(Fail::skip(not_answered(Answer::Skip, false)));
+        return Err(Fail::skip(not_answered(Answer::NoTerminal)));
     }
     // The start volume is read first: the start source plays while the sources are read. A skip in
     // the reads runs no `rise_back`: the check has started no sound.
@@ -310,7 +310,10 @@ async fn bluetooth_part(ctx: &mut Ctx, old: &str, list: &[String]) -> Check {
     let start_bt = receiver_on_bt(ctx);
     let answer = ask_watched(
         ctx,
-        Ask::Action("it plays", SKIP_BLUETOOTH),
+        Ask::Action {
+            done: "it plays",
+            skip: SKIP_BLUETOOTH,
+        },
         "Play music from a phone over Bluetooth to the receiver. This makes sound.",
         None,
         start,
@@ -325,7 +328,7 @@ async fn bluetooth_part(ctx: &mut Ctx, old: &str, list: &[String]) -> Check {
             bluetooth_shown(ctx, old, start_bt, start, &mut stop).await,
             300,
         ),
-        Ok(Watched::Done(other)) => (Err(Fail::skip(not_answered(other, true))), 2000),
+        Ok(Watched::Done(other)) => (Err(Fail::skip(not_answered(other))), 2000),
         Ok(Watched::Ended(rise) | Watched::After(_, rise)) => {
             (Err(stop_fail(&mut stop, rise)), 2000)
         }
@@ -355,7 +358,10 @@ async fn ask_stop(ctx: &mut Ctx, start: f64) -> (Result<Watched, Fail>, Vec<Fail
     loop {
         let watched = owner_ask_watched(
             ctx,
-            Ask::Action("done", MUSIC_PLAYS),
+            Ask::Action {
+                done: "done",
+                skip: MUSIC_PLAYS,
+            },
             "Stop the music on the phone.",
             None,
             start,
@@ -383,7 +389,9 @@ fn with_stop(result: Check, stop: Result<Watched, Fail>) -> Check {
     let note = match stop {
         Ok(Watched::Done(Answer::Done)) => "the owner stopped the music",
         Ok(Watched::Done(Answer::Skip)) => "the owner said that the music still plays",
-        Ok(Watched::Done(_)) => "the owner did not say that the music stopped",
+        Ok(Watched::Done(Answer::Yes | Answer::No | Answer::NoInput | Answer::NoTerminal)) => {
+            "the owner did not say that the music stopped"
+        }
         Ok(Watched::Ended(rise)) => {
             return failed(format!("the stop prompt ended early: {}", rise.fail));
         }
@@ -426,9 +434,9 @@ async fn bt_volume_ok(ctx: &mut Ctx, watch: Option<f64>) -> Result<(), Raised> {
 }
 
 /// Why the owner gave no answer that the check can use.
-fn not_answered(answer: Answer, terminal: bool) -> &'static str {
+fn not_answered(answer: Answer) -> &'static str {
     match answer {
-        Answer::Skip if !terminal => "no terminal",
+        Answer::NoTerminal => "no terminal",
         Answer::Skip => "skipped by the owner",
         Answer::NoInput => "the input ended",
         Answer::Done | Answer::Yes | Answer::No => "no answer",
@@ -490,7 +498,11 @@ async fn bluetooth_shown(
     let hint = format!("The media player shows: {shown}");
     let answer = match ask_watched(
         ctx,
-        Ask::Question("it is right", "it is wrong", SKIP_BLUETOOTH),
+        Ask::Question {
+            yes: "it is right",
+            no: "it is wrong",
+            skip: SKIP_BLUETOOTH,
+        },
         "Does the player show what the phone plays?",
         Some(&hint),
         start,
@@ -507,7 +519,7 @@ async fn bluetooth_shown(
         Answer::No => Err(Fail::new(format!("the player shows {shown}"))),
         other => Err(Fail::skip(format!(
             "{}, the player shows {shown}",
-            not_answered(other, true)
+            not_answered(other)
         ))),
     }
 }
@@ -743,9 +755,9 @@ mod tests {
 
     #[test]
     fn not_answered_says_why() {
-        assert_eq!(not_answered(Answer::Skip, false), "no terminal");
-        assert_eq!(not_answered(Answer::Skip, true), "skipped by the owner");
-        assert_eq!(not_answered(Answer::NoInput, true), "the input ended");
+        assert_eq!(not_answered(Answer::NoTerminal), "no terminal");
+        assert_eq!(not_answered(Answer::Skip), "skipped by the owner");
+        assert_eq!(not_answered(Answer::NoInput), "the input ended");
     }
 
     #[test]

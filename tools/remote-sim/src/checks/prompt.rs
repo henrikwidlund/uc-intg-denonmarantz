@@ -58,15 +58,24 @@ pub(crate) enum Answer {
     Skip,
     /// The input ended, so the owner cannot answer.
     NoInput,
+    /// Stdin is not a terminal, so the question is not asked.
+    NoTerminal,
 }
 
 /// Kind of question to the owner.
 #[derive(Clone, Copy)]
 pub(crate) enum Ask {
     /// Something to do. Enter means it is done, s skips. The texts say what each key means.
-    Action(&'static str, &'static str),
+    Action {
+        done: &'static str,
+        skip: &'static str,
+    },
     /// A yes or no question. The texts say what y, n and s mean.
-    Question(&'static str, &'static str, &'static str),
+    Question {
+        yes: &'static str,
+        no: &'static str,
+        skip: &'static str,
+    },
 }
 
 /// What s + Enter means for most prompts.
@@ -75,8 +84,8 @@ pub(crate) const SKIP_CHECK: &str = "skip this check";
 /// The line that says what each key does.
 fn keys_text(kind: Ask) -> String {
     match kind {
-        Ask::Action(done, skip) => format!("Enter = {done}, s + Enter = {skip}"),
-        Ask::Question(yes, no, skip) => {
+        Ask::Action { done, skip } => format!("Enter = {done}, s + Enter = {skip}"),
+        Ask::Question { yes, no, skip } => {
             format!("y + Enter = {yes}, n + Enter = {no}, s + Enter = {skip}")
         }
     }
@@ -86,15 +95,16 @@ fn keys_text(kind: Ask) -> String {
 fn parse_answer(kind: Ask, line: &str) -> Option<Answer> {
     match (kind, line.trim().to_ascii_lowercase().as_str()) {
         (_, "s") => Some(Answer::Skip),
-        (Ask::Action(..), "") => Some(Answer::Done),
-        (Ask::Question(..), "y") => Some(Answer::Yes),
-        (Ask::Question(..), "n") => Some(Answer::No),
+        (Ask::Action { .. }, "") => Some(Answer::Done),
+        (Ask::Question { .. }, "y") => Some(Answer::Yes),
+        (Ask::Question { .. }, "n") => Some(Answer::No),
         _ => None,
     }
 }
 
-/// Ask the owner on the terminal and wait for the answer. Without a terminal it returns `Skip`,
-/// at the end of the input `NoInput`. The question and the answer go to the report of the step.
+/// Ask the owner on the terminal and wait for the answer. Without a terminal it returns
+/// `NoTerminal`, at the end of the input `NoInput`. The question and the answer go to the report
+/// of the step.
 pub(crate) async fn ask(ctx: &mut Ctx, kind: Ask, text: &str) -> Result<Answer, Fail> {
     ask_hint(ctx, kind, text, None).await
 }
@@ -109,7 +119,7 @@ pub(crate) async fn ask_hint(
     if !terminal() {
         ctx.answers
             .push(format!("{text:?}: not asked, no terminal"));
-        return Ok(Answer::Skip);
+        return Ok(Answer::NoTerminal);
     }
     let keys = keys_text(kind);
     drop_typed_lines(ctx);
@@ -519,8 +529,15 @@ mod tests {
     use super::*;
     use crate::checks::MAX_VOLUME;
 
-    const ACTION: Ask = Ask::Action("done", SKIP_CHECK);
-    const QUESTION: Ask = Ask::Question("yes", "no", SKIP_CHECK);
+    const ACTION: Ask = Ask::Action {
+        done: "done",
+        skip: SKIP_CHECK,
+    };
+    const QUESTION: Ask = Ask::Question {
+        yes: "yes",
+        no: "no",
+        skip: SKIP_CHECK,
+    };
 
     #[test]
     fn answers() {

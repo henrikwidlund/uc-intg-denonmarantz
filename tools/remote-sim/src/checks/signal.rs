@@ -39,9 +39,15 @@ const ORACLE_SECS: u64 = 20;
 const ORACLE_REFRESH: Duration = Duration::from_secs(3);
 
 /// The keys of the first prompt for a signal kind.
-const KEYS: Ask = Ask::Action("it plays", "skip the checks that need it");
+const KEYS: Ask = Ask::Action {
+    done: "it plays",
+    skip: "skip the checks that need it",
+};
 /// The keys of a prompt after the signal was not seen.
-const KEYS_AGAIN: Ask = Ask::Action("check again", "skip the checks that need it");
+const KEYS_AGAIN: Ask = Ask::Action {
+    done: "check again",
+    skip: "skip the checks that need it",
+};
 
 /// The kind of signal that the owner plays.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -366,7 +372,7 @@ async fn check_one(
                 return Ok(Part::Skipped(format!("{label}: not started (no input)")));
             }
             // The next prompt must not start above the limit or the start volume.
-            _ => {
+            Answer::Skip | Answer::Yes | Answer::No | Answer::NoTerminal => {
                 let loud = match cap_volume(ctx, Some(start)).await {
                     Ok(loud) => loud,
                     Err(e) => {

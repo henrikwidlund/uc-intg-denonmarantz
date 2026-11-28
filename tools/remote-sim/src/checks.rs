@@ -2382,6 +2382,10 @@ fn owner_result(failed: Option<String>, owner: Result<SetBack, Fail>) -> Result<
             "the check could not set the source back: {msg}; {}",
             back.note
         ))),
+        // The error of the owner can contain `msg` (in `why`): then it is said only once.
+        (Some(msg), Err(e)) if e.msg.contains(&msg) => Err(Fail::new(format!(
+            "the check could not set the source back; {e}"
+        ))),
         (Some(msg), Err(e)) => Err(Fail::new(format!(
             "the check could not set the source back: {msg}; {e}"
         ))),
@@ -2401,7 +2405,9 @@ impl Note for SetBack {
 /// too. Right after the prompt and the wait, the watch reads the volume once more and sets a volume
 /// above `start` back: a rise or a failed read is a failure. Fails also if the owner says that it
 /// is set back but [`wait_source`] with [`OWNER_BACK_SECS`] fails (the driver or the second
-/// connection does not have `old`), or if the input ended. See [`owner_back`] for the rise apart.
+/// connection does not have `old`), if the input ended, if there is no terminal, or if the prompt
+/// fails (for example a closed WebSocket). Skips without a second connection, see [`watched_any`].
+/// See [`owner_back`] for the rise apart.
 async fn owner_source_back(
     ctx: &mut Ctx,
     old: &str,
@@ -2429,10 +2435,10 @@ async fn owner_back(
     };
     let text =
         format!("Set the source of the receiver back to {target}. The check does not: {why}.");
-    let kind = Ask::Action(
-        "it is set back",
-        "leave the source as it is, the check or the part skips if nothing failed",
-    );
+    let kind = Ask::Action {
+        done: "it is set back",
+        skip: "leave the source as it is, the check or the part skips if nothing failed",
+    };
     let (answer, mut rise) = match owner_ask_watched(ctx, kind, &text, None, start).await {
         Ok(Watched::Done(answer)) => (answer, None),
         Ok(Watched::After(answer, rise)) => (answer, Some(rise)),
@@ -2490,7 +2496,13 @@ async fn owner_back(
             ),
             skipped: true,
         }),
-        _ => Err(Fail::new(format!(
+        Answer::NoTerminal => Err(Fail::new(format!(
+            "the source is not set back to {target}: {why}; no terminal"
+        ))),
+        Answer::NoInput => Err(Fail::new(format!(
+            "the source is not set back to {target}: {why}; the input ended"
+        ))),
+        Answer::Yes | Answer::No => Err(Fail::new(format!(
             "the source is not set back to {target}: {why}"
         ))),
     };
@@ -4752,17 +4764,21 @@ pub async fn log(ctx: &mut Ctx) -> Check {
         )));
     }
     ensure!(errors.is_empty(), "{} ERROR lines in the log", errors.len());
-    // The unreachable and broken file checks cause some warnings. Without an answer, or after an
-    // error of the prompt (for example a closed WebSocket), the warnings do not fail the check.
+    // The unreachable and broken file checks cause some warnings. Without an answer, without a
+    // terminal, or after an error of the prompt (for example a closed WebSocket), the warnings do
+    // not fail the check.
     let mut unasked = String::new();
     if !warnings.is_empty() {
-        let kind = Ask::Question(
-            "all are expected",
-            "one is not expected",
-            "do not check them",
-        );
+        let kind = Ask::Question {
+            yes: "all are expected",
+            no: "one is not expected",
+            skip: "do not check them",
+        };
         let question = "Is each WARN line above from a check that was expected to warn?";
         match ask(ctx, kind, question).await {
+            Ok(Answer::NoTerminal) => {
+                unasked = " (the WARN lines are not checked by the owner: no terminal)".to_owned();
+            }
             Ok(answer) => {
                 ensure!(
                     answer != Answer::No,
@@ -6741,7 +6757,10 @@ async fn start_heos(
     ),
     Fail,
 > {
-    let kind = Ask::Action("it plays", skip);
+    let kind = Ask::Action {
+        done: "it plays",
+        skip,
+    };
     let text = "Start HEOS Music on the receiver. This makes sound.";
     // Without a terminal the receiver is not switched on only to skip.
     if !terminal() {
@@ -7020,6 +7039,57 @@ fn heos_position(ctx: &Ctx, mp: &str) -> Result<i64, Fail> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_result_says_the_error_once() {
+        let text = |r: Result<SetBack, Fail>| match r {
+            Ok(back) => (true, back.note),
+            Err(e) => (false, e.msg),
+        };
+        let owner = Err(Fail::new(
+            "not set back: the set back failed: E; no terminal",
+        ));
+        assert_eq!(
+            text(owner_result(Some("E".to_owned()), owner)),
+            (
+                false,
+                "the check could not set the source back; not set back: the set back failed: E; no terminal"
+                    .to_owned()
+            )
+        );
+        let owner = Err(Fail::new("the prompt failed"));
+        assert_eq!(
+            text(owner_result(Some("E".to_owned()), owner)),
+            (
+                false,
+                "the check could not set the source back: E; the prompt failed".to_owned()
+            )
+        );
+        let back = Ok(SetBack::note("the owner set it back".to_owned()));
+        assert_eq!(
+            text(owner_result(None, back)),
+            (true, "the owner set it back".to_owned())
+        );
+        let left = Ok(SetBack {
+            note: "left: E".to_owned(),
+            skipped: true,
+        });
+        assert_eq!(
+            text(owner_result(Some("E".to_owned()), left)),
+            (
+                false,
+                "the check could not set the source back; left: E".to_owned()
+            )
+        );
+        let back = Ok(SetBack::note("back".to_owned()));
+        assert_eq!(
+            text(owner_result(Some("E".to_owned()), back)),
+            (
+                false,
+                "the check could not set the source back: E; back".to_owned()
+            )
+        );
+    }
 
     fn check(result: Result<u8, Fail>) -> (Option<u8>, String, bool) {
         match result {

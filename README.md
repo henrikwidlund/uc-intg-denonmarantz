@@ -559,7 +559,8 @@ second connection to have it too.
 The questions are asked on the terminal. Each question says what each key does. What s + Enter does is different for
 each question: for example it skips the check, skips a part of it, leaves the source as it is or only adds a note. The
 questions and the answers go to the report line of the check. Without a terminal, no question is asked: the check or the
-part of it that needs the answer is skipped, and `log` does not check the WARN lines. A run in the background (for
+part of it that needs the answer is skipped, and `log` does not check the WARN lines. If a check cannot set the source
+back itself and needs to ask you, it fails without a terminal: the source stays changed. A run in the background (for
 example with `&`) whose input is the terminal is paused at once, until you bring it back with `fg`. Start such a run
 with `< /dev/null`: then no question is asked.
 
