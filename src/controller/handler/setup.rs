@@ -3507,8 +3507,9 @@ mod tests {
         async fn a_host_name_takes_a_failed_address_before_one_without_a_result() {
             let other = crate::test_support::Fake::start(true).await;
             let (port, task) = silent_port().await;
-            // Another receiver, a refused port, and no answer within the limit.
-            ports_by_ip(&[(FIRST_IP, other.port()), (SECOND_IP, 1)], port);
+            let (closing, closing_task) = closing_port().await;
+            // Another receiver, a port that closes the connection, and no answer within the limit.
+            ports_by_ip(&[(FIRST_IP, other.port()), (SECOND_IP, closing)], port);
             resolve_to(&[FIRST_IP, SECOND_IP, "192.0.2.3"]);
             let limit = Duration::from_millis(300);
             let entered =
@@ -3520,6 +3521,7 @@ mod tests {
                 },
                 entered
             );
+            closing_task.abort();
             task.abort();
         }
 
@@ -3560,6 +3562,22 @@ mod tests {
             (port, task)
         }
 
+        /// A port of the loopback address that closes each connection at once, so a request
+        /// fails at once on all systems. A closed port does not do this on Windows, where a
+        /// refused connect is tried again. Abort the task to close it.
+        async fn closing_port() -> (u16, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind((FAKE_HOST, 0))
+                .await
+                .expect("bind");
+            let port = listener.local_addr().expect("address").port();
+            let task = tokio::spawn(async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    drop(socket);
+                }
+            });
+            (port, task)
+        }
+
         #[actix::test]
         async fn the_addresses_of_a_host_name_get_one_time_limit() {
             let (port, task) = silent_port().await;
@@ -3579,10 +3597,13 @@ mod tests {
 
             // The first address fails at once and the second one has no answer: the error of
             // the first address.
-            ports_by_address(1, port);
+            let (closing, closing_task) = closing_port().await;
+            ports_by_address(closing, port);
             let Err(error) = identify_entered(HOST_NAME.into(), limit).await else {
                 panic!("no error");
             };
+            closing_task.abort();
+            assert!(error.is_network(), "{error}");
             assert_ne!(
                 Some(format!("identify {HOST_NAME}").as_str()),
                 error.request(),

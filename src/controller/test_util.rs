@@ -208,8 +208,9 @@ pub(crate) const LOOPBACK_CONFIG: &str = r#"[{"id": "LOOP0000001", "name": "AVR"
 pub(crate) const LOOPBACK_KEY: &str = "LOOP0000001";
 
 /// The receivers and the setup on this thread connect to port 1 of the loopback address for HTTP
-/// and telnet, whatever the configured address. Nothing listens there, so a connect fails at
-/// once. The search finds nothing.
+/// and telnet, whatever the configured address. Nothing listens there, so a connect fails. On
+/// Linux and macOS it fails at once; on Windows a refused connect is tried again, so it fails
+/// with a timeout after the connect time limit. The search finds nothing.
 pub(crate) fn use_closed_port() {
     let setup: crate::device::discovery::TestBuilder = std::rc::Rc::new(|_, _| {
         crate::test_support::test_builder(1, 1, denon_marantz::Avr::builder("127.0.0.1"))
